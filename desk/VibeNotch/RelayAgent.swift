@@ -206,18 +206,27 @@ final class RelayAgent: NSObject, ObservableObject {
         let diffs = e.transcriptPath.map { TranscriptReader.fileEditDiffs(transcriptPath: $0) } ?? [:]
         var out: [Msg] = []
 
-        // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(图在上、文字在下,同一个气泡)。
+        // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(文件信息栏 + 图 + 说明,同一张卡片)。
         if let p = e.promptSummary, !p.isEmpty {
-            var imageDatas: [String] = []
+            var imageItems: [[String: Any]] = []
             for path in extractImagePaths(p, sessionId: sid) {
-                if let data = thumbnailBase64(path: path) { imageDatas.append(data) }
+                guard let data = thumbnailBase64(path: path) else { continue }
+                var item: [String: Any] = ["data": data]
+                let url = URL(fileURLWithPath: path)
+                item["name"] = "image_" + Self.fileStamp.string(from: Date()) + "." + url.pathExtension.lowercased()
+                item["kind"] = url.pathExtension.uppercased()
+                if let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int {
+                    item["size"] = Self.humanSize(bytes)
+                }
+                imageItems.append(item)
             }
-            let hasImage = !imageDatas.isEmpty
+            let hasImage = !imageItems.isEmpty
             let textOnly = (hasImage ? stripImages(p) : cleanPrompt(p))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if hasImage {
-                var props: [String: Any] = ["images": imageDatas]
+                var props: [String: Any] = ["images": imageItems,
+                                            "time": Self.hhmm.string(from: Date())]
                 if !textOnly.isEmpty { props["text"] = cap(textOnly, 1000) }
                 out.append(Msg(id: "\(pfx)user", role: "user",
                                root: ["type": "photomsg", "props": props],
@@ -345,6 +354,18 @@ final class RelayAgent: NSObject, ObservableObject {
             "data": data, "mime": "image/jpeg",
             "source": source, "name": (source as NSString).lastPathComponent
         ]]
+    }
+
+    static let hhmm: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+    static let fileStamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd_HHmm"; return f
+    }()
+    static func humanSize(_ bytes: Int) -> String {
+        if bytes >= 1_000_000 { return String(format: "%.1f MB", Double(bytes) / 1_000_000) }
+        if bytes >= 1_000 { return "\(bytes / 1_000) KB" }
+        return "\(bytes) B"
     }
 
     /// 读图 → 缩略图(最长边 640)→ JPEG → base64。结果缓存,避免重复编码。

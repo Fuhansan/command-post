@@ -218,54 +218,104 @@ struct DiffLinesView: View {
 
 struct PhotoMsgRenderer: View {
     let component: Component
-    private let maxW: CGFloat = 234
-    private let maxH: CGFloat = 280
-    private let radius: CGFloat = 20
-    private let pad: CGFloat = 4          // 气泡内图片四周留白(iMessage 风)
+    private let cardW: CGFloat = 272
+    private let pad: CGFloat = 10        // 卡片内边距
+    private let maxImgH: CGFloat = 300
+
+    private struct Item {
+        let image: UIImage
+        let name: String
+        let kind: String
+        let size: String
+    }
 
     var body: some View {
         let p = component.props
-        let uis = decodeImages(p["images"]?.arrayValue ?? [])
+        let items = decodeItems(p["images"]?.arrayValue ?? [])
         let text = p.string("text").trimmingCharacters(in: .whitespacesAndNewlines)
-        // 气泡宽度:跟随图片(单图按宽高比),无图则用文字宽度。
-        let imgW = uis.first.map { fitted($0.size).width } ?? (maxW - pad * 2)
-        let bubbleW = imgW + pad * 2
+        let time = p.string("time")
+        let imgW = cardW - pad * 2
 
-        VStack(alignment: .leading, spacing: text.isEmpty ? 0 : 7) {
-            ForEach(Array(uis.enumerated()), id: \.offset) { _, ui in
-                let s = fitted(ui.size)
-                Image(uiImage: ui).resizable().scaledToFill()
+        VStack(alignment: .leading, spacing: 9) {
+            if let first = items.first { headerRow(first) }
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                let s = fitted(item.image.size, boxW: imgW)
+                Image(uiImage: item.image).resizable().scaledToFill()
                     .frame(width: s.width, height: s.height)
-                    .clipShape(RoundedRectangle(cornerRadius: radius - pad, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .frame(maxWidth: .infinity)   // 窄图水平居中
             }
             if !text.isEmpty {
                 Text(text)
-                    .font(.system(size: 15)).foregroundStyle(.white)
+                    .font(.system(size: 15)).foregroundStyle(Theme.text)
                     .multilineTextAlignment(.leading).lineSpacing(2)
-                    .frame(width: imgW, alignment: .leading)
-                    .padding(.horizontal, 6).padding(.bottom, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !time.isEmpty {
+                HStack(spacing: 4) {
+                    Spacer()
+                    Text(time).font(.system(size: 11)).foregroundStyle(Theme.textTer)
+                    ZStack(alignment: .leading) {   // Telegram 式双勾
+                        Image(systemName: "checkmark")
+                        Image(systemName: "checkmark").offset(x: 4)
+                    }
+                    .font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.blue)
+                    .padding(.trailing, 4)
+                }
             }
         }
         .padding(pad)
-        .frame(width: bubbleW)
-        .background(Theme.blueBtn)
-        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
-        .shadow(color: .black.opacity(0.28), radius: 7, y: 3)
+        .frame(width: cardW)
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .stroke(Theme.purple.opacity(0.45), lineWidth: 1))
+        .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
     }
 
-    /// base64 → UIImage(去掉解码失败项)。
-    private func decodeImages(_ arr: [JSONValue]) -> [UIImage] {
-        arr.compactMap { v in
-            guard let s = v.stringValue, let d = Data(base64Encoded: s) else { return nil }
-            return UIImage(data: d)
+    /// 顶部文件信息栏:图标 + 「Screenshot · PNG」 + 文件名·大小。
+    private func headerRow(_ item: Item) -> some View {
+        HStack(spacing: 9) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Theme.cardHi)
+                .frame(width: 36, height: 36)
+                .overlay(Image(systemName: "photo")
+                    .font(.system(size: 15)).foregroundStyle(Theme.textSec))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.kind.isEmpty ? "Screenshot" : "Screenshot · \(item.kind)")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.text)
+                Text([item.name, item.size].filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.system(size: 11)).foregroundStyle(Theme.textSec)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: 6)
+            Image(systemName: "arrow.down.to.line")
+                .font(.system(size: 14)).foregroundStyle(Theme.textSec)
         }
     }
 
-    /// 在 (maxW-2pad) × maxH 内按宽高比缩放,既不裁切也不留黑边。
-    private func fitted(_ size: CGSize) -> CGSize {
-        let boxW = maxW - pad * 2
+    /// 兼容两种 images 元素:对象 {data,name,kind,size} 或纯 base64 字符串(旧格式)。
+    private func decodeItems(_ arr: [JSONValue]) -> [Item] {
+        arr.compactMap { v in
+            let b64: String?
+            var name = "", kind = "", size = ""
+            if let obj = v.objectValue {
+                b64 = obj["data"]?.stringValue
+                name = obj["name"]?.stringValue ?? ""
+                kind = obj["kind"]?.stringValue ?? ""
+                size = obj["size"]?.stringValue ?? ""
+            } else {
+                b64 = v.stringValue
+            }
+            guard let s = b64, let d = Data(base64Encoded: s), let ui = UIImage(data: d) else { return nil }
+            return Item(image: ui, name: name, kind: kind, size: size)
+        }
+    }
+
+    /// 在 boxW × maxImgH 内按宽高比缩放,不裁切不留黑边。
+    private func fitted(_ size: CGSize, boxW: CGFloat) -> CGSize {
         guard size.width > 0, size.height > 0 else { return CGSize(width: boxW, height: boxW) }
-        let scale = min(boxW / size.width, maxH / size.height)
+        let scale = min(boxW / size.width, maxImgH / size.height)
         return CGSize(width: size.width * scale, height: size.height * scale)
     }
 }
