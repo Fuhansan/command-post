@@ -32,6 +32,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var imageCache: [String: String?] = [:] // 图片路径 → 缩略图 base64(nil=读取失败,避免重复尝试)
     private var turnCount: [String: Int] = [:]      // 会话 → 当前轮次(prompt 变化即 +1),消息 id 带轮次 → 客户端累积历史
     private var turnPrompt: [String: String] = [:]  // 会话 → 上次见到的 prompt,用于检测新一轮
+    private var permSeen: [String: (pfx: String, detail: String?)] = [:]  // 会话 → 审批卡所在轮次+命令,决定后原地改成已处理卡
     private var retry = 0
     private var started = false
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
@@ -54,6 +55,9 @@ final class RelayAgent: NSObject, ObservableObject {
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
         pending.$pendingIDs
+            .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
+            .store(in: &cancellables)
+        pending.$lastDecisions
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
         connect()
@@ -279,9 +283,15 @@ final class RelayAgent: NSObject, ObservableObject {
             out.append(Msg(id: "\(pfx)g\(gi)", role: "agent", root: root, fallback: g.fallback))
         }
 
-        // 待批准命令
+        // 待批准命令。决定后不删卡:同 id 原地换成「已允许/已拒绝」,留在会话历史里。
         if pending.pendingIDs.contains(sid) {
+            permSeen[sid] = (pfx, e.toolDetail)
             out.append(Msg(id: "\(pfx)pending", role: "agent", root: permCard(e), fallback: "需要批准"))
+        } else if let seen = permSeen[sid], seen.pfx == pfx,
+                  let decision = pending.lastDecisions[sid] {
+            out.append(Msg(id: "\(pfx)pending", role: "agent",
+                           root: permResolvedCard(detail: seen.detail, decision: decision),
+                           fallback: decision == "allow" ? "已允许" : "已拒绝"))
         } else if out.isEmpty, case .waiting(let msg) = e.state {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
@@ -301,6 +311,20 @@ final class RelayAgent: NSObject, ObservableObject {
             ]]
         ])
         return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
+    }
+
+    /// 已处理的审批卡:按钮换成结果徽标,卡片留在历史里。
+    private func permResolvedCard(detail: String?, decision: String) -> [String: Any] {
+        let (label, color, icon, style): (String, String, String, String)
+        switch decision {
+        case "allow": (label, color, icon, style) = ("✓ 已允许", "success", "checkmark.circle.fill", "default")
+        case "deny":  (label, color, icon, style) = ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
+        default:      (label, color, icon, style) = ("已超时,按默认流程处理", "secondary", "clock.fill", "default")
+        }
+        var kids: [[String: Any]] = [text("请求执行以下命令:", color: "secondary", style: "caption")]
+        if let detail { kids.append(code(detail)) }
+        kids.append(badge(label, color: color))
+        return card(title: "审批请求", icon: icon, style: style, children: kids)
     }
 
     /// 读不到图时:把 [Image …] 换成简洁标记。
