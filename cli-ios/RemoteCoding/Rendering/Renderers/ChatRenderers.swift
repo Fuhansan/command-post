@@ -218,31 +218,55 @@ struct DiffLinesView: View {
 
 struct PhotoMsgRenderer: View {
     let component: Component
-    private let width: CGFloat = 240
+    private let maxW: CGFloat = 234
+    private let maxH: CGFloat = 280
+    private let radius: CGFloat = 20
+    private let pad: CGFloat = 4          // 气泡内图片四周留白(iMessage 风)
 
     var body: some View {
         let p = component.props
-        let images = p["images"]?.arrayValue ?? []
-        let text = p.string("text")
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(images.enumerated()), id: \.offset) { _, img in
-                if let s = img.stringValue, let data = Data(base64Encoded: s), let ui = UIImage(data: data) {
-                    Image(uiImage: ui).resizable().scaledToFit()
-                        .frame(maxWidth: width, maxHeight: 320)
-                }
+        let uis = decodeImages(p["images"]?.arrayValue ?? [])
+        let text = p.string("text").trimmingCharacters(in: .whitespacesAndNewlines)
+        // 气泡宽度:跟随图片(单图按宽高比),无图则用文字宽度。
+        let imgW = uis.first.map { fitted($0.size).width } ?? (maxW - pad * 2)
+        let bubbleW = imgW + pad * 2
+
+        VStack(alignment: .leading, spacing: text.isEmpty ? 0 : 7) {
+            ForEach(Array(uis.enumerated()), id: \.offset) { _, ui in
+                let s = fitted(ui.size)
+                Image(uiImage: ui).resizable().scaledToFill()
+                    .frame(width: s.width, height: s.height)
+                    .clipShape(RoundedRectangle(cornerRadius: radius - pad, style: .continuous))
             }
             if !text.isEmpty {
                 Text(text)
-                    .font(.system(size: 15)).foregroundStyle(Theme.text)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .font(.system(size: 15)).foregroundStyle(.white)
+                    .multilineTextAlignment(.leading).lineSpacing(2)
+                    .frame(width: imgW, alignment: .leading)
+                    .padding(.horizontal, 6).padding(.bottom, 4)
             }
         }
-        .frame(width: width)
-        .background(Theme.blueBtn.opacity(0.22))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Theme.stroke.opacity(0.4), lineWidth: 0.5))
+        .padding(pad)
+        .frame(width: bubbleW)
+        .background(Theme.blueBtn)
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .shadow(color: .black.opacity(0.28), radius: 7, y: 3)
+    }
+
+    /// base64 → UIImage(去掉解码失败项)。
+    private func decodeImages(_ arr: [JSONValue]) -> [UIImage] {
+        arr.compactMap { v in
+            guard let s = v.stringValue, let d = Data(base64Encoded: s) else { return nil }
+            return UIImage(data: d)
+        }
+    }
+
+    /// 在 (maxW-2pad) × maxH 内按宽高比缩放,既不裁切也不留黑边。
+    private func fitted(_ size: CGSize) -> CGSize {
+        let boxW = maxW - pad * 2
+        guard size.width > 0, size.height > 0 else { return CGSize(width: boxW, height: boxW) }
+        let scale = min(boxW / size.width, maxH / size.height)
+        return CGSize(width: size.width * scale, height: size.height * scale)
     }
 }
 
