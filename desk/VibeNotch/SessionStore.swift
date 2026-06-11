@@ -18,6 +18,11 @@ final class SessionStore: ObservableObject {
     /// were quit without firing a SessionEnd hook.
     static let idleRemovalSeconds: TimeInterval = 2 * 60 * 60
 
+    /// 主动移除一个会话(手机端结束任务且进程号未知时的兜底)。
+    func removeSession(sessionId: String) {
+        sessions.removeAll { $0.id == sessionId }
+    }
+
     func apply(_ event: HookEvent) {
         guard let sid = event.sessionId else { return }
         let cwd = event.cwd ?? "?"

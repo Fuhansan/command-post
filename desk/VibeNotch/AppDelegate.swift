@@ -97,6 +97,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay remote \(decision == .allow ? "allow" : "deny") sid=\(sid.prefix(8))")
             self.decide(sessionId: sid, decision: decision)
         }
+        agent.onRemoteClose = { [weak self] sid in
+            guard let self else { return }
+            guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
+                vlog("relay close ignored: sid=\(sid.prefix(8)) unknown")
+                return
+            }
+            vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
+            self.pendingStore.cancel(sid: sid)   // 丢弃挂起的审批连接(若有)
+            if let pid = entry.ownerPID {
+                kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
+            } else {
+                // 不知道进程号(罕见)→ 直接移除会话,保证手机端也消失
+                self.store.removeSession(sessionId: sid)
+            }
+        }
         agent.start()
         relayAgent = agent
     }

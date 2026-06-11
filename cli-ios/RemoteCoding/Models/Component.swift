@@ -37,6 +37,7 @@ struct UIMessage: Identifiable {
     var role: String          // agent | user | system
     var root: Component
     var fallbackText: String?
+    var time: String?         // 消息时间(HH:mm,首次出现时刻,由 agent 下发)
 
     init?(frame: Frame) {
         guard case .ui = frame.t, let id = frame.id, let body = frame.body else { return nil }
@@ -45,6 +46,7 @@ struct UIMessage: Identifiable {
         self.role = body["role"]?.stringValue ?? "agent"
         self.root = Component(json: body["root"] ?? .object([:]))
         self.fallbackText = frame.fallbackText
+        self.time = body["time"]?.stringValue
     }
 
     /// 本地构造一条用户文本消息(用户在输入框发送时)。
@@ -57,5 +59,10 @@ struct UIMessage: Identifiable {
             "props": .object(["text": .string(text)])
         ]))
         self.fallbackText = text
+        self.time = Self.hhmm.string(from: Date())
     }
+
+    private static let hhmm: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
 }

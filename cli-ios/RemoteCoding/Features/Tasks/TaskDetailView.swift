@@ -7,6 +7,7 @@ struct TaskDetailView: View {
     @EnvironmentObject private var relay: RelayClient
     @Environment(\.dismiss) private var dismiss
     @State private var draft = ""
+    @State private var showEndConfirm = false
 
     private var session: RelaySession? { relay.session(id: sessionId) }
 
@@ -45,24 +46,47 @@ struct TaskDetailView: View {
         }
         .toolbar(.hidden, for: .tabBar)
         .toolbar(.hidden, for: .navigationBar)
+        .confirmationDialog("结束任务", isPresented: $showEndConfirm, titleVisibility: .visible) {
+            Button("结束任务(关闭电脑端会话)", role: .destructive) {
+                relay.endSession(sessionId: sessionId)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将终止电脑上对应的 Claude Code 会话进程,任务从列表移除。")
+        }
+        .onChange(of: session == nil) { _, gone in
+            if gone { dismiss() }   // 会话被移除(结束/异常退出)→ 自动返回列表
+        }
     }
 
     /// 一条消息:agent → [头像 + 内容];工具 chip 紧凑无头像;user → 右对齐气泡。
+    /// 下方附小字时间(toolchip 紧凑不加;photomsg 卡内自带)。
     @ViewBuilder
     private func messageRow(_ msg: UIMessage) -> some View {
         let content = ComponentView(component: msg.root)
             .environment(\.onComponentAction) { relay.sendAction($0, for: msg.id, sessionId: sessionId) }
+        let showTime = msg.time != nil && msg.root.type != "photomsg"
         if msg.role == "user" {
-            HStack(spacing: 0) { Spacer(minLength: 44); content }   // 用户内容统一右对齐
+            VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: 0) { Spacer(minLength: 44); content }   // 用户内容统一右对齐
+                if showTime { timeLabel(msg.time!) }
+            }
         } else if msg.root.type == "toolchip" {
             content.padding(.leading, 44)   // 缩进对齐头像后的内容
         } else {
             HStack(alignment: .top, spacing: 10) {
                 let style = messageAvatarStyle(for: msg.root)
                 MessageAvatar(icon: style.icon, colors: style.colors)
-                content.frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 3) {
+                    content.frame(maxWidth: .infinity, alignment: .leading)
+                    if showTime { timeLabel(msg.time!) }
+                }
             }
         }
+    }
+
+    private func timeLabel(_ t: String) -> some View {
+        Text(t).font(.system(size: 10)).foregroundStyle(Theme.textTer)
     }
 
     private var navBar: some View {
@@ -71,7 +95,16 @@ struct TaskDetailView: View {
                 Image(systemName: "chevron.left").font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.text)
             }
             Spacer()
-            Image(systemName: "ellipsis").font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.text)
+            Menu {
+                Button(role: .destructive) {
+                    showEndConfirm = true
+                } label: {
+                    Label("结束任务", systemImage: "xmark.circle")
+                }
+            } label: {
+                Image(systemName: "ellipsis").font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.text)
+                    .frame(width: 36, height: 36, alignment: .trailing)   // 扩大点按区
+            }
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
     }

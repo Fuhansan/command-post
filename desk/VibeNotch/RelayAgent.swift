@@ -17,6 +17,8 @@ final class RelayAgent: NSObject, ObservableObject {
     static let account = "demo"
     // 每个 claude 会话(终端)= 一个独立协议 sid = entry.id → 手机端分成多个任务。
 
+    /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。
+    var onRemoteClose: ((String) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -42,6 +44,15 @@ final class RelayAgent: NSObject, ObservableObject {
     }
     private var permRecords: [String: [PermRecord]] = [:]  // 会话 → 审批记录
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
+    private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
+
+    /// 消息首次出现的时间;之后同 id 始终返回同一值。
+    private func stamp(for msgId: String) -> String {
+        if let t = msgTime[msgId] { return t }
+        let t = Self.hhmm.string(from: Date())
+        msgTime[msgId] = t
+        return t
+    }
     private var retry = 0
     private var started = false
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
@@ -139,6 +150,7 @@ final class RelayAgent: NSObject, ObservableObject {
         for sid in knownSids where !activeSids.contains(sid) {
             sendSessionRemove(sid: sid)
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
+            for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
             permRecords[sid] = nil
         }
         knownSids = activeSids
@@ -163,7 +175,8 @@ final class RelayAgent: NSObject, ObservableObject {
             }
             // 变化的消息才推
             for m in msgs {
-                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root]
+                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
+                                           "time": stamp(for: m.id)]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
@@ -250,7 +263,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
             if hasImage {
                 var props: [String: Any] = ["images": imageItems,
-                                            "time": Self.hhmm.string(from: Date())]
+                                            "time": stamp(for: "\(pfx)user")]
                 if !textOnly.isEmpty { props["text"] = cap(textOnly, 1000) }
                 out.append(Msg(id: "\(pfx)user", role: "user",
                                root: ["type": "photomsg", "props": props],
@@ -471,8 +484,9 @@ final class RelayAgent: NSObject, ObservableObject {
             ?? ""
         guard !sid.isEmpty else { return }
         switch actionId {
-        case "perm_allow": onRemoteDecision?(sid, .allow)
-        case "perm_deny":  onRemoteDecision?(sid, .deny)
+        case "perm_allow":    onRemoteDecision?(sid, .allow)
+        case "perm_deny":     onRemoteDecision?(sid, .deny)
+        case "session_close": onRemoteClose?(sid)
         default: break
         }
     }
