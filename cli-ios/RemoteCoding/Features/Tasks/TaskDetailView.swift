@@ -29,6 +29,7 @@ struct TaskDetailView: View {
                         }
                         .padding(.horizontal, 16).padding(.vertical, 12)
                     }
+                    .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
                     .onChange(of: session?.messages.count ?? 0) { _, _ in
                         if let last = session?.messages.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
