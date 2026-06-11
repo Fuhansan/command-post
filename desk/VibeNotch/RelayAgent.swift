@@ -46,12 +46,14 @@ final class RelayAgent: NSObject, ObservableObject {
     func start() {
         guard !started else { return }
         started = true
-        // 任一会话/待决变化 → 同步到服务器
+        // 任一会话/待决变化 → 同步到服务器。
+        // 注:@Published 在 willSet 触发(值改变之前),直接同步会读到旧状态、漏掉删除。
+        // 用 Task{@MainActor} 延到本次修改完成后再读 store.sessions(新状态)。
         store.$sessions
-            .sink { [weak self] _ in self?.syncToServer() }
+            .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
         pending.$pendingIDs
-            .sink { [weak self] _ in self?.syncToServer() }
+            .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
         connect()
     }
