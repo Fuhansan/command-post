@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Xcode / SwiftPM build outputs
+build/
+DerivedData/
+.build/
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# XcodeGen-generated projects (regenerate with `xcodegen generate`)
+*.xcodeproj/
+
+# Maven (coding-server)
+target/
+
+# Packaged release artifacts
+dist/
+
+# IDE / local tooling settings
+.idea/
+.claude/
+.vscode/
+
+# Backed-up nested git dirs
+*_git_backup/

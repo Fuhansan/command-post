@@ -1,0 +1,40 @@
+name: RemoteCoding
+options:
+  bundleIdPrefix: com.aicodingremote
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"            # 语言模式 5,先避开严格并发对脚手架的噪音;后续可升 6
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: YES
+    DEVELOPMENT_TEAM: ""            # 真机调试时填你的 Team ID
+
+packages:
+  MarkdownUI:
+    url: https://github.com/gonzalezreal/swift-markdown-ui
+    from: "2.4.0"
+
+targets:
+  RemoteCoding:
+    type: application
+    platform: iOS
+    sources:
+      - path: RemoteCoding
+    dependencies:
+      - package: MarkdownUI
+        product: MarkdownUI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aicodingremote.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_CFBundleDisplayName: "AI Coding Remote"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        # 原生能力用途说明(相册 / 相机)
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "用于在对话中发送图片"
+        INFOPLIST_KEY_NSCameraUsageDescription: "用于拍照并在对话中发送"
