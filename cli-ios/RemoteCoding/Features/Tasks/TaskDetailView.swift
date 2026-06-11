@@ -87,6 +87,16 @@ struct TaskDetailView: View {
                     Text(SessionStatusUI.label(status))
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(SessionStatusUI.color(status))
+                    if let term = session?.terminal, !term.isEmpty, term != "?" {
+                        Text("· \(term)").font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                    }
+                }
+                if let cwd = session?.cwd, !cwd.isEmpty, cwd != "?" {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder").font(.system(size: 11)).foregroundStyle(Theme.textTer)
+                        Text(shortMacPath(cwd)).font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Theme.textSec).lineLimit(1).truncationMode(.head)
+                    }
                 }
             }
             Spacer()

@@ -4,7 +4,9 @@ import Combine
 /// 一个会话(任务)= 一个 claude 终端会话,按协议 `sid` 区分。
 struct RelaySession: Identifiable {
     let id: String              // sid
-    var title: String           // 终端/IDE 名
+    var title: String           // 项目名(cwd 末段)
+    var terminal: String        // 终端/IDE 名
+    var cwd: String             // 项目工作目录
     var subtitle: String        // prompt 摘要 / 当前活动
     var status: String          // idle | working | waiting | done | ended
     var needsAction: Bool       // 是否有待批准的命令
@@ -103,10 +105,12 @@ final class RelayClient: ObservableObject {
         let meta = frame.body?["session"]
         let idx = sessions.firstIndex(where: { $0.id == sid })
         var s = idx.map { sessions[$0] }
-            ?? RelaySession(id: sid, title: "会话", subtitle: "", status: "working",
-                            needsAction: false, messages: [])
+            ?? RelaySession(id: sid, title: "会话", terminal: "", cwd: "", subtitle: "",
+                            status: "working", needsAction: false, messages: [])
         if let meta {
             s.title = meta["title"]?.stringValue ?? s.title
+            s.terminal = meta["terminal"]?.stringValue ?? s.terminal
+            s.cwd = meta["cwd"]?.stringValue ?? s.cwd
             s.subtitle = meta["subtitle"]?.stringValue ?? s.subtitle
             s.status = meta["status"]?.stringValue ?? s.status
             s.needsAction = meta["needsAction"]?.boolValue ?? s.needsAction
@@ -122,8 +126,13 @@ final class RelayClient: ObservableObject {
     /// PROTOCOL §7 —— patch:
     /// op=remove + scope=session → 删整个会话;op=remove(带消息 id)→ 删该条消息;op=replace → 替换根组件。
     private func applyPatch(_ frame: Frame) {
-        guard let sid = frame.sid, let body = frame.body else { return }
+        guard let body = frame.body else { return }
         let op = body.string("op", default: "replace")
+        if op == "reset" {   // agent 进程重启 → 清空全部会话,作废旧数据
+            sessions.removeAll()
+            return
+        }
+        guard let sid = frame.sid else { return }
         if op == "remove" {
             if body.string("scope") == "session" {
                 sessions.removeAll { $0.id == sid }

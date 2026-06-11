@@ -64,6 +64,12 @@ public class Hub {
         synchronized (m) { m.keySet().removeIf(k -> k.startsWith(prefix)); }
     }
 
+    /** 清空该账号全部快照(agent 进程重启 reset 时)。 */
+    public void clearSnapshots(String account) {
+        Map<String, String> m = snapshots.get(account);
+        if (m != null) m.clear();
+    }
+
     public void register(Connection c) {
         Account a = acc(c.account);
         (c.isAgent() ? a.agents : a.clients).put(c.channel.id(), c);

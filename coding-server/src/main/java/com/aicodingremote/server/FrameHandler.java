@@ -45,7 +45,7 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
                     Frames.pong(root.path("id").isMissingNode() ? null : root.path("id").asText(),
                                 root.path("ts").asLong(System.currentTimeMillis())));
             case "ui"     -> { forward(ctx, text, /*fromAgent=*/true); snapshotUi(ctx, root, text); }
-            case "patch"  -> { forward(ctx, text, /*fromAgent=*/true); maybeDropSnapshot(ctx, root); }
+            case "patch"  -> handlePatch(ctx, root, text);
             case "action", "input" -> forward(ctx, text, /*fromAgent=*/false);
             case "resume" -> { /* 最小版无缓冲,忽略回放请求(PROTOCOL §8.4 待实现) */ }
             default -> log.debug("忽略未知/未处理 frame t={}", t);
@@ -100,6 +100,18 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         if (conn == null) return;
         String msgId = root.path("id").asText("");
         if (!msgId.isEmpty()) hub.snapshot(conn.account, msgId, text);
+    }
+
+    /** patch 路由:op=reset 清空账号全部快照并转发(让手机清空);否则正常转发 + 处理删除快照。 */
+    private void handlePatch(ChannelHandlerContext ctx, JsonNode root, String text) {
+        Connection conn = ctx.channel().attr(CONN).get();
+        if (conn != null && "reset".equals(root.path("body").path("op").asText(""))) {
+            hub.clearSnapshots(conn.account);
+            for (Connection c : hub.clientsOf(conn.account)) send(c.channel, text);
+            return;
+        }
+        forward(ctx, text, /*fromAgent=*/true);
+        maybeDropSnapshot(ctx, root);
     }
 
     /** patch(op=remove):scope=session 删整会话快照;否则删单条消息快照。 */

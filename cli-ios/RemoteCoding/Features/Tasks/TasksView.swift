@@ -108,18 +108,32 @@ struct TasksView: View {
     }
 }
 
-/// 任务行(一个 claude 会话)。
+/// 把 Mac 绝对路径里的 /Users/<name>/ 缩成 ~/。
+func shortMacPath(_ p: String) -> String {
+    p.replacingOccurrences(of: #"^/Users/[^/]+/"#, with: "~/", options: .regularExpression)
+}
+
+/// 任务行(一个 claude 会话):项目名 + 终端 + 目录。
 struct SessionCard: View {
     let session: RelaySession
+    private var hasTerminal: Bool { !session.terminal.isEmpty && session.terminal != "?" }
+    private var hasCwd: Bool { !session.cwd.isEmpty && session.cwd != "?" }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 Avatar(letter: String(session.title.prefix(1)), color: Theme.purple)
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(session.title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text(SessionStatusUI.label(session.status))
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(SessionStatusUI.color(session.status))
+                    HStack(spacing: 6) {
+                        if hasTerminal {
+                            Text(session.terminal).font(.system(size: 12)).foregroundStyle(Theme.textSec)
+                            Text("·").font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                        }
+                        Text(SessionStatusUI.label(session.status))
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(SessionStatusUI.color(session.status))
+                    }
                 }
                 Spacer()
                 if session.needsAction {
@@ -127,6 +141,14 @@ struct SessionCard: View {
                         .font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .background(Theme.coral).clipShape(Capsule())
+                }
+            }
+            if hasCwd {
+                HStack(spacing: 5) {
+                    Image(systemName: "folder").font(.system(size: 11)).foregroundStyle(Theme.textTer)
+                    Text(shortMacPath(session.cwd))
+                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.textSec)
+                        .lineLimit(1).truncationMode(.head)
                 }
             }
             if !session.subtitle.isEmpty {

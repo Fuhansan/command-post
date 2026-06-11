@@ -34,6 +34,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var turnPrompt: [String: String] = [:]  // 会话 → 上次见到的 prompt,用于检测新一轮
     private var retry = 0
     private var started = false
+    private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
 
     init(store: SessionStore, pending: PendingDecisionStore) {
         self.store = store
@@ -76,7 +77,20 @@ final class RelayAgent: NSObject, ObservableObject {
         retry = 0
         lastSent.removeAll()
         knownSids.removeAll()
+        // 进程刚启动(非网络重连)→ 让服务器+手机清掉上个进程实例的残留消息,
+        // 避免重启后轮次重置导致旧 id(如 t2:img0/prompt)与新 id 并存的孤儿气泡。
+        if firstConnect {
+            firstConnect = false
+            sendReset()
+        }
         syncToServer()   // 连上后补发当前所有会话
+    }
+
+    /// 清空本账号在服务器与手机端的全部会话(agent 进程重启时调用)。
+    private func sendReset() {
+        seq += 1
+        send(jsonString(["v": 1, "t": "patch", "id": "reset", "seq": seq,
+                         "from": "agent", "body": ["op": "reset"]]))
     }
 
     private func sendAuth() {
@@ -152,12 +166,18 @@ final class RelayAgent: NSObject, ObservableObject {
                          "from": "agent", "body": ["op": "remove"]]))
     }
 
-    /// 任务元信息 —— 手机首页任务行用(title/副标题/状态/是否需处理)。
+    /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
     private func sessionMeta(_ e: SessionEntry) -> [String: Any] {
         let isPending = pending.pendingIDs.contains(e.id)
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
+        let cwd = e.cwd
+        let base = (cwd as NSString).lastPathComponent
+        // 标题优先用项目名(cwd 末段);取不到再退回终端名。
+        let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
         return [
-            "title": e.terminal.displayName,
+            "title": project,                     // 项目名(主标题)
+            "terminal": e.terminal.displayName,    // 终端 / IDE
+            "cwd": cwd,                            // 项目工作目录
             "subtitle": subtitle,
             "status": isPending ? "waiting" : statusKey(e.state),
             "needsAction": isPending
@@ -186,21 +206,24 @@ final class RelayAgent: NSObject, ObservableObject {
         let diffs = e.transcriptPath.map { TranscriptReader.fileEditDiffs(transcriptPath: $0) } ?? [:]
         var out: [Msg] = []
 
-        // 用户 prompt:先把粘贴的图片渲染成缩略图消息,再发去掉图片引用后的文本气泡。
+        // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(图在上、文字在下,同一个气泡)。
         if let p = e.promptSummary, !p.isEmpty {
-            let imgs = extractImagePaths(p)
-            var shownImage = false
-            for (k, path) in imgs.enumerated() {
-                if let data = thumbnailBase64(path: path) {
-                    shownImage = true
-                    out.append(Msg(id: "\(pfx)img\(k)", role: "user",
-                                   root: imageComp(data: data, source: path), fallback: "图片"))
-                }
+            var imageDatas: [String] = []
+            for path in extractImagePaths(p, sessionId: sid) {
+                if let data = thumbnailBase64(path: path) { imageDatas.append(data) }
             }
-            let textOnly = (shownImage ? stripImages(p) : cleanPrompt(p))
+            let hasImage = !imageDatas.isEmpty
+            let textOnly = (hasImage ? stripImages(p) : cleanPrompt(p))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !textOnly.isEmpty {
-                out.append(Msg(id: "\(pfx)prompt", role: "user",
+
+            if hasImage {
+                var props: [String: Any] = ["images": imageDatas]
+                if !textOnly.isEmpty { props["text"] = cap(textOnly, 1000) }
+                out.append(Msg(id: "\(pfx)user", role: "user",
+                               root: ["type": "photomsg", "props": props],
+                               fallback: cap(textOnly.isEmpty ? "图片" : textOnly, 120)))
+            } else if !textOnly.isEmpty {
+                out.append(Msg(id: "\(pfx)user", role: "user",
                                root: bubble(role: "user", cap(textOnly, 1000)), fallback: cap(textOnly, 120)))
             }
         }
@@ -271,19 +294,38 @@ final class RelayAgent: NSObject, ObservableObject {
         return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
     }
 
-    /// 读不到图时:把 [Image: …] 换成简洁标记。
+    /// 读不到图时:把 [Image …] 换成简洁标记。
     private func cleanPrompt(_ p: String) -> String {
-        cap(p.replacingOccurrences(of: #"\[Image:[^\]]*\]"#, with: "📷 [图片]", options: .regularExpression), 1000)
+        cap(p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "📷 [图片]", options: .regularExpression), 1000)
     }
 
-    /// 把 [Image: …] 整段去掉(已用缩略图展示时)。
+    /// 把 [Image …] 整段去掉(已用缩略图展示时)。
     private func stripImages(_ p: String) -> String {
-        p.replacingOccurrences(of: #"\[Image:[^\]]*\]"#, with: "", options: .regularExpression)
+        p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "", options: .regularExpression)
     }
 
-    /// 从 prompt 抽出粘贴图片的本地路径(`[Image: source: /path]` 或 image-cache 路径)。
-    private func extractImagePaths(_ p: String) -> [String] {
+    /// 从 prompt 抽出粘贴图片的本地路径。Claude Code 真实格式是 `[Image #N]`(只有编号),
+    /// 图片实际在 `~/.claude/image-cache/<sessionId>/<N>.<ext>`,据此构造路径。
+    /// 兼容带显式路径的 `[Image: source: /path]` 与裸路径。
+    private func extractImagePaths(_ p: String, sessionId: String) -> [String] {
         var paths: [String] = []
+        let fm = FileManager.default
+        let cacheDir = NSString(string: "~/.claude/image-cache").expandingTildeInPath + "/" + sessionId
+
+        // 1) [Image #N] → image-cache/<sid>/N.<ext>
+        if let re = try? NSRegularExpression(pattern: #"\[Image\s*#(\d+)\]"#) {
+            let ns = p as NSString
+            for m in re.matches(in: p, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
+                let n = ns.substring(with: m.range(at: 1))
+                for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
+                    let path = "\(cacheDir)/\(n).\(ext)"
+                    if fm.fileExists(atPath: path) { if !paths.contains(path) { paths.append(path) }; break }
+                }
+            }
+        }
+        if !paths.isEmpty { return paths }
+
+        // 2) 兜底:显式路径
         let patterns = [#"\[Image:[^\]]*?source:\s*([^\]\s]+)\]"#,
                         #"(/[^\s\]]+?\.(?:png|jpe?g|gif|webp|heic))"#]
         for pat in patterns {
@@ -293,7 +335,7 @@ final class RelayAgent: NSObject, ObservableObject {
                 let path = ns.substring(with: m.range(at: 1))
                 if !paths.contains(path) { paths.append(path) }
             }
-            if !paths.isEmpty { break }   // 优先用 [Image:] 格式,命中就不再用宽松匹配
+            if !paths.isEmpty { break }
         }
         return paths
     }

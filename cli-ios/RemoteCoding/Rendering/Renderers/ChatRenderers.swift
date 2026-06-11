@@ -214,6 +214,38 @@ struct DiffLinesView: View {
     }
 }
 
+// MARK: - 图文消息(用户粘贴图 + 文字 → 一个统一气泡:图在上、文字在下)
+
+struct PhotoMsgRenderer: View {
+    let component: Component
+    private let width: CGFloat = 240
+
+    var body: some View {
+        let p = component.props
+        let images = p["images"]?.arrayValue ?? []
+        let text = p.string("text")
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(images.enumerated()), id: \.offset) { _, img in
+                if let s = img.stringValue, let data = Data(base64Encoded: s), let ui = UIImage(data: data) {
+                    Image(uiImage: ui).resizable().scaledToFit()
+                        .frame(maxWidth: width, maxHeight: 320)
+                }
+            }
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 15)).foregroundStyle(Theme.text)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+            }
+        }
+        .frame(width: width)
+        .background(Theme.blueBtn.opacity(0.22))
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Theme.stroke.opacity(0.4), lineWidth: 0.5))
+    }
+}
+
 // MARK: - 工具 chip(Read/Grep 等,紧凑无头像)
 
 struct ToolChipRenderer: View {

@@ -37,6 +37,7 @@ struct ComponentView: View {
         case "file":         FileRenderer(component: component)
         case "command":      CommandRenderer(component: component)
         case "toolchip":     ToolChipRenderer(component: component)
+        case "photomsg":     PhotoMsgRenderer(component: component)
         // 交互
         case "button":       ButtonRenderer(component: component)
         case "button_group": ButtonGroupRenderer(component: component)
