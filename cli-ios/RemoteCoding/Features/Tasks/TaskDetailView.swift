@@ -15,24 +15,28 @@ struct TaskDetailView: View {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
                 navBar
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(spacing: 14) {
-                            sessionHeader
-                            if let msgs = session?.messages, !msgs.isEmpty {
-                                ForEach(msgs) { msg in
-                                    messageRow(msg).id(msg.id)
+                GeometryReader { geo in
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            VStack(spacing: 14) {
+                                sessionHeader
+                                if let msgs = session?.messages, !msgs.isEmpty {
+                                    ForEach(msgs) { msg in
+                                        messageRow(msg).id(msg.id)
+                                    }
+                                } else {
+                                    emptyState
                                 }
-                            } else {
-                                emptyState
                             }
+                            .padding(.horizontal, 16).padding(.vertical, 12)
+                            // 撑满视口且顶部对齐:消息少时头部贴顶,不随 bottom 锚点沉底
+                            .frame(minHeight: geo.size.height, alignment: .top)
                         }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                    }
-                    .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
-                    .onChange(of: session?.messages.count ?? 0) { _, _ in
-                        if let last = session?.messages.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                        .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
+                        .onChange(of: session?.messages.count ?? 0) { _, _ in
+                            if let last = session?.messages.last {
+                                withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                            }
                         }
                     }
                 }
