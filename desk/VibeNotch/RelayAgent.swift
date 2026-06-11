@@ -32,7 +32,16 @@ final class RelayAgent: NSObject, ObservableObject {
     private var imageCache: [String: String?] = [:] // 图片路径 → 缩略图 base64(nil=读取失败,避免重复尝试)
     private var turnCount: [String: Int] = [:]      // 会话 → 当前轮次(prompt 变化即 +1),消息 id 带轮次 → 客户端累积历史
     private var turnPrompt: [String: String] = [:]  // 会话 → 上次见到的 prompt,用于检测新一轮
-    private var permSeen: [String: (pfx: String, detail: String?)] = [:]  // 会话 → 审批卡所在轮次+命令,决定后原地改成已处理卡
+    /// 一次审批请求 = 一条记录 = 一张独立卡片(id 带轮内序号)。
+    /// 同一轮多次审批时,每次都是新卡追加在会话末尾,旧卡保留各自的结果。
+    private struct PermRecord {
+        let pfx: String       // 请求发生时的轮次前缀
+        let idx: Int          // 轮内序号(同轮第几次审批)
+        var detail: String?   // 请求的命令
+        var decision: String? // nil=待决定;"allow"/"deny"/"timeout"/"expired"
+    }
+    private var permRecords: [String: [PermRecord]] = [:]  // 会话 → 审批记录
+    private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var retry = 0
     private var started = false
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
@@ -57,7 +66,7 @@ final class RelayAgent: NSObject, ObservableObject {
         pending.$pendingIDs
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
-        pending.$lastDecisions
+        pending.$decisionEvents
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
         connect()
@@ -115,11 +124,22 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 每个会话 → **多条独立消息**(prompt / 每句 AI 文本 / 每个文件 / 每条命令 / 待批准),
     /// 各自一条 `ui` 帧。手机端据此渲染成真正的对话:每条消息独立一行、各带头像。
     private func syncToServer() {
+        // 先消费新的审批决定事件:把结果写进对应记录(该会话最早一条未决定的)。
+        for ev in pending.decisionEvents where ev.seq > appliedDecisionSeq {
+            if var recs = permRecords[ev.sid],
+               let i = recs.firstIndex(where: { $0.decision == nil }) {
+                recs[i].decision = ev.decision
+                permRecords[ev.sid] = recs
+            }
+            appliedDecisionSeq = max(appliedDecisionSeq, ev.seq)
+        }
+
         let activeSids = Set(store.sessions.map(\.id))
         // 整会话消失 → 删除该会话所有消息
         for sid in knownSids where !activeSids.contains(sid) {
             sendSessionRemove(sid: sid)
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
+            permRecords[sid] = nil
         }
         knownSids = activeSids
 
@@ -283,15 +303,34 @@ final class RelayAgent: NSObject, ObservableObject {
             out.append(Msg(id: "\(pfx)g\(gi)", role: "agent", root: root, fallback: g.fallback))
         }
 
-        // 待批准命令。决定后不删卡:同 id 原地换成「已允许/已拒绝」,留在会话历史里。
+        // 审批:每次请求 = 一条独立记录 = 一张独立卡(id 带轮内序号)。
+        // 决定后卡片原地变「已允许/已拒绝」;同轮再次审批 → 追加新卡,不复用旧卡。
+        var recs = permRecords[sid] ?? []
         if pending.pendingIDs.contains(sid) {
-            permSeen[sid] = (pfx, e.toolDetail)
-            out.append(Msg(id: "\(pfx)pending", role: "agent", root: permCard(e), fallback: "需要批准"))
-        } else if let seen = permSeen[sid], seen.pfx == pfx,
-                  let decision = pending.lastDecisions[sid] {
-            out.append(Msg(id: "\(pfx)pending", role: "agent",
-                           root: permResolvedCard(detail: seen.detail, decision: decision),
-                           fallback: decision == "allow" ? "已允许" : "已拒绝"))
+            if let i = recs.indices.last, recs[i].decision == nil, recs[i].pfx == pfx {
+                // 同一请求仍在挂起:刷新命令详情即可
+                if let td = e.toolDetail { recs[i].detail = td }
+            } else {
+                let idx = recs.filter { $0.pfx == pfx }.count
+                recs.append(PermRecord(pfx: pfx, idx: idx, detail: e.toolDetail, decision: nil))
+            }
+        } else if let i = recs.indices.last, recs[i].decision == nil {
+            // 不再挂起且没有决定事件(连接被丢弃,如会话结束)→ 标记失效
+            recs[i].decision = "expired"
+        }
+        permRecords[sid] = recs
+        for r in recs where r.pfx == pfx {
+            if let d = r.decision {
+                out.append(Msg(id: "\(pfx)perm\(r.idx)", role: "agent",
+                               root: permResolvedCard(detail: r.detail, decision: d),
+                               fallback: d == "allow" ? "已允许" : "已拒绝"))
+            } else {
+                out.append(Msg(id: "\(pfx)perm\(r.idx)", role: "agent",
+                               root: permCard(detail: r.detail, sid: sid), fallback: "需要批准"))
+            }
+        }
+        if recs.contains(where: { $0.pfx == pfx }) {
+            // 有审批卡时不再追加 waiting 提示
         } else if out.isEmpty, case .waiting(let msg) = e.state {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
@@ -300,14 +339,14 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     /// 待批准卡(允许/拒绝)。
-    private func permCard(_ e: SessionEntry) -> [String: Any] {
+    private func permCard(detail: String?, sid: String) -> [String: Any] {
         var kids: [[String: Any]] = [text("请求执行以下命令:", color: "secondary", style: "caption")]
-        if let td = e.toolDetail { kids.append(code(td)) }
+        if let detail { kids.append(code(detail)) }
         kids.append([
             "type": "button_group",
             "props": ["buttons": [
-                button(label: "拒绝", style: "default", actionId: "perm_deny", value: e.id),
-                button(label: "允许", style: "danger", actionId: "perm_allow", value: e.id)
+                button(label: "拒绝", style: "default", actionId: "perm_deny", value: sid),
+                button(label: "允许", style: "danger", actionId: "perm_allow", value: sid)
             ]]
         ])
         return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
@@ -317,9 +356,10 @@ final class RelayAgent: NSObject, ObservableObject {
     private func permResolvedCard(detail: String?, decision: String) -> [String: Any] {
         let (label, color, icon, style): (String, String, String, String)
         switch decision {
-        case "allow": (label, color, icon, style) = ("✓ 已允许", "success", "checkmark.circle.fill", "default")
-        case "deny":  (label, color, icon, style) = ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
-        default:      (label, color, icon, style) = ("已超时,按默认流程处理", "secondary", "clock.fill", "default")
+        case "allow":   (label, color, icon, style) = ("✓ 已允许", "success", "checkmark.circle.fill", "default")
+        case "deny":    (label, color, icon, style) = ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
+        case "timeout": (label, color, icon, style) = ("已超时,按默认流程处理", "secondary", "clock.fill", "default")
+        default:        (label, color, icon, style) = ("已失效", "secondary", "minus.circle.fill", "default")
         }
         var kids: [[String: Any]] = [text("请求执行以下命令:", color: "secondary", style: "caption")]
         if let detail { kids.append(code(detail)) }
