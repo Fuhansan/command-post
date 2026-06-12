@@ -26,6 +26,9 @@ enum SessionStatusUI {
 /// 屏 1 —— 任务列表(首页)。每个 claude 终端会话 = 一个任务(来自服务器,非模拟数据)。
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
+    @State private var showLaunch = false
+    @State private var launchCmd = "claude"
+    @State private var launched = false
 
     var body: some View {
         NavigationStack {
@@ -52,6 +55,7 @@ struct TasksView: View {
                 TaskDetailView(sessionId: sid)
             }
             .toolbar(.hidden, for: .navigationBar)
+            .sheet(isPresented: $showLaunch) { launchSheet }
         }
     }
 
@@ -66,7 +70,56 @@ struct TasksView: View {
                 connectionLine
             }
             Spacer()
+            // 新建会话:电脑端开一个终端跑命令
+            Button {
+                launchCmd = "claude"; launched = false; showLaunch = true
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(Theme.blueBtn).clipShape(Circle())
+            }
+            .disabled(!relay.agents.contains { $0.online })
         }
+    }
+
+    /// 新建会话弹层:在电脑上开一个 Terminal.app 跑命令(默认 claude)。
+    private var launchSheet: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 14) {
+                Text("在电脑上新建会话").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
+                Text("电脑会打开一个终端窗口运行下面的命令。想进某个项目就带上 cd,例如:\ncd ~/proj && claude")
+                    .font(.system(size: 13)).foregroundStyle(Theme.textSec)
+                TextField("", text: $launchCmd, prompt: Text("要运行的命令").foregroundColor(Theme.textTer), axis: .vertical)
+                    .font(.system(size: 15, design: .monospaced)).foregroundStyle(Theme.text)
+                    .autocorrectionDisabled().textInputAutocapitalization(.never)
+                    .lineLimit(1...4)
+                    .padding(12).background(Theme.field)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                Button {
+                    relay.launchCommand(launchCmd)
+                    launched = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { showLaunch = false }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: launched ? "checkmark.circle.fill" : "play.fill")
+                        Text(launched ? "已发送,等终端启动…" : "在电脑上运行")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                    .foregroundStyle(.white).frame(maxWidth: .infinity).padding(.vertical, 13)
+                    .background(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty ? Theme.cardHi
+                                : (launched ? Theme.green : Theme.blueBtn))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .disabled(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty || launched)
+                Spacer()
+            }
+            .padding(24)
+        }
+        .presentationDetents([.medium])
     }
 
     private var connectionLine: some View {

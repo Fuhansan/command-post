@@ -221,6 +221,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.releaseQuestionGate(sid: sid)
             self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
         }
+        agent.onRemoteLaunch = { command in
+            vlog("relay launch: \(command)")
+            TerminalLauncher.run(command: command)
+        }
         agent.start()
         relayAgent = agent
         SettingsWindowController.shared.relayAgent = agent

@@ -49,6 +49,8 @@ final class RelayAgent: NSObject, ObservableObject {
     var onRemoteAnswer: ((String, [String], Bool, String) -> Void)?
     /// 手机选择「改在电脑上回答」→ 放行 hook,让终端正常弹题。
     var onRemoteAnswerLocal: ((String) -> Void)?
+    /// 手机请求新建会话:打开 Terminal.app 运行命令(如 `claude`)。
+    var onRemoteLaunch: ((String) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -709,6 +711,12 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         if actionId == "question_local" {
             if let sid = obj["sid"] as? String { onRemoteAnswerLocal?(sid) }
+            return
+        }
+        if actionId == "launch_command" {
+            // 新建会话:value 是要在新终端里跑的命令(默认 claude)
+            let cmd = (body["value"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cmd.isEmpty { onRemoteLaunch?(cmd) }
             return
         }
         // sid 优先取 value;回退用 msg_id("sess:<sid>")

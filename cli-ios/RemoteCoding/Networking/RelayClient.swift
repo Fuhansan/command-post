@@ -333,6 +333,18 @@ final class RelayClient: ObservableObject {
                      ]))
     }
 
+    /// 新建会话:请求电脑端开一个 Terminal.app 窗口运行命令(默认 claude)。
+    /// 命令跑起来后,新 claude 会话会经 hook 正常出现在任务列表。
+    func launchCommand(_ command: String) {
+        let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cmd.isEmpty else { return }
+        sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: "system", localMsgId: nil,
+                     body: .object([
+                       "action_id": .string("launch_command"),
+                       "value": .string(cmd)
+                     ]))
+    }
+
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
     func endSession(sessionId: String) {
         sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId, localMsgId: nil,
