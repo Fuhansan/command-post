@@ -145,6 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.start()
         relayAgent = agent
+
+        // 手机配对成功 / 退出登录 → 以新账号身份重连中转
+        NotificationCenter.default.addObserver(forName: .relayCredentialsChanged,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                vlog("relay credentials changed → reconnect as \(RelayAgent.account)")
+                self?.relayAgent?.restart()
+            }
+        }
     }
 
     /// Periodically drop sessions whose hook stream has gone silent (e.g. the

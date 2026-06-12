@@ -14,15 +14,16 @@ import Foundation
 final class RelayAgent: NSObject, ObservableObject {
 
     static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
-    /// 配对账号:读 ~/.vibenotch/account(手机端 Google 登录后填入同一邮箱),缺省 demo。
-    static let account: String = {
+    /// 配对账号:优先手机配对授权的凭据;其次 ~/.vibenotch/account 文件;缺省 demo。
+    static var account: String {
+        if let a = AgentCredentials.account, !a.isEmpty { return a }
         let path = NSString(string: "~/.vibenotch/account").expandingTildeInPath
         if let s = try? String(contentsOfFile: path, encoding: .utf8) {
             let t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if !t.isEmpty { return t }
         }
         return "demo"
-    }()
+    }
     // 每个 claude 会话(终端)= 一个独立协议 sid = entry.id → 手机端分成多个任务。
 
     /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。
@@ -139,12 +140,20 @@ final class RelayAgent: NSObject, ObservableObject {
         sendJSON([
             "v": 1, "t": "auth", "id": "h_agent", "from": "agent",
             "body": [
-                "token": "agent",
+                // 配对授权拿到的 token:服务器优先据此解析账号(没有则回退 account 会合)
+                "token": AgentCredentials.token ?? "agent",
                 "account": Self.account,
                 "device": ["id": "agent_mac", "platform": "mac", "name": name],
                 "caps": ["protocol": 1]
             ]
         ])
+    }
+
+    /// 凭据变化(配对成功/退出)→ 以新身份重连。
+    func restart() {
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        connect()
     }
 
     // MARK: - 上行:会话 → 协议组件

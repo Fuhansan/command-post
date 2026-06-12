@@ -20,6 +20,25 @@ enum AuthAPI {
     @MainActor
     static var baseURL: String { "http://\(RelayClient.savedHost):8080/api/auth" }
 
+    /// 认领电脑端的配对码:把 VibeNotch 绑到当前登录账号下。
+    @MainActor
+    static func claimPair(code: String) async throws {
+        guard let token = AppState.sessionToken else { throw AuthError.server("请先登录") }
+        guard let url = URL(string: "http://\(RelayClient.savedHost):8080/api/pair/claim") else {
+            throw URLError(.badURL)
+        }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["code": code, "token": token])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw AuthError.server(msg ?? "配对失败(\(http.statusCode))")
+        }
+    }
+
     /// 用 Google idToken 换本系统会话令牌。
     @MainActor
     static func loginWithGoogle(idToken: String) async throws -> AuthResult {

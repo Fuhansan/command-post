@@ -1,10 +1,89 @@
 import SwiftUI
 
-/// 设备 / 设置(占位,后续展开)。
+/// 设备页:在线电脑列表 + 配对新电脑(输入 VibeNotch 设置里显示的配对码)。
 struct DevicesView: View {
     @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var relay: RelayClient
+    @State private var code = ""
+    @State private var claiming = false
+    @State private var result: (ok: Bool, message: String)? = nil
+
     var body: some View {
-        placeholder(icon: "desktopcomputer", title: "设备", subtitle: "管理已连接的电脑代理")
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text("设备").font(.system(size: 24, weight: .bold)).foregroundStyle(Theme.text)
+
+                    // 已连接的电脑
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("电脑代理").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.textSec)
+                        if relay.agents.isEmpty {
+                            Text("暂无在线电脑").font(.system(size: 14)).foregroundStyle(Theme.textTer)
+                        } else {
+                            ForEach(relay.agents) { agent in
+                                HStack(spacing: 10) {
+                                    Image(systemName: "desktopcomputer")
+                                        .font(.system(size: 18))
+                                        .foregroundStyle(agent.online ? Theme.green : Theme.textTer)
+                                    Text(agent.name).font(.system(size: 15)).foregroundStyle(Theme.text)
+                                    Spacer()
+                                    Text(agent.online ? "在线" : "离线")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(agent.online ? Theme.green : Theme.textTer)
+                                }
+                            }
+                        }
+                    }
+                    .padding(16).frame(maxWidth: .infinity, alignment: .leading).cardStyle()
+
+                    // 配对新电脑
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("配对新电脑").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.textSec)
+                        Text("在电脑上打开 VibeNotch 设置 → 点「配对手机」,把显示的 6 位码填到这里")
+                            .font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                        HStack(spacing: 10) {
+                            TextField("", text: $code,
+                                      prompt: Text("6 位配对码").foregroundColor(Theme.textTer))
+                                .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(Theme.text)
+                                .keyboardType(.numberPad)
+                                .padding(.horizontal, 14).padding(.vertical, 12)
+                                .background(Theme.field)
+                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                            Button {
+                                claiming = true; result = nil
+                                let c = code.trimmingCharacters(in: .whitespaces)
+                                Task {
+                                    do {
+                                        try await AuthAPI.claimPair(code: c)
+                                        result = (true, "✓ 配对成功,电脑将自动以你的账号上线")
+                                        code = ""
+                                    } catch {
+                                        result = (false, error.localizedDescription)
+                                    }
+                                    claiming = false
+                                }
+                            } label: {
+                                Text(claiming ? "配对中…" : "配对")
+                                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                                    .padding(.horizontal, 18).padding(.vertical, 12)
+                                    .background(Theme.blueBtn)
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                            }
+                            .disabled(claiming || code.trimmingCharacters(in: .whitespaces).count != 6)
+                        }
+                        if let r = result {
+                            Text(r.message).font(.system(size: 13))
+                                .foregroundStyle(r.ok ? Theme.green : Theme.coral)
+                        }
+                    }
+                    .padding(16).cardStyle()
+                }
+                .padding(16)
+            }
+        }
     }
 }
 
