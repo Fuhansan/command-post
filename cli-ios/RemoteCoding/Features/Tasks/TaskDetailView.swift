@@ -30,8 +30,11 @@ struct TaskDetailView: View {
                                     ForEach(msgs) { msg in
                                         messageRow(msg).id(msg.id)
                                     }
-                                } else {
+                                } else if session?.status != "working" {
                                     emptyState
+                                }
+                                if session?.status == "working" {
+                                    TypingIndicatorRow().id("typing")
                                 }
                             }
                             .padding(.horizontal, 16).padding(.vertical, 12)
@@ -40,8 +43,15 @@ struct TaskDetailView: View {
                         }
                         .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
                         .onChange(of: session?.messages.count ?? 0) { _, _ in
-                            if let last = session?.messages.last {
+                            if session?.status == "working" {
+                                withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
+                            } else if let last = session?.messages.last {
                                 withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                            }
+                        }
+                        .onChange(of: session?.status ?? "") { _, st in
+                            if st == "working" {
+                                withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
                             }
                         }
                     }
@@ -285,6 +295,35 @@ struct TaskDetailView: View {
             stagedImages = []
         }
         draft = ""
+    }
+}
+
+/// 「AI 正在思考」指示气泡:头像 + 三个呼吸跳动的圆点。
+/// 会话状态 working 时挂在消息流末尾,让用户知道对面在干活。
+struct TypingIndicatorRow: View {
+    @State private var animate = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            MessageAvatar(icon: "sparkles", colors: [Color(hex: 0x7C5CD6), Color(hex: 0xC061E0)])
+            HStack(spacing: 5) {
+                ForEach(0..<3, id: \.self) { i in
+                    Circle()
+                        .fill(Theme.textSec)
+                        .frame(width: 7, height: 7)
+                        .scaleEffect(animate ? 1.2 : 0.7)
+                        .opacity(animate ? 1 : 0.4)
+                        .animation(.easeInOut(duration: 0.45).repeatForever(autoreverses: true)
+                            .delay(Double(i) * 0.16), value: animate)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 13)
+            .background(Theme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Theme.stroke, lineWidth: 1))
+            Spacer()
+        }
+        .onAppear { animate = true }
     }
 }
 
