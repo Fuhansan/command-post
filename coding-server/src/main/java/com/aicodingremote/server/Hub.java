@@ -28,6 +28,9 @@ public class Hub {
 
     private final Map<String, Account> accounts = new ConcurrentHashMap<>();
 
+    /** 手机挂起的电脑(account → deviceId → 设备名)。挂起期间该 Agent 的鉴权被拒。 */
+    private final Map<String, Map<String, String>> suspended = new ConcurrentHashMap<>();
+
     /** 一条快照:来自哪台 Agent + 帧原文(reset 时按设备作用域清理,多电脑互不影响)。 */
     private record Snap(String agentId, String frame) {}
 
@@ -72,6 +75,26 @@ public class Hub {
         Map<String, Snap> m = snapshots.get(account);
         if (m == null) return;
         synchronized (m) { m.values().removeIf(v -> agentId == null || agentId.equals(v.agentId())); }
+    }
+
+    public void suspendAgent(String account, String deviceId, String name) {
+        suspended.computeIfAbsent(account, k -> new ConcurrentHashMap<>())
+                 .put(deviceId, name == null ? deviceId : name);
+    }
+
+    public void resumeAgent(String account, String deviceId) {
+        Map<String, String> m = suspended.get(account);
+        if (m != null) m.remove(deviceId);
+    }
+
+    public boolean isSuspended(String account, String deviceId) {
+        Map<String, String> m = suspended.get(account);
+        return m != null && m.containsKey(deviceId);
+    }
+
+    /** 该账号被挂起的设备(deviceId → 名称),auth_ok 时带给手机展示。 */
+    public Map<String, String> suspendedOf(String account) {
+        return suspended.getOrDefault(account, Map.of());
     }
 
     public void register(Connection c) {

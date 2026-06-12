@@ -63,6 +63,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var seenFrameOrder: [String] = []               // 同上,FIFO 容量控制
     private var lastPongAt = Date()                         // 最近一次 pong,用于检测僵死连接
     private var heartbeatTimer: Timer?
+    private var coolDownUntil = Date.distantPast            // 被服务器拒绝(挂起/令牌失效)后的重连冷却
 
     /// 消息首次出现的时间;之后同 id 始终返回同一值。
     private func stamp(for msgId: String) -> String {
@@ -525,6 +526,14 @@ final class RelayAgent: NSObject, ObservableObject {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let t = obj["t"] as? String
         if t == "pong" { lastPongAt = Date(); return }
+        if t == "error", let body = obj["body"] as? [String: Any],
+           (body["fatal"] as? Bool) == true {
+            // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
+            // (手机点「重连」解除后,下一次探测即恢复上线)
+            coolDownUntil = Date().addingTimeInterval(30)
+            vlog("relay: 服务器拒绝(\(body["code"] as? String ?? "?")),30s 后再试")
+            return
+        }
         guard t == "input" || t == "action" else { return }
 
         // 可靠投递:回 delivered 级 ack;按帧 id 去重(重发的帧只 ack 不重复执行,
@@ -602,7 +611,8 @@ final class RelayAgent: NSObject, ObservableObject {
     private func scheduleReconnect() {
         heartbeatTimer?.invalidate(); heartbeatTimer = nil
         retry += 1
-        let delay = min(pow(2.0, Double(retry)), 30)
+        let delay = max(min(pow(2.0, Double(retry)), 30),
+                        coolDownUntil.timeIntervalSinceNow)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             self.connect()

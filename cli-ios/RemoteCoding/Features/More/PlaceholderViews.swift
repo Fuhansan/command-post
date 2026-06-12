@@ -26,11 +26,23 @@ struct DevicesView: View {
                                     Image(systemName: "desktopcomputer")
                                         .font(.system(size: 18))
                                         .foregroundStyle(agent.online ? Theme.green : Theme.textTer)
-                                    Text(agent.name).font(.system(size: 15)).foregroundStyle(Theme.text)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(agent.name).font(.system(size: 15)).foregroundStyle(Theme.text)
+                                        Text(agent.online ? "在线" : (agent.suspended ? "已断开(挂起)" : "离线"))
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(agent.online ? Theme.green
+                                                             : (agent.suspended ? Theme.gold : Theme.textTer))
+                                    }
                                     Spacer()
-                                    Text(agent.online ? "在线" : "离线")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(agent.online ? Theme.green : Theme.textTer)
+                                    if agent.online {
+                                        Button("断开") { relay.suspendAgent(agent) }
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundStyle(Theme.coral)
+                                    } else if agent.suspended {
+                                        Button("重连") { relay.resumeAgent(agent) }
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .foregroundStyle(Theme.blue)
+                                    }
                                 }
                             }
                         }

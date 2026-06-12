@@ -16,8 +16,9 @@ final class Frames {
 
     private Frames() {}
 
-    /** PROTOCOL §8.1 —— 握手成功，回带账号下在线 Agent 列表。 */
-    static String authOk(String account, Collection<Connection> agents) {
+    /** PROTOCOL §8.1 —— 握手成功，回带账号下在线 Agent + 被挂起的 Agent 列表。 */
+    static String authOk(String account, Collection<Connection> agents,
+                         java.util.Map<String, String> suspendedAgents) {
         ObjectNode f = M.createObjectNode();
         f.put("v", 1).put("t", "auth_ok").put("from", "server");
         ObjectNode body = f.putObject("body");
@@ -30,6 +31,13 @@ final class Frames {
             o.put("name", a.deviceName);
             o.put("online", true);
         }
+        suspendedAgents.forEach((id, name) -> {
+            ObjectNode o = arr.addObject();
+            o.put("id", id);
+            o.put("name", name);
+            o.put("online", false);
+            o.put("suspended", true);
+        });
         return f.toString();
     }
 

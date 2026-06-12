@@ -56,6 +56,7 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
                 Connection c = ctx.channel().attr(CONN).get();
                 forward(ctx, text, /*fromAgent=*/c != null && c.isAgent());
             }
+            case "ctl"    -> handleCtl(ctx, root);
             case "resume" -> { /* 最小版无缓冲,忽略回放请求(PROTOCOL §8.4 待实现) */ }
             default -> log.debug("忽略未知/未处理 frame t={}", t);
         }
@@ -88,13 +89,21 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         String deviceName = device.path("name").asText(role == Connection.Role.AGENT ? "Agent" : "Device");
         String deviceId = device.hasNonNull("id") ? device.path("id").asText() : deviceName;
 
+        // 被手机挂起的电脑:拒绝接入,直到手机点「重连」解除
+        if (role == Connection.Role.AGENT && hub.isSuspended(account, deviceId)) {
+            log.info("auth 拒绝: 设备已被手机挂起 {}@{}", deviceId, account);
+            send(ctx.channel(), Frames.error("suspended", "该电脑已被手机端断开,在手机「设备」页点重连恢复", true));
+            ctx.close();
+            return;
+        }
+
         Connection conn = new Connection(ctx.channel(), account, role, deviceId, deviceName);
         ctx.channel().attr(CONN).set(conn);
         hub.register(conn);
         log.info("auth: {} 上线 (account={})", conn, account);
 
         // 回 auth_ok:带上该账号当前在线的 Agent 列表
-        send(ctx.channel(), Frames.authOk(account, hub.agentsOf(account)));
+        send(ctx.channel(), Frames.authOk(account, hub.agentsOf(account), hub.suspendedOf(account)));
 
         if (role == Connection.Role.AGENT) {
             // Agent 上线 → 通知同账号的 Client
@@ -140,6 +149,33 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
             String msgId = root.path("id").asText("");
             if (!msgId.isEmpty()) hub.removeSnapshot(conn.account, msgId);
         }
+    }
+
+    /** 手机的设备控制:挂起(断开某台电脑)/ 恢复。服务端自己消费,不转发。 */
+    private void handleCtl(ChannelHandlerContext ctx, JsonNode root) {
+        Connection conn = ctx.channel().attr(CONN).get();
+        if (conn == null || conn.isAgent()) return;
+        JsonNode body = root.path("body");
+        String op = body.path("op").asText("");
+        String agentId = body.path("agent").asText("");
+        if (agentId.isEmpty()) return;
+        switch (op) {
+            case "agent_suspend" -> {
+                String name = body.path("name").asText(agentId);
+                hub.suspendAgent(conn.account, agentId, name);
+                // 踢掉该设备当前的连接(channelInactive 会清快照 + 广播 reset/离线)
+                for (Connection a : hub.agentsOf(conn.account)) {
+                    if (agentId.equals(a.deviceId)) a.channel.close();
+                }
+                log.info("ctl: 挂起设备 {}@{}", agentId, conn.account);
+            }
+            case "agent_resume" -> {
+                hub.resumeAgent(conn.account, agentId);
+                log.info("ctl: 恢复设备 {}@{} (等待其重连)", agentId, conn.account);
+            }
+            default -> { }
+        }
+        ackToSender(ctx, root);
     }
 
     /** 上行帧到达即回 server 级 ack 给发送方(发送方据此把消息标为「已发送 ✓」)。 */

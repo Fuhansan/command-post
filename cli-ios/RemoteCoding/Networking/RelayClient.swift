@@ -177,7 +177,29 @@ final class RelayClient: ObservableObject {
     private static func parseAgents(_ body: JSONValue?) -> [AgentInfo] {
         (body?["agents"]?.arrayValue ?? []).map {
             AgentInfo(id: $0.string("id"), name: $0.string("name", default: "Agent"),
-                      online: $0["online"]?.boolValue ?? true)
+                      online: $0["online"]?.boolValue ?? true,
+                      suspended: $0["suspended"]?.boolValue ?? false)
+        }
+    }
+
+    /// 断开某台电脑(服务器挂起它并踢下线;它的会话随 reset/离线清除)。
+    func suspendAgent(_ agent: AgentInfo) {
+        sendFrame(t: "ctl", id: "ctl_\(UUID().uuidString)", sid: nil,
+                  body: .object(["op": .string("agent_suspend"),
+                                 "agent": .string(agent.id),
+                                 "name": .string(agent.name)]))
+        if let i = agents.firstIndex(where: { $0.id == agent.id }) {
+            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: false, suspended: true)
+        }
+    }
+
+    /// 恢复某台电脑(解除挂起;电脑 30 秒内自动重连上线)。
+    func resumeAgent(_ agent: AgentInfo) {
+        sendFrame(t: "ctl", id: "ctl_\(UUID().uuidString)", sid: nil,
+                  body: .object(["op": .string("agent_resume"),
+                                 "agent": .string(agent.id)]))
+        if let i = agents.firstIndex(where: { $0.id == agent.id }) {
+            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: false, suspended: false)
         }
     }
 
@@ -186,7 +208,9 @@ final class RelayClient: ObservableObject {
         let online = body["online"]?.boolValue ?? false
         let name = body["name"]?.stringValue
         if let idx = agents.firstIndex(where: { $0.id == id }) {
-            agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name, online: online)
+            // 上线即非挂起;离线保留原 suspended 标记(挂起导致的离线仍显示「重连」)
+            let susp = online ? false : agents[idx].suspended
+            agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name, online: online, suspended: susp)
         } else if online {
             agents.append(AgentInfo(id: id, name: name ?? id, online: true))
         }

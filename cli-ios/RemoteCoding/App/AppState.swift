@@ -42,4 +42,5 @@ struct AgentInfo: Identifiable, Hashable {
     let id: String
     let name: String
     let online: Bool
+    var suspended: Bool = false   // 被手机端「断开」挂起,可点重连恢复
 }
