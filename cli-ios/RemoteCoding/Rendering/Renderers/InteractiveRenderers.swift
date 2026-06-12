@@ -4,17 +4,29 @@ import SwiftUI
 
 struct ButtonRenderer: View {
     let component: Component
+    /// 点击后的本地即时反馈(组内共享):点过 → 高亮所点项 + 转圈,其余禁用。
+    var pressed: Binding<Int?>? = nil
+    var index: Int = 0
+
     @Environment(\.onComponentAction) private var onAction
 
     var body: some View {
         let label = component.props.string("label", default: "确定")
         let style = component.props.string("style", default: "default")
         let icon = component.props["icon"]?.stringValue
+        let isPressed = pressed?.wrappedValue == index
+        let anyPressed = pressed?.wrappedValue != nil
         Button {
+            guard !anyPressed else { return }   // 防重复点击
+            pressed?.wrappedValue = index       // 立即本地反馈,不等服务器
             if let action = component.action { onAction(action) }
         } label: {
             HStack(spacing: 6) {
-                if let icon { Image(systemName: icon).font(.system(size: 14, weight: .semibold)) }
+                if isPressed {
+                    ProgressView().controlSize(.mini).tint(Self.fg(style))
+                } else if let icon {
+                    Image(systemName: icon).font(.system(size: 14, weight: .semibold))
+                }
                 Text(label).font(.system(size: 14, weight: .semibold))
             }
             .foregroundStyle(Self.fg(style))
@@ -23,8 +35,10 @@ struct ButtonRenderer: View {
             .background(Self.bg(style))
             .overlay(RoundedRectangle(cornerRadius: Theme.rBtn).stroke(Self.border(style), lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: Theme.rBtn))
+            .opacity(anyPressed && !isPressed ? 0.35 : 1)
         }
         .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: pressed?.wrappedValue)
     }
 
     static func bg(_ s: String) -> Color {
@@ -40,11 +54,13 @@ struct ButtonRenderer: View {
 
 struct ButtonGroupRenderer: View {
     let component: Component
+    @State private var pressed: Int? = nil   // 本地点击态;agent 重发新卡片后视图重建自动复位
+
     var body: some View {
         let buttons = component.props["buttons"]?.arrayValue ?? []
         HStack(spacing: 10) {
-            ForEach(Array(buttons.enumerated()), id: \.offset) { _, json in
-                ButtonRenderer(component: Component(json: json))
+            ForEach(Array(buttons.enumerated()), id: \.offset) { i, json in
+                ButtonRenderer(component: Component(json: json), pressed: $pressed, index: i)
             }
         }
     }

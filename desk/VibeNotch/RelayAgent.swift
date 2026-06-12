@@ -81,6 +81,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var questionRecords: [String: [QuestionRecord]] = [:]
     private var phoneChoice: [String: String] = [:]   // 会话 → 手机刚选的选项文字(等 PostToolUse 确认)
     private var multiPicks: [String: Set<String>] = [:]   // 会话 → 多选题已勾选的选项文字
+    private var answerFeedback: [String: String] = [:]    // 会话 → 点击后的即时反馈(显示在卡上)
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
     private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
@@ -433,6 +434,8 @@ final class RelayAgent: NSObject, ObservableObject {
         } else if let i = qrecs.indices.last, !qrecs[i].answered {
             qrecs[i].answered = true
             qrecs[i].choiceLabel = phoneChoice.removeValue(forKey: sid) ?? "已在电脑上选择"
+            answerFeedback[sid] = nil
+            multiPicks[sid] = nil
         }
         questionRecords[sid] = qrecs
         for r in qrecs where r.pfx == pfx {
@@ -513,6 +516,15 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         if r.answered {
             kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
+        } else if q?.multiSelect == true, let fb = answerFeedback[sid] {
+            kids.append(badge(fb, color: "gold"))
+            var buttons = opts.prefix(4).enumerated().map { i, o in
+                button(label: "\(i + 1) · \(cap(o.label, 12))", style: "default",
+                       actionId: "question_answer", value: "\(i + 1)")
+            }
+            buttons.append(button(label: "✓ 完成选择", style: "danger",
+                                  actionId: "question_answer", value: "enter"))
+            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
         } else if q?.multiSelect == true {
             kids.append(text("多选:点选项切换勾选(再点一次取消),选好后点「完成选择」提交",
                              color: "secondary", style: "caption"))
@@ -523,6 +535,8 @@ final class RelayAgent: NSObject, ObservableObject {
             buttons.append(button(label: "✓ 完成选择", style: "danger",
                                   actionId: "question_answer", value: "enter"))
             kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
+        } else if let fb = answerFeedback[sid] {
+            kids.append(badge(fb, color: "gold"))   // 已发送按键,等待 TUI 确认(防重复点击)
         } else {
             let buttons = opts.prefix(4).enumerated().map { i, o in
                 button(label: "\(i + 1) · \(cap(o.label, 14))", style: i == 0 ? "danger" : "default",
@@ -689,7 +703,21 @@ final class RelayAgent: NSObject, ObservableObject {
                     phoneChoice[sid] = opts[i - 1].label
                 }
             }
+            // 即时反馈:让卡片立刻显示"已发送/已勾选",用户知道点击生效了
+            if let e = store.sessions.first(where: { $0.id == sid }), let pq = e.pendingQuestion {
+                if digit == "enter" {
+                    answerFeedback[sid] = "已提交,等待终端确认…"
+                } else if pq.questions.first?.multiSelect == true {
+                    let picks = multiPicks[sid] ?? []
+                    answerFeedback[sid] = picks.isEmpty ? "已全部取消勾选"
+                        : "已勾选: " + picks.sorted().joined(separator: "、")
+                } else {
+                    answerFeedback[sid] = "已选「\(digit)」,等待终端确认…"
+                }
+            }
+            vlog("question_answer sid=\(sid.prefix(8)) digit=\(digit)")
             onRemoteAnswer?(sid, digit)
+            syncToServer()   // 卡片即时重渲染(反馈可见)
             return
         }
         // sid 优先取 value;回退用 msg_id("sess:<sid>")

@@ -295,6 +295,9 @@ struct PhotoMsgRenderer: View {
     }
 
     /// 兼容两种 images 元素:对象 {data,name,kind,size} 或纯 base64 字符串(旧格式)。
+    /// 解码结果缓存 —— 列表重渲染时不再重复 base64 解码(消灭闪烁)。
+    private static let imageCache = NSCache<NSString, UIImage>()
+
     private func decodeItems(_ arr: [JSONValue]) -> [Item] {
         arr.compactMap { v in
             let b64: String?
@@ -307,7 +310,13 @@ struct PhotoMsgRenderer: View {
             } else {
                 b64 = v.stringValue
             }
-            guard let s = b64, let d = Data(base64Encoded: s), let ui = UIImage(data: d) else { return nil }
+            guard let s = b64 else { return nil }
+            let key = "\(s.count):\(s.prefix(48))" as NSString
+            if let cached = Self.imageCache.object(forKey: key) {
+                return Item(image: cached, name: name, kind: kind, size: size)
+            }
+            guard let d = Data(base64Encoded: s), let ui = UIImage(data: d) else { return nil }
+            Self.imageCache.setObject(ui, forKey: key)
             return Item(image: ui, name: name, kind: kind, size: size)
         }
     }
