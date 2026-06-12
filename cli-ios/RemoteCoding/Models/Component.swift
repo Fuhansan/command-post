@@ -39,6 +39,14 @@ struct StagedImagePayload {
     let size: String   // "1.2 MB"
 }
 
+/// 上行消息的投递状态(两段式 ack:服务器 → 代理端)。
+enum DeliveryStatus {
+    case sending     // 已发出,未收到任何 ack
+    case sent        // 服务器已确认(单勾)
+    case delivered   // 电脑端已确认(双勾)
+    case failed      // 重试耗尽,可手动重发
+}
+
 /// PROTOCOL §5 —— 一条渲染用的富消息。由 `t: "ui"` 的 Frame 构造。
 struct UIMessage: Identifiable {
     let id: String
@@ -47,6 +55,8 @@ struct UIMessage: Identifiable {
     var root: Component
     var fallbackText: String?
     var time: String?         // 消息时间(HH:mm,首次出现时刻,由 agent 下发)
+    var status: DeliveryStatus? = nil   // 仅本地发出的消息有;agent 下发的为 nil
+    var upstreamId: String? = nil       // 对应的上行帧 id(重发/对账用)
 
     init?(frame: Frame) {
         guard case .ui = frame.t, let id = frame.id, let body = frame.body else { return nil }

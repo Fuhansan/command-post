@@ -44,6 +44,16 @@ final class Frames {
         return f.toString();
     }
 
+    /** 上行确认:stage=server(已到服务器)。delivered 级由 Agent 发出、服务器透传。 */
+    static String ack(String ackId, String stage) {
+        ObjectNode f = M.createObjectNode();
+        f.put("v", 1).put("t", "ack").put("from", "server");
+        ObjectNode body = f.putObject("body");
+        body.put("ack_id", ackId);
+        body.put("stage", stage);
+        return f.toString();
+    }
+
     /** PROTOCOL §8.3 —— 心跳回应，回显 id / ts。 */
     static String pong(String id, long ts) {
         ObjectNode f = M.createObjectNode();

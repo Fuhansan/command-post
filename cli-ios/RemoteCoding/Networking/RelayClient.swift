@@ -73,10 +73,13 @@ final class RelayClient: ObservableObject {
 
     private func ingest(_ frame: Frame) {
         switch frame.t {
-        case .authOk:    agents = Self.parseAgents(frame.body)
+        case .authOk:
+            agents = Self.parseAgents(frame.body)
+            flushPending()   // 重连成功 → 补发断线期间未确认的上行
         case .presence:  applyPresence(frame.body)
         case .ui:        applyUI(frame)
         case .patch:     applyPatch(frame)
+        case .ack:       applyAck(frame)
         default:         break
         }
     }
@@ -117,8 +120,8 @@ final class RelayClient: ObservableObject {
         }
         if msg.role == "user" {
             // 正式的用户消息(经 agent 从转录回传)到达 → 移除发送时的本地回显,
-            // 否则同一条消息显示两遍(本地一条 + 正式一条)。
-            s.messages.removeAll { $0.seq == .max && $0.role == "user" }
+            // 否则同一条消息显示两遍(本地一条 + 正式一条)。发送失败的保留(重试入口)。
+            s.messages.removeAll { $0.seq == .max && $0.role == "user" && $0.status != .failed }
         }
         if let mIdx = s.messages.firstIndex(where: { $0.id == msg.id }) {
             s.messages[mIdx] = msg
@@ -159,36 +162,42 @@ final class RelayClient: ObservableObject {
     func sendInput(text: String, sessionId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let frameId = "in_\(UUID().uuidString)"
+        var msg = UIMessage(localUserText: trimmed)
+        msg.status = .sending; msg.upstreamId = frameId
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
-            sessions[idx].messages.append(UIMessage(localUserText: trimmed))
+            sessions[idx].messages.append(msg)
         }
-        sendFrame(t: "input", id: "in_\(UUID().uuidString)", sid: sessionId,
-                  body: .object(["kind": .string("text"), "text": .string(trimmed)]))
+        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: msg.id,
+                     body: .object(["kind": .string("text"), "text": .string(trimmed)]))
     }
 
     /// 图文输入:图片(base64)+ 可选文字一起发往电脑端,注入对应终端。本地先回显一条图文气泡。
     func sendImageInput(images: [StagedImagePayload], text: String, sessionId: String) {
         guard !images.isEmpty else { return sendInput(text: text, sessionId: sessionId) }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let frameId = "in_\(UUID().uuidString)"
+        var msg = UIMessage(localUserImages: images, text: trimmed)
+        msg.status = .sending; msg.upstreamId = frameId
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
-            sessions[idx].messages.append(UIMessage(localUserImages: images, text: trimmed))
+            sessions[idx].messages.append(msg)
         }
-        sendFrame(t: "input", id: "in_\(UUID().uuidString)", sid: sessionId,
-                  body: .object([
-                    "kind": .string("image"),
-                    "text": .string(trimmed),
-                    "images": .array(images.map { .object(["data": .string($0.data), "ext": .string($0.ext)]) })
-                  ]))
+        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: msg.id,
+                     body: .object([
+                       "kind": .string("image"),
+                       "text": .string(trimmed),
+                       "images": .array(images.map { .object(["data": .string($0.data), "ext": .string($0.ext)]) })
+                     ]))
     }
 
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
     func endSession(sessionId: String) {
-        sendFrame(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId,
-                  body: .object([
-                    "msg_id": .string("sess:\(sessionId)"),
-                    "action_id": .string("session_close"),
-                    "value": .string(sessionId)
-                  ]))
+        sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId, localMsgId: nil,
+                     body: .object([
+                       "msg_id": .string("sess:\(sessionId)"),
+                       "action_id": .string("session_close"),
+                       "value": .string(sessionId)
+                     ]))
     }
 
     func sendAction(_ action: ComponentAction, for messageId: String, sessionId: String) {
@@ -197,15 +206,102 @@ final class RelayClient: ObservableObject {
             "action_id": .string(action.id)
         ]
         if let v = action.value { obj["value"] = v }
-        sendFrame(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId, body: .object(obj))
+        sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId,
+                     localMsgId: nil, body: .object(obj))
+    }
+
+    /// 手动重发一条「发送失败」的消息(气泡上点重试)。
+    func retryUpstream(messageId: String, sessionId: String) {
+        guard let entry = pendingFrames.first(where: { $0.value.localMsgId == messageId }) else { return }
+        var p = entry.value
+        p.attempts = 0
+        pendingFrames[entry.key] = p
+        setStatus(.sending, localMsgId: messageId, sessionId: sessionId)
+        transmit(entry.key)
+    }
+
+    // MARK: - 可靠上行(待确认队列 + 超时重发 + 两段 ack)
+
+    /// 一条等待确认的上行帧。重发用同一帧 id —— agent 端按 id 幂等去重。
+    private struct PendingFrame {
+        let text: String          // 已序列化的帧原文
+        let sessionId: String
+        let localMsgId: String?   // 关联的本地回显消息(状态展示)
+        var attempts: Int = 0
+    }
+    private var pendingFrames: [String: PendingFrame] = [:]
+    private var ackTimeouts: [String: Task<Void, Never>] = [:]
+    private static let maxAttempts = 3
+
+    private func sendReliable(t: String, id: String, sid: String, localMsgId: String?, body: JSONValue) {
+        guard let text = frameText(t: t, id: id, sid: sid, body: body) else { return }
+        pendingFrames[id] = PendingFrame(text: text, sessionId: sid, localMsgId: localMsgId)
+        transmit(id)
+    }
+
+    private func transmit(_ frameId: String) {
+        guard var p = pendingFrames[frameId] else { return }
+        p.attempts += 1
+        pendingFrames[frameId] = p
+        ws.sendRaw(p.text)
+        scheduleAckTimeout(frameId, attempt: p.attempts)
+    }
+
+    /// 超时未收到 delivered ack → 重发(指数退避 5/10/20s);耗尽次数 → 标记失败。
+    private func scheduleAckTimeout(_ frameId: String, attempt: Int) {
+        ackTimeouts[frameId]?.cancel()
+        let delay = 5.0 * pow(2.0, Double(attempt - 1))
+        ackTimeouts[frameId] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !Task.isCancelled, let p = self.pendingFrames[frameId] else { return }
+            if p.attempts >= Self.maxAttempts {
+                self.ackTimeouts[frameId] = nil
+                if let mid = p.localMsgId { self.setStatus(.failed, localMsgId: mid, sessionId: p.sessionId) }
+                // pendingFrames 保留,供手动重试
+            } else {
+                self.transmit(frameId)
+            }
+        }
+    }
+
+    /// 处理服务器/代理端回的 ack:server 级 → 单勾;delivered 级 → 双勾并出队。
+    private func applyAck(_ frame: Frame) {
+        guard let ackId = frame.body?["ack_id"]?.stringValue,
+              let p = pendingFrames[ackId] else { return }
+        let stage = frame.body?["stage"]?.stringValue ?? "server"
+        if stage == "delivered" {
+            ackTimeouts[ackId]?.cancel(); ackTimeouts[ackId] = nil
+            pendingFrames[ackId] = nil
+            if let mid = p.localMsgId { setStatus(.delivered, localMsgId: mid, sessionId: p.sessionId) }
+        } else {
+            if let mid = p.localMsgId { setStatus(.sent, localMsgId: mid, sessionId: p.sessionId) }
+        }
+    }
+
+    /// 重连认证成功后补发所有未确认的上行(重置重试次数)。
+    private func flushPending() {
+        for id in pendingFrames.keys {
+            pendingFrames[id]?.attempts = 0
+            transmit(id)
+        }
+    }
+
+    private func setStatus(_ status: DeliveryStatus, localMsgId: String, sessionId: String) {
+        guard let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == localMsgId }) else { return }
+        sessions[sIdx].messages[mIdx].status = status
     }
 
     // MARK: - 出站封装
 
-    private func sendFrame(t: String, id: String, sid: String?, body: JSONValue) {
+    private func frameText(t: String, id: String, sid: String?, body: JSONValue) -> String? {
         guard let bodyData = try? JSONEncoder().encode(body),
-              let bodyStr = String(data: bodyData, encoding: .utf8) else { return }
+              let bodyStr = String(data: bodyData, encoding: .utf8) else { return nil }
         let sidPart = sid.map { "\"sid\":\"\($0)\"," } ?? ""
-        ws.sendRaw("{\"v\":1,\"t\":\"\(t)\",\"id\":\"\(id)\",\(sidPart)\"from\":\"client\",\"body\":\(bodyStr)}")
+        return "{\"v\":1,\"t\":\"\(t)\",\"id\":\"\(id)\",\(sidPart)\"from\":\"client\",\"body\":\(bodyStr)}"
+    }
+
+    private func sendFrame(t: String, id: String, sid: String?, body: JSONValue) {
+        if let text = frameText(t: t, id: id, sid: sid, body: body) { ws.sendRaw(text) }
     }
 }

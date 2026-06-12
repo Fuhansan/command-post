@@ -26,6 +26,8 @@ final class WebSocketClient: NSObject, ObservableObject {
     private lazy var session: URLSession = URLSession(configuration: .default)
     private var url: URL?
     private var retry = 0
+    private var heartbeat: Timer?
+    private var lastPongAt = Date()
 
     func connect(to url: URL) {
         self.url = url
@@ -37,13 +39,34 @@ final class WebSocketClient: NSObject, ObservableObject {
         receiveLoop()
         state = .connected
         retry = 0
+        startHeartbeat()
         onConnect?()   // 上层据此发 auth 帧(首连与重连都会触发)
     }
 
     func disconnect() {
+        heartbeat?.invalidate(); heartbeat = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         state = .disconnected
+    }
+
+    /// 应用层心跳:25s 一次 ping;70s 没收到 pong 视为僵死连接(切网/锁屏后的
+    /// TCP 黑洞,send 不报错只有心跳能发现),主动断开走重连。
+    private func startHeartbeat() {
+        lastPongAt = Date()
+        heartbeat?.invalidate()
+        heartbeat = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if Date().timeIntervalSince(self.lastPongAt) > 70 {
+                    self.heartbeat?.invalidate(); self.heartbeat = nil
+                    self.task?.cancel(with: .goingAway, reason: nil)
+                    self.scheduleReconnect()
+                    return
+                }
+                self.sendRaw("{\"v\":1,\"t\":\"ping\",\"id\":\"p_ios\",\"ts\":\(Int(Date().timeIntervalSince1970 * 1000))}")
+            }
+        }
     }
 
     /// 发送任意 Codable 的 Frame(出站)。
@@ -67,10 +90,15 @@ final class WebSocketClient: NSObject, ObservableObject {
                 switch result {
                 case .success(let message):
                     if case .string(let text) = message, let frame = Frame.decode(text) {
-                        self.onFrame?(frame)
+                        if case .pong = frame.t {
+                            self.lastPongAt = Date()   // 心跳回应,不上抛
+                        } else {
+                            self.onFrame?(frame)
+                        }
                     }
                     self.receiveLoop()
                 case .failure(let error):
+                    self.heartbeat?.invalidate(); self.heartbeat = nil
                     self.state = .failed(error.localizedDescription)
                     self.scheduleReconnect()
                 }

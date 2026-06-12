@@ -46,7 +46,13 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
                                 root.path("ts").asLong(System.currentTimeMillis())));
             case "ui"     -> { forward(ctx, text, /*fromAgent=*/true); snapshotUi(ctx, root, text); }
             case "patch"  -> handlePatch(ctx, root, text);
-            case "action", "input" -> forward(ctx, text, /*fromAgent=*/false);
+            // 上行指令:先回 server 级 ack(已到服务器),再转发给 Agent;
+            // Agent 处理后回 delivered 级 ack,经下面的 "ack" 分支透传回 Client。
+            case "action", "input" -> { ackToSender(ctx, root); forward(ctx, text, /*fromAgent=*/false); }
+            case "ack"    -> {
+                Connection c = ctx.channel().attr(CONN).get();
+                forward(ctx, text, /*fromAgent=*/c != null && c.isAgent());
+            }
             case "resume" -> { /* 最小版无缓冲,忽略回放请求(PROTOCOL §8.4 待实现) */ }
             default -> log.debug("忽略未知/未处理 frame t={}", t);
         }
@@ -129,6 +135,12 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         }
     }
 
+    /** 上行帧到达即回 server 级 ack 给发送方(发送方据此把消息标为「已发送 ✓」)。 */
+    private void ackToSender(ChannelHandlerContext ctx, JsonNode root) {
+        String id = root.path("id").asText("");
+        if (!id.isEmpty()) send(ctx.channel(), Frames.ack(id, "server"));
+    }
+
     /** 透传内容类 frame:Agent→所有 Client,或 Client→所有 Agent。原文不改。 */
     private void forward(ChannelHandlerContext ctx, String text, boolean fromAgent) {
         Connection conn = ctx.channel().attr(CONN).get();
@@ -150,6 +162,16 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
                 String presence = Frames.presence(conn.deviceId, conn.deviceName, false);
                 for (Connection c : hub.clientsOf(conn.account)) send(c.channel, presence);
             }
+        }
+    }
+
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+        if (evt instanceof io.netty.handler.timeout.IdleStateEvent e
+                && e.state() == io.netty.handler.timeout.IdleState.READER_IDLE) {
+            Connection conn = ctx.channel().attr(CONN).get();
+            log.info("空闲超时,踢除: {}", conn != null ? conn : ctx.channel());
+            ctx.close();
         }
     }
 

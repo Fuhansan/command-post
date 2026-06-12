@@ -47,6 +47,10 @@ final class RelayAgent: NSObject, ObservableObject {
     private var permRecords: [String: [PermRecord]] = [:]  // 会话 → 审批记录
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
+    private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
+    private var seenFrameOrder: [String] = []               // 同上,FIFO 容量控制
+    private var lastPongAt = Date()                         // 最近一次 pong,用于检测僵死连接
+    private var heartbeatTimer: Timer?
 
     /// 消息首次出现的时间;之后同 id 始终返回同一值。
     private func stamp(for msgId: String) -> String {
@@ -87,6 +91,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
     func stop() {
         cancellables.removeAll()
+        heartbeatTimer?.invalidate(); heartbeatTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         started = false
@@ -101,6 +106,7 @@ final class RelayAgent: NSObject, ObservableObject {
         t.resume()
         receiveLoop()
         sendAuth()
+        startHeartbeat()
         retry = 0
         lastSent.removeAll()
         knownSids.removeAll()
@@ -486,12 +492,28 @@ final class RelayAgent: NSObject, ObservableObject {
     private func ingest(_ text: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if (obj["t"] as? String) == "input" {
+        let t = obj["t"] as? String
+        if t == "pong" { lastPongAt = Date(); return }
+        guard t == "input" || t == "action" else { return }
+
+        // 可靠投递:回 delivered 级 ack;按帧 id 去重(重发的帧只 ack 不重复执行,
+        // 杜绝重复注入终端/重复审批)。
+        if let fid = obj["id"] as? String, !fid.isEmpty {
+            sendJSON(["v": 1, "t": "ack", "id": "ack_\(fid)", "from": "agent",
+                      "body": ["ack_id": fid, "stage": "delivered"]])
+            if seenFrameIds.contains(fid) { return }
+            seenFrameIds.insert(fid)
+            seenFrameOrder.append(fid)
+            if seenFrameOrder.count > 500 {
+                seenFrameIds.remove(seenFrameOrder.removeFirst())
+            }
+        }
+
+        if t == "input" {
             ingestInput(obj)
             return
         }
-        guard (obj["t"] as? String) == "action",
-              let body = obj["body"] as? [String: Any] else { return }
+        guard let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
         // sid 优先取 value;回退用 msg_id("sess:<sid>")
         let sid = (body["value"] as? String)
@@ -547,11 +569,32 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     private func scheduleReconnect() {
+        heartbeatTimer?.invalidate(); heartbeatTimer = nil
         retry += 1
         let delay = min(pow(2.0, Double(retry)), 30)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             self.connect()
+        }
+    }
+
+    /// 应用层心跳:25s 一次 ping;70s 没收到 pong 视为僵死连接,强制重建。
+    /// (半开连接下 TCP 发送不报错,只有靠心跳能发现。)
+    private func startHeartbeat() {
+        lastPongAt = Date()
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if Date().timeIntervalSince(self.lastPongAt) > 70 {
+                    vlog("relay heartbeat: pong 超时,重建连接")
+                    self.task?.cancel(with: .goingAway, reason: nil)
+                    self.scheduleReconnect()
+                    return
+                }
+                self.sendJSON(["v": 1, "t": "ping", "id": "p_agent",
+                               "ts": Int(Date().timeIntervalSince1970 * 1000)])
+            }
         }
     }
 

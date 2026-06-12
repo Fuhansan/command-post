@@ -74,7 +74,10 @@ struct TaskDetailView: View {
         if msg.role == "user" {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 0) { Spacer(minLength: 44); content }   // 用户内容统一右对齐
-                if showTime { timeLabel(msg.time!) }
+                HStack(spacing: 4) {
+                    if showTime { timeLabel(msg.time!) }
+                    statusLabel(msg)
+                }
             }
         } else if msg.root.type == "toolchip" {
             content.padding(.leading, 44)   // 缩进对齐头像后的内容
@@ -92,6 +95,36 @@ struct TaskDetailView: View {
 
     private func timeLabel(_ t: String) -> some View {
         Text(t).font(.system(size: 10)).foregroundStyle(Theme.textTer)
+    }
+
+    /// 投递状态:⏳发送中 / ✓已到服务器 / ✓✓电脑端已收 / 失败(点按重发)。
+    @ViewBuilder
+    private func statusLabel(_ msg: UIMessage) -> some View {
+        switch msg.status {
+        case .sending:
+            Image(systemName: "clock").font(.system(size: 9)).foregroundStyle(Theme.textTer)
+        case .sent:
+            Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.textTer)
+        case .delivered:
+            ZStack(alignment: .leading) {
+                Image(systemName: "checkmark")
+                Image(systemName: "checkmark").offset(x: 4)
+            }
+            .font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.blue)
+            .padding(.trailing, 4)
+        case .failed:
+            Button {
+                relay.retryUpstream(messageId: msg.id, sessionId: sessionId)
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "exclamationmark.arrow.circlepath").font(.system(size: 11))
+                    Text("重试").font(.system(size: 10, weight: .medium))
+                }
+                .foregroundStyle(Theme.coral)
+            }
+        case nil:
+            EmptyView()
+        }
     }
 
     private var navBar: some View {
