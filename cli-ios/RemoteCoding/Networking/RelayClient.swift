@@ -10,6 +10,8 @@ struct RelaySession: Identifiable {
     var subtitle: String        // prompt 摘要 / 当前活动
     var status: String          // idle | working | waiting | done | ended
     var needsAction: Bool       // 是否有待批准的命令
+    var pendingKind: String     // ""|perm(待审批,可批量)|question(待选择,需进会话)
+    var pendingDetail: String   // 待办摘要(命令 / 题目)
     var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
     var messages: [UIMessage]   // 该会话的下行富消息
 }
@@ -137,6 +139,9 @@ final class RelayClient: ObservableObject {
         sessions.first { $0.id == id }
     }
 
+    /// 跨会话待办数(通知 Tab 角标)。
+    var pendingCount: Int { sessions.filter { !$0.pendingKind.isEmpty }.count }
+
     private func sendAuth() {
         guard let account else { return }
         let body = JSONValue.object([
@@ -239,7 +244,8 @@ final class RelayClient: ObservableObject {
         let idx = sessions.firstIndex(where: { $0.id == sid })
         var s = idx.map { sessions[$0] }
             ?? RelaySession(id: sid, title: "会话", terminal: "", cwd: "", subtitle: "",
-                            status: "working", needsAction: false, agentId: "", messages: [])
+                            status: "working", needsAction: false,
+                            pendingKind: "", pendingDetail: "", agentId: "", messages: [])
         if let meta {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
             s.title = meta["title"]?.stringValue ?? s.title
@@ -248,6 +254,8 @@ final class RelayClient: ObservableObject {
             s.subtitle = meta["subtitle"]?.stringValue ?? s.subtitle
             s.status = meta["status"]?.stringValue ?? s.status
             s.needsAction = meta["needsAction"]?.boolValue ?? s.needsAction
+            s.pendingKind = meta["pendingKind"]?.stringValue ?? s.pendingKind
+            s.pendingDetail = meta["pendingDetail"]?.stringValue ?? s.pendingDetail
         }
         if msg.role == "user" {
             // 正式的用户消息(经 agent 从转录回传)到达 → 移除发送时的本地回显,

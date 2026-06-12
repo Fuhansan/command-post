@@ -287,13 +287,21 @@ final class RelayAgent: NSObject, ObservableObject {
 
     /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
     private func sessionMeta(_ e: SessionEntry) -> [String: Any] {
-        let isPending = pending.pendingIDs.contains(e.id) || e.pendingQuestion != nil
+        let isPerm = pending.pendingIDs.contains(e.id)
+        let isPending = isPerm || e.pendingQuestion != nil
+        // 待办类型与摘要:手机「通知」页据此聚合跨会话待办(审批可批量,选择题逐个)
+        let pendingKind = isPerm ? "perm" : (e.pendingQuestion != nil ? "question" : "")
+        let pendingDetail = isPerm ? (e.toolDetail ?? "")
+            : (e.pendingQuestion?.questions.first?.question
+               ?? (e.pendingQuestion?.tool == "ExitPlanMode" ? "计划待确认" : ""))
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
         let cwd = e.cwd
         let base = (cwd as NSString).lastPathComponent
         // 标题优先用项目名(cwd 末段);取不到再退回终端名。
         let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
         return [
+            "pendingKind": pendingKind,            // perm=待审批(可批量) question=待选择(逐个)
+            "pendingDetail": cap(pendingDetail, 160),
             "agent": Self.deviceId,                // 来自哪台电脑
             "title": project,                     // 项目名(主标题)
             "terminal": e.terminal.displayName,    // 终端 / IDE
