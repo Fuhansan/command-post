@@ -145,6 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.start()
         relayAgent = agent
+        SettingsWindowController.shared.relayAgent = agent
 
         // 手机配对成功 / 退出登录 → 以新账号身份重连中转
         NotificationCenter.default.addObserver(forName: .relayCredentialsChanged,

@@ -9,6 +9,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowController()
 
     private var window: NSWindow?
+    /// 由 AppDelegate 注入,设置窗口展示连接状态。
+    weak var relayAgent: RelayAgent?
 
     func show() {
         if let w = window {
@@ -17,7 +19,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        let view = SettingsView(settings: AppSettings.shared)
+        let view = SettingsView(settings: AppSettings.shared, relayAgent: relayAgent)
         let host = NSHostingController(rootView: view)
         let w = NSWindow(contentViewController: host)
         w.styleMask = [.titled, .closable, .miniaturizable]

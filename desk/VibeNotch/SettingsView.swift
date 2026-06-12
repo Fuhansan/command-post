@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
+    let relayAgent: RelayAgent?
     @StateObject private var pairing = PairingController()
     /// Re-resolved on each render so language changes apply live without
     /// needing to close and reopen the window.
@@ -12,6 +13,9 @@ struct SettingsView: View {
             // 账号:由手机授权配对(手机先 Google 登录,再输入这里显示的配对码)
             Section("账号(AI Coding Remote)") {
                 accountRow
+                if let relayAgent {
+                    AgentConnStateRow(agent: relayAgent)
+                }
             }
 
             Section(L10n.t(.settingsSectionGeneral, locale: locale)) {
@@ -82,6 +86,40 @@ struct SettingsView: View {
                 Text("✓ 配对成功: \(account),已以新账号重连")
                     .font(.system(size: 11)).foregroundStyle(.green)
             }
+        }
+    }
+}
+
+
+/// 与中转服务器的实时连接状态行(随 RelayAgent.connState 自动刷新)。
+struct AgentConnStateRow: View {
+    @ObservedObject var agent: RelayAgent
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(text).font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var color: Color {
+        switch agent.connState {
+        case .online:           return .green
+        case .connecting:       return .yellow
+        case .suspendedByPhone: return .orange
+        case .rejected:         return .red
+        case .unpaired, .offline: return .gray
+        }
+    }
+
+    private var text: String {
+        switch agent.connState {
+        case .online:           return "已连接中转服务器"
+        case .connecting:       return "连接中…"
+        case .suspendedByPhone: return "已被手机端断开 —— 在手机「设备」页点「重连」恢复"
+        case .rejected(let c):  return "被服务器拒绝(\(c)),请重新配对"
+        case .unpaired:         return "未配对,离线"
+        case .offline:          return "已断开,自动重连中…"
         }
     }
 }

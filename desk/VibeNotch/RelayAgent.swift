@@ -13,6 +13,17 @@ import Foundation
 @MainActor
 final class RelayAgent: NSObject, ObservableObject {
 
+    /// 与中转服务器的连接状态(设置窗口展示用)。
+    enum ConnState: Equatable {
+        case unpaired            // 未配对,不连接
+        case connecting          // 连接/鉴权中
+        case online              // 已上线
+        case suspendedByPhone    // 被手机「断开」挂起,等待手机点重连
+        case rejected(String)    // 被服务器拒绝(令牌失效等)
+        case offline             // 断线,自动重连中
+    }
+    @Published private(set) var connState: ConnState = .offline
+
     static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
     /// 本机 Agent 的稳定唯一标识(多台电脑同账号时区分会话/快照/在线状态)。
     static let deviceId: String = {
@@ -103,6 +114,7 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     func stop() {
+        connState = .offline
         cancellables.removeAll()
         heartbeatTimer?.invalidate(); heartbeatTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
@@ -117,8 +129,10 @@ final class RelayAgent: NSObject, ObservableObject {
         // credentialsChanged 通知 → restart() 再进来。
         guard Self.isPaired else {
             vlog("relay: 未配对,保持离线(在 VibeNotch 设置里配对手机)")
+            connState = .unpaired
             return
         }
+        connState = .connecting
         let t = session.webSocketTask(with: Self.relayURL)
         t.maximumMessageSize = 8 << 20   // 手机上行图片帧可达数百 KB,默认 1MB 太紧
         task = t
@@ -526,12 +540,15 @@ final class RelayAgent: NSObject, ObservableObject {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let t = obj["t"] as? String
         if t == "pong" { lastPongAt = Date(); return }
+        if t == "auth_ok" { connState = .online; return }
         if t == "error", let body = obj["body"] as? [String: Any],
            (body["fatal"] as? Bool) == true {
             // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
             // (手机点「重连」解除后,下一次探测即恢复上线)
-            coolDownUntil = Date().addingTimeInterval(30)
-            vlog("relay: 服务器拒绝(\(body["code"] as? String ?? "?")),30s 后再试")
+            let code = body["code"] as? String ?? "?"
+            coolDownUntil = Date().addingTimeInterval(10)
+            connState = code == "suspended" ? .suspendedByPhone : .rejected(code)
+            vlog("relay: 服务器拒绝(\(code)),10s 后再试")
             return
         }
         guard t == "input" || t == "action" else { return }
@@ -610,6 +627,10 @@ final class RelayAgent: NSObject, ObservableObject {
 
     private func scheduleReconnect() {
         heartbeatTimer?.invalidate(); heartbeatTimer = nil
+        switch connState {
+        case .suspendedByPhone, .rejected, .unpaired: break   // 保留具体原因
+        default: connState = .offline
+        }
         retry += 1
         let delay = max(min(pow(2.0, Double(retry)), 30),
                         coolDownUntil.timeIntervalSinceNow)
