@@ -43,4 +43,5 @@ struct AgentInfo: Identifiable, Hashable {
     let name: String
     let online: Bool
     var suspended: Bool = false   // 被手机端「断开」挂起,可点重连恢复
+    var resuming: Bool = false    // 已点「重连」,等待电脑回连(≤10s 探测周期)
 }

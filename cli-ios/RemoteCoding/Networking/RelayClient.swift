@@ -193,13 +193,22 @@ final class RelayClient: ObservableObject {
         }
     }
 
-    /// 恢复某台电脑(解除挂起;电脑 30 秒内自动重连上线)。
+    /// 恢复某台电脑:解除挂起 → 显示「重连中」,电脑下一次探测(≤10s)上线;
+    /// 30s 仍未回来则落回离线(电脑可能根本没开机)。
     func resumeAgent(_ agent: AgentInfo) {
         sendFrame(t: "ctl", id: "ctl_\(UUID().uuidString)", sid: nil,
                   body: .object(["op": .string("agent_resume"),
                                  "agent": .string(agent.id)]))
         if let i = agents.firstIndex(where: { $0.id == agent.id }) {
-            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: false, suspended: false)
+            agents[i] = AgentInfo(id: agent.id, name: agent.name,
+                                  online: false, suspended: false, resuming: true)
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self,
+                  let i = self.agents.firstIndex(where: { $0.id == agent.id }),
+                  self.agents[i].resuming, !self.agents[i].online else { return }
+            self.agents[i].resuming = false   // 超时:显示离线
         }
     }
 
@@ -208,9 +217,11 @@ final class RelayClient: ObservableObject {
         let online = body["online"]?.boolValue ?? false
         let name = body["name"]?.stringValue
         if let idx = agents.firstIndex(where: { $0.id == id }) {
-            // 上线即非挂起;离线保留原 suspended 标记(挂起导致的离线仍显示「重连」)
+            // 上线即清掉挂起/重连中;离线保留原 suspended(挂起导致的离线仍显示「重连」)
             let susp = online ? false : agents[idx].suspended
-            agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name, online: online, suspended: susp)
+            let resuming = online ? false : agents[idx].resuming
+            agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name,
+                                    online: online, suspended: susp, resuming: resuming)
         } else if online {
             agents.append(AgentInfo(id: id, name: name ?? id, online: true))
         }

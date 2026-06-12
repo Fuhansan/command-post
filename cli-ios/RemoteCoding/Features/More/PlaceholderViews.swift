@@ -28,16 +28,21 @@ struct DevicesView: View {
                                         .foregroundStyle(agent.online ? Theme.green : Theme.textTer)
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(agent.name).font(.system(size: 15)).foregroundStyle(Theme.text)
-                                        Text(agent.online ? "在线" : (agent.suspended ? "已断开(挂起)" : "离线"))
+                                        Text(agent.online ? "在线"
+                                             : agent.resuming ? "重连中,等待电脑回应…"
+                                             : agent.suspended ? "已断开(挂起)" : "离线")
                                             .font(.system(size: 12, weight: .medium))
                                             .foregroundStyle(agent.online ? Theme.green
-                                                             : (agent.suspended ? Theme.gold : Theme.textTer))
+                                                             : agent.resuming ? Theme.blue
+                                                             : agent.suspended ? Theme.gold : Theme.textTer)
                                     }
                                     Spacer()
                                     if agent.online {
                                         Button("断开") { relay.suspendAgent(agent) }
                                             .font(.system(size: 13, weight: .semibold))
                                             .foregroundStyle(Theme.coral)
+                                    } else if agent.resuming {
+                                        ProgressView().controlSize(.small)
                                     } else if agent.suspended {
                                         Button("重连") { relay.resumeAgent(agent) }
                                             .font(.system(size: 13, weight: .semibold))
