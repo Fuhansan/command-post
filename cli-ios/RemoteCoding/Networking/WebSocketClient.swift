@@ -28,9 +28,11 @@ final class WebSocketClient: NSObject, ObservableObject {
     private var retry = 0
     private var heartbeat: Timer?
     private var lastPongAt = Date()
+    private var manualClose = false   // 用户主动断开 → 不自动重连,等手动重连
 
     func connect(to url: URL) {
         self.url = url
+        manualClose = false
         state = .connecting
         let task = session.webSocketTask(with: url)
         task.maximumMessageSize = 8 << 20   // 收发大帧(图片)余量
@@ -44,6 +46,7 @@ final class WebSocketClient: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        manualClose = true
         heartbeat?.invalidate(); heartbeat = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
@@ -99,8 +102,12 @@ final class WebSocketClient: NSObject, ObservableObject {
                     self.receiveLoop()
                 case .failure(let error):
                     self.heartbeat?.invalidate(); self.heartbeat = nil
-                    self.state = .failed(error.localizedDescription)
-                    self.scheduleReconnect()
+                    if self.manualClose {
+                        self.state = .disconnected   // 用户主动断开,保持断开态
+                    } else {
+                        self.state = .failed(error.localizedDescription)
+                        self.scheduleReconnect()
+                    }
                 }
             }
         }

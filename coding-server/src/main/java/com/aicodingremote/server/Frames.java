@@ -44,6 +44,16 @@ final class Frames {
         return f.toString();
     }
 
+    /** Agent 断开时服务器代发的设备级 reset:手机据此清掉该电脑的会话。 */
+    static String agentReset(String agentId) {
+        ObjectNode f = M.createObjectNode();
+        f.put("v", 1).put("t", "patch").put("id", "reset").put("from", "server");
+        ObjectNode body = f.putObject("body");
+        body.put("op", "reset");
+        body.put("agent", agentId);
+        return f.toString();
+    }
+
     /** 上行确认:stage=server(已到服务器)。delivered 级由 Agent 发出、服务器透传。 */
     static String ack(String ackId, String stage) {
         ObjectNode f = M.createObjectNode();

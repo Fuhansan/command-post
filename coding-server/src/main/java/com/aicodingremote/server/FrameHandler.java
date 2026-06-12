@@ -166,8 +166,16 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
             hub.unregister(conn);
             log.info("断开: {}", conn);
             if (conn.isAgent()) {
+                // 服务端隔离:离线电脑的数据不再保留/回放 —— 清掉它的快照,
+                // 并代发设备级 reset + presence 离线,手机立刻移除该电脑的会话。
+                // Agent 重连后会全量重推,数据不会丢。
+                hub.clearSnapshots(conn.account, conn.deviceId);
+                String reset = Frames.agentReset(conn.deviceId);
                 String presence = Frames.presence(conn.deviceId, conn.deviceName, false);
-                for (Connection c : hub.clientsOf(conn.account)) send(c.channel, presence);
+                for (Connection c : hub.clientsOf(conn.account)) {
+                    send(c.channel, reset);
+                    send(c.channel, presence);
+                }
             }
         }
     }

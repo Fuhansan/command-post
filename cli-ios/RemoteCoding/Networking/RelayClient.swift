@@ -119,6 +119,13 @@ final class RelayClient: ObservableObject {
         ws.connect(to: Self.currentURL())
     }
 
+    /// 手动断开(保留登录态与账号,不自动重连;设置页「重连」恢复)。
+    func manualDisconnect() {
+        ws.disconnect()
+        sessions = []
+        agents = []
+    }
+
     func disconnect() {
         account = nil
         agents = []
@@ -176,6 +183,11 @@ final class RelayClient: ObservableObject {
             agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name, online: online)
         } else if online {
             agents.append(AgentInfo(id: id, name: name ?? id, online: true))
+        }
+        // 客户端隔离(双保险):电脑离线 → 它的会话立即移除,不再展示旧数据。
+        // 服务端同时会代发该设备的 reset 并清快照;电脑重连后会全量重推。
+        if !online {
+            sessions.removeAll { $0.agentId == id }
         }
     }
 

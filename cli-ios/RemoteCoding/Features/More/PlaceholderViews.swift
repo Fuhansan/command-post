@@ -172,6 +172,19 @@ struct SettingsView: View {
                             }
                             .foregroundStyle(r.ok ? Theme.green : Theme.coral)
                         }
+                        // 手动断开 / 重连
+                        Button {
+                            if relay.connection == .connected {
+                                relay.manualDisconnect()
+                            } else {
+                                relay.reconnectToCurrentServer()
+                            }
+                        } label: {
+                            Text(relay.connection == .connected ? "断开连接" : "重新连接")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(relay.connection == .connected ? Theme.coral : Theme.blue)
+                        }
+                        .padding(.top, 2)
                     }
                     .padding(16).cardStyle()
 
