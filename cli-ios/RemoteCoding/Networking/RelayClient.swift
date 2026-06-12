@@ -132,7 +132,8 @@ final class RelayClient: ObservableObject {
     private func sendAuth() {
         guard let account else { return }
         let body = JSONValue.object([
-            "token": .string("ios"),
+            // 登录后的会话令牌:服务器优先据此解析账号(未登录回退 account 会合)
+            "token": .string(AppState.sessionToken ?? "ios"),
             "account": .string(account),
             "device": .object([
                 "id": .string("ios_device"),

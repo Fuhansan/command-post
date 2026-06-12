@@ -74,6 +74,14 @@ public class UserStore {
         return users.containsKey(account);
     }
 
+    /** 外部登录(Google 等)的账号:首次出现时登记,无本地密码。 */
+    public synchronized void ensureExternal(String account, String provider) {
+        if (!users.containsKey(account)) {
+            users.put(account, "external:" + provider);
+            persist(usersFile, users);
+        }
+    }
+
     private static String hash(String saltHex, String password) {
         try {
             MessageDigest d = MessageDigest.getInstance("SHA-256");

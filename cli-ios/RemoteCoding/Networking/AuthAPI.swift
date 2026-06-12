@@ -1,0 +1,39 @@
+import Foundation
+
+/// 登录 REST(服务器 8080)。Google idToken → 本系统 {account, token}。
+enum AuthAPI {
+    struct AuthResult: Decodable {
+        let account: String
+        let token: String
+        let name: String?
+    }
+
+    enum AuthError: LocalizedError {
+        case server(String)
+        var errorDescription: String? {
+            if case .server(let m) = self { return m }
+            return nil
+        }
+    }
+
+    /// REST 基地址:沿用设置页的服务器 IP,端口固定 8080(Spring MVC)。
+    @MainActor
+    static var baseURL: String { "http://\(RelayClient.savedHost):8080/api/auth" }
+
+    /// 用 Google idToken 换本系统会话令牌。
+    @MainActor
+    static func loginWithGoogle(idToken: String) async throws -> AuthResult {
+        guard let url = URL(string: "\(baseURL)/google") else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["idToken": idToken])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw AuthError.server(msg ?? "登录失败(\(http.statusCode))")
+        }
+        return try JSONDecoder().decode(AuthResult.self, from: data)
+    }
+}

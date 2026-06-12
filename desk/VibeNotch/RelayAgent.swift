@@ -14,7 +14,15 @@ import Foundation
 final class RelayAgent: NSObject, ObservableObject {
 
     static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
-    static let account = "demo"
+    /// 配对账号:读 ~/.vibenotch/account(手机端 Google 登录后填入同一邮箱),缺省 demo。
+    static let account: String = {
+        let path = NSString(string: "~/.vibenotch/account").expandingTildeInPath
+        if let s = try? String(contentsOfFile: path, encoding: .utf8) {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !t.isEmpty { return t }
+        }
+        return "demo"
+    }()
     // 每个 claude 会话(终端)= 一个独立协议 sid = entry.id → 手机端分成多个任务。
 
     /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。

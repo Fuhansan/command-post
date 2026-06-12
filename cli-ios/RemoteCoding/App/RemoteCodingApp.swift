@@ -1,4 +1,5 @@
 import SwiftUI
+import GoogleSignIn
 
 @main
 struct RemoteCodingApp: App {
@@ -10,6 +11,7 @@ struct RemoteCodingApp: App {
             RootView()
                 .environmentObject(appState)
                 .environmentObject(relay)
+                .onOpenURL { GIDSignIn.sharedInstance.handle($0) }   // Google 登录回调
         }
     }
 }

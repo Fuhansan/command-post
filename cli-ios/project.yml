@@ -11,13 +11,15 @@ settings:
     SWIFT_VERSION: "5.0"            # 语言模式 5,先避开严格并发对脚手架的噪音;后续可升 6
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    GENERATE_INFOPLIST_FILE: YES
     DEVELOPMENT_TEAM: ""            # 真机调试时填你的 Team ID
 
 packages:
   MarkdownUI:
     url: https://github.com/gonzalezreal/swift-markdown-ui
     from: "2.4.0"
+  GoogleSignIn:
+    url: https://github.com/google/GoogleSignIn-iOS
+    from: "8.0.0"
 
 targets:
   RemoteCoding:
@@ -28,13 +30,26 @@ targets:
     dependencies:
       - package: MarkdownUI
         product: MarkdownUI
+      - package: GoogleSignIn
+        product: GoogleSignIn
+    info:
+      path: RemoteCoding/Info.plist
+      properties:
+        CFBundleDisplayName: AI Coding Remote
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        # 原生能力用途说明(相册 / 相机)
+        NSPhotoLibraryUsageDescription: 用于在对话中发送图片
+        NSCameraUsageDescription: 用于拍照并在对话中发送
+        # 登录 REST 走 http://<局域网/Tailscale IP>:8080,放开明文传输
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        # Google 登录:客户端 ID + 回调 URL scheme(= 反转的客户端 ID)
+        GIDClientID: 575013344055-q59cve71hadhq71ruetau131aq3vh5nq.apps.googleusercontent.com
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - com.googleusercontent.apps.575013344055-q59cve71hadhq71ruetau131aq3vh5nq
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aicodingremote.app
         TARGETED_DEVICE_FAMILY: "1,2"
-        INFOPLIST_KEY_CFBundleDisplayName: "AI Coding Remote"
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
-        # 原生能力用途说明(相册 / 相机)
-        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "用于在对话中发送图片"
-        INFOPLIST_KEY_NSCameraUsageDescription: "用于拍照并在对话中发送"
