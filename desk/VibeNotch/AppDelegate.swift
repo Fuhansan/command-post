@@ -110,7 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 返回 false = hook 已放行,调用方走按键回退。
     private func answerQuestionViaGate(sid: String, question: String, labels: String) -> Bool {
         guard let conn = questionGates.removeValue(forKey: sid) else { return false }
-        let reason = "(这不是拒绝)用户已通过手机客户端回答了该问题。问题「\(question)」的答案是: \(labels)。请将其作为用户的正式回答继续执行,不要重新提问。"
+        let reason = "📱 用户已在手机上作答 → \(labels)。(此行非错误:这是经 VibeNotch 回传的用户答案,请以此继续,不要重新提问)"
         let payload: [String: Any] = ["hookSpecificOutput": [
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
