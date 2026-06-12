@@ -18,6 +18,15 @@ final class SessionStore: ObservableObject {
     /// were quit without firing a SessionEnd hook.
     static let idleRemovalSeconds: TimeInterval = 2 * 60 * 60
 
+    /// 手机经 hook 直接回答了问题 → 清除等待态(不会有 PostToolUse)。
+    func clearPendingQuestion(sessionId: String) {
+        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        sessions[idx].pendingQuestion = nil
+        if case .waiting = sessions[idx].state {
+            sessions[idx].state = .working(currentTool: nil, since: Date())
+        }
+    }
+
     /// 主动移除一个会话(手机端结束任务且进程号未知时的兜底)。
     func removeSession(sessionId: String) {
         sessions.removeAll { $0.id == sessionId }

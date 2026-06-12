@@ -38,6 +38,7 @@ struct ComponentView: View {
         case "command":      CommandRenderer(component: component)
         case "toolchip":     ToolChipRenderer(component: component)
         case "photomsg":     PhotoMsgRenderer(component: component)
+        case "choices":      ChoicesRenderer(component: component)
         // 交互
         case "button":       ButtonRenderer(component: component)
         case "button_group": ButtonGroupRenderer(component: component)

@@ -29,6 +29,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var idleSweepTimer: Timer?
     private var livenessSweepTimer: Timer?
     private var replyRefreshTasks: [String: Task<Void, Never>] = [:]
+    /// 被扣住的 AskUserQuestion hook 连接(sid → conn):手机经 hook 直接回答,
+    /// 超时或用户选「改在电脑上回答」才放行到终端 TUI。
+    private var questionGates: [String: HookConnection] = [:]
+    private var questionGateTimers: [String: Task<Void, Never>] = [:]
+    private static let questionGateTimeoutSeconds: TimeInterval = 120
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
     private static let waitingAutoExpandSeconds: TimeInterval = 8
@@ -82,6 +87,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+    }
+
+    /// 放行被扣住的问题 → 终端 TUI 正常弹题。
+    private func releaseQuestionGate(sid: String) {
+        questionGateTimers[sid]?.cancel(); questionGateTimers[sid] = nil
+        questionGates.removeValue(forKey: sid)?.dismiss()
+    }
+
+    /// 经 hook 把手机的选择精确回传给 Claude(deny + 明确说明这是用户的回答)。
+    /// 返回 false = hook 已放行,调用方走按键回退。
+    private func answerQuestionViaGate(sid: String, question: String, labels: String) -> Bool {
+        guard let conn = questionGates.removeValue(forKey: sid) else { return false }
+        questionGateTimers[sid]?.cancel(); questionGateTimers[sid] = nil
+        let reason = "(这不是拒绝)用户已通过手机客户端回答了该问题。问题「\(question)」的答案是: \(labels)。请将其作为用户的正式回答继续执行,不要重新提问。"
+        let payload: [String: Any] = ["hookSpecificOutput": [
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        ]]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8), conn.respond(json: json) else {
+            // 连接已死(hook 被 claude 超时杀掉,TUI 已弹题)→ 让调用方走回退
+            vlog("question gate respond failed(连接已死) sid=\(sid.prefix(8))")
+            return false
+        }
+        store.clearPendingQuestion(sessionId: sid)   // 不会再有 PostToolUse,这里直接收尾
+        return true
     }
 
     /// 接入 AI Coding Remote 中转：把会话推给手机,并把手机的 Allow/Deny 接到 decide()。
@@ -143,30 +175,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 TerminalTyper.type(message)
             }
         }
-        agent.onRemoteAnswer = { [weak self] sid, digit in
+        agent.onRemoteAnswer = { [weak self] sid, digits, isMulti, labels in
             guard let self else { return }
             guard let entry = self.store.sessions.first(where: { $0.id == sid }),
-                  entry.pendingQuestion != nil else {
+                  let pq = entry.pendingQuestion else {
                 vlog("relay answer ignored: sid=\(sid.prefix(8)) 没有待答问题")
+                return
+            }
+            // 路径一(首选):hook 还扣着 → 把答案精确回传给 Claude,零按键注入
+            if self.answerQuestionViaGate(sid: sid, question: pq.questions.first?.question ?? "", labels: labels) {
+                vlog("relay answer via hook: sid=\(sid.prefix(8)) labels=\(labels)")
+                return
+            }
+            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选注入数字键;
+            // 多选按键时序不可靠,不注入,提示在电脑完成
+            guard !isMulti else {
+                vlog("relay answer dropped: 多选已放行到终端,不做按键注入 sid=\(sid.prefix(8))")
+                self.relayAgent?.questionAnswerFailed(sid: sid)   // 卡片提示改在电脑作答
                 return
             }
             if !WindowActivator.isAccessibilityTrusted {
                 WindowActivator.requestAccessibilityIfNeeded()
                 return
             }
-            guard self.jumpToTerminal(sessionId: sid) else {
-                vlog("relay answer dropped: terminal activation failed sid=\(sid.prefix(8))")
-                return
-            }
-            vlog("relay answer sid=\(sid.prefix(8)) digit=\(digit)")
-            // 单选:数字键即选中确认;多选:数字键切换勾选,enter 提交
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                if digit == "enter" {
-                    TerminalTyper.type("", thenReturn: true)
-                } else {
-                    TerminalTyper.type(digit, thenReturn: false)
+            guard self.jumpToTerminal(sessionId: sid) else { return }
+            if let d = digits.first {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    TerminalTyper.type(d, thenReturn: false)
                 }
             }
+        }
+        agent.onRemoteAnswerLocal = { [weak self] sid in
+            guard let self else { return }
+            vlog("question → 用户选择在电脑上回答 sid=\(sid.prefix(8))")
+            self.releaseQuestionGate(sid: sid)
+            self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
         }
         agent.start()
         relayAgent = agent
@@ -284,6 +327,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let sid = event.sessionId {
             vlog("pending permission: sid=\(sid.prefix(8)) tool=\(tool)")
             pendingStore.add(sid: sid, conn: conn)
+        } else if event.hookEventName == "PreToolUse",
+                  event.toolName == "AskUserQuestion",
+                  let sid = event.sessionId {
+            // 扣住问题:手机可经 hook 字节级精确回答(不模拟按键);
+            // 超时 / 用户选「改在电脑上回答」→ 放行,终端正常弹题。
+            vlog("question gate hold: sid=\(sid.prefix(8))")
+            questionGates[sid]?.dismiss()
+            questionGateTimers[sid]?.cancel()
+            questionGates[sid] = conn
+            questionGateTimers[sid] = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.questionGateTimeoutSeconds * 1_000_000_000))
+                guard let self, self.questionGates[sid] === conn else { return }
+                vlog("question gate timeout → 放行到终端 sid=\(sid.prefix(8))")
+                self.releaseQuestionGate(sid: sid)
+            }
         } else {
             conn.dismiss()
         }

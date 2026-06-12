@@ -19,16 +19,20 @@ final class HookConnection {
 
     /// Write `json` + "\n" to the script's stdout side, then close.
     /// Used for PreToolUse permissionDecision payloads.
-    func respond(json: String) {
+    /// 返回 false = 连接已死(脚本被 claude 超时杀掉等),内容没送出去。
+    @discardableResult
+    func respond(json: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !resolved else { return }
+        guard !resolved else { return false }
         resolved = true
         let payload = json + "\n"
         let data = Data(payload.utf8)
+        var ok = false
         data.withUnsafeBytes { buf in
-            _ = write(fd, buf.baseAddress, buf.count)
+            ok = write(fd, buf.baseAddress, buf.count) == buf.count
         }
         close(fd)
+        return ok
     }
 
     /// Close the connection without writing anything (the script will read EOF

@@ -3,6 +3,7 @@
 # Existing hooks in ~/.vibenotch/ and ~/.claude/settings.json are untouched;
 # the new app uses the same absolute paths.
 set -e
+set -o pipefail   # xcodebuild 失败时不被 tail 吞掉退出码
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"

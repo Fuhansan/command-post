@@ -161,3 +161,100 @@ struct ToggleRenderer: View {
             }
     }
 }
+
+
+// MARK: - 选择题组件(单选/多选)。选项整行纵排;多选本地勾选、「完成」一次性回传。
+
+struct ChoicesRenderer: View {
+    let component: Component
+    @Environment(\.onComponentAction) private var onAction
+    @State private var picked: Set<Int> = []      // 本地勾选(多选)
+    @State private var submitted: Bool = false    // 已提交,等待 agent 确认卡
+
+    var body: some View {
+        let multi = component.props.bool("multi")
+        let options = component.props["options"]?.arrayValue ?? []
+
+        VStack(spacing: 8) {
+            ForEach(Array(options.enumerated()), id: \.offset) { i, opt in
+                optionRow(i: i, opt: opt, multi: multi)
+            }
+            if multi {
+                Button {
+                    guard !submitted, !picked.isEmpty else { return }
+                    submitted = true
+                    let csv = picked.sorted().map { String($0 + 1) }.joined(separator: ",")
+                    sendAnswer(csv)
+                } label: {
+                    HStack(spacing: 6) {
+                        if submitted { ProgressView().controlSize(.mini).tint(.white) }
+                        Text(submitted ? "已提交,等待确认…" : "✓ 完成选择(已选 \(picked.count) 项)")
+                            .font(.system(size: 14, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity).padding(.vertical, 12)
+                    .background(picked.isEmpty && !submitted ? Theme.cardHi : Theme.blueBtn)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.rBtn))
+                }
+                .buttonStyle(.plain)
+                .disabled(submitted || picked.isEmpty)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func optionRow(i: Int, opt: JSONValue, multi: Bool) -> some View {
+        let label = opt.string("label")
+        let desc = opt.string("description")
+        let isPicked = picked.contains(i)
+
+        Button {
+            guard !submitted else { return }
+            if multi {
+                if isPicked { picked.remove(i) } else { picked.insert(i) }   // 本地切换,完成时一次性提交
+            } else {
+                picked = [i]; submitted = true
+                sendAnswer(String(i + 1))   // 单选:即点即传(TUI 数字键即选即确认)
+            }
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isPicked
+                      ? (multi ? "checkmark.square.fill" : "checkmark.circle.fill")
+                      : (multi ? "square" : "circle"))
+                    .font(.system(size: 18))
+                    .foregroundStyle(isPicked ? Theme.blue : Theme.textTer)
+                    .padding(.top, 1)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(i + 1). \(label)")
+                        .font(.system(size: 14, weight: isPicked ? .semibold : .regular))
+                        .foregroundStyle(Theme.text)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if !desc.isEmpty {
+                        Text(desc).font(.system(size: 12)).foregroundStyle(Theme.textSec)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                if !multi && isPicked && submitted {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            .padding(10)
+            .background(isPicked ? Theme.blue.opacity(0.12) : Theme.field)
+            .overlay(RoundedRectangle(cornerRadius: 10)
+                .stroke(isPicked ? Theme.blue.opacity(0.6) : Theme.stroke, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .opacity(submitted && !isPicked ? 0.45 : 1)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func sendAnswer(_ value: String) {
+        guard let base = component.action,
+              let action = ComponentAction(json: .object([
+                  "id": .string(base.id), "value": .string(value)
+              ])) else { return }
+        onAction(action)
+    }
+}

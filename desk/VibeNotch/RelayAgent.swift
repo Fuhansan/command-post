@@ -44,8 +44,11 @@ final class RelayAgent: NSObject, ObservableObject {
     var onRemoteClose: ((String) -> Void)?
     /// 手机发来的输入(文字 + 已落盘的图片路径)。由 AppDelegate 注入对应终端。
     var onRemoteInput: ((String, String, [String]) -> Void)?
-    /// 手机对 TUI 选择题的回答(数字键)。由 AppDelegate 注入对应终端。
-    var onRemoteAnswer: ((String, String) -> Void)?
+    /// 手机对选择题的回答:(sid, 数字序列, 是否多选, 所选选项文字)。
+    /// AppDelegate 优先经 hook 直接回传答案;hook 已放行时回退按键注入。
+    var onRemoteAnswer: ((String, [String], Bool, String) -> Void)?
+    /// 手机选择「改在电脑上回答」→ 放行 hook,让终端正常弹题。
+    var onRemoteAnswerLocal: ((String) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -80,8 +83,7 @@ final class RelayAgent: NSObject, ObservableObject {
     }
     private var questionRecords: [String: [QuestionRecord]] = [:]
     private var phoneChoice: [String: String] = [:]   // 会话 → 手机刚选的选项文字(等 PostToolUse 确认)
-    private var multiPicks: [String: Set<String>] = [:]   // 会话 → 多选题已勾选的选项文字
-    private var answerFeedback: [String: String] = [:]    // 会话 → 点击后的即时反馈(显示在卡上)
+    private var answerFeedback: [String: String] = [:]    // 会话 → 已收到选择的反馈(显示在卡上)
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
     private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
@@ -185,6 +187,12 @@ final class RelayAgent: NSObject, ObservableObject {
                 "caps": ["protocol": 1]
             ]
         ])
+    }
+
+    /// 答案没能回传(hook 已超时放行,题目已在终端弹出)→ 卡片改提示。
+    func questionAnswerFailed(sid: String) {
+        answerFeedback[sid] = "回传超时,题目已在电脑终端弹出,请在电脑上完成选择"
+        syncToServer()
     }
 
     /// 凭据变化(配对成功/退出)→ 先以旧身份清掉本机数据,再以新身份重连。
@@ -435,7 +443,6 @@ final class RelayAgent: NSObject, ObservableObject {
             qrecs[i].answered = true
             qrecs[i].choiceLabel = phoneChoice.removeValue(forKey: sid) ?? "已在电脑上选择"
             answerFeedback[sid] = nil
-            multiPicks[sid] = nil
         }
         questionRecords[sid] = qrecs
         for r in qrecs where r.pfx == pfx {
@@ -502,47 +509,30 @@ final class RelayAgent: NSObject, ObservableObject {
             return card(title: "计划待确认", icon: "list.bullet.clipboard.fill",
                         style: r.answered ? "default" : "warning", children: kids)
         }
-        // AskUserQuestion(先支持第一题;多选题引导回电脑)
+        // AskUserQuestion(先支持第一题,多题引导回电脑)
         let q = r.payload.questions.first
         let title = q?.header?.isEmpty == false ? q!.header! : "请选择"
         if let qt = q?.question, !qt.isEmpty { kids.append(text(qt, bold: true)) }
         let opts = q?.options ?? []
-        for (i, o) in opts.enumerated() {
-            let desc = (o.description?.isEmpty == false) ? " —— \(o.description!)" : ""
-            kids.append(text("\(i + 1). \(o.label)\(cap(desc, 120))", color: "secondary", style: "caption"))
-        }
         if r.payload.questions.count > 1 {
             kids.append(text("(共 \(r.payload.questions.count) 题,其余请在电脑上作答)", color: "secondary", style: "caption"))
         }
         if r.answered {
             kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
-        } else if q?.multiSelect == true, let fb = answerFeedback[sid] {
-            kids.append(badge(fb, color: "gold"))
-            var buttons = opts.prefix(4).enumerated().map { i, o in
-                button(label: "\(i + 1) · \(cap(o.label, 12))", style: "default",
-                       actionId: "question_answer", value: "\(i + 1)")
-            }
-            buttons.append(button(label: "✓ 完成选择", style: "danger",
-                                  actionId: "question_answer", value: "enter"))
-            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
-        } else if q?.multiSelect == true {
-            kids.append(text("多选:点选项切换勾选(再点一次取消),选好后点「完成选择」提交",
-                             color: "secondary", style: "caption"))
-            var buttons = opts.prefix(4).enumerated().map { i, o in
-                button(label: "\(i + 1) · \(cap(o.label, 12))", style: "default",
-                       actionId: "question_answer", value: "\(i + 1)")
-            }
-            buttons.append(button(label: "✓ 完成选择", style: "danger",
-                                  actionId: "question_answer", value: "enter"))
-            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
         } else if let fb = answerFeedback[sid] {
-            kids.append(badge(fb, color: "gold"))   // 已发送按键,等待 TUI 确认(防重复点击)
+            kids.append(badge(fb, color: "gold"))   // 已收到选择,正在注入按键(防重复)
         } else {
-            let buttons = opts.prefix(4).enumerated().map { i, o in
-                button(label: "\(i + 1) · \(cap(o.label, 14))", style: i == 0 ? "danger" : "default",
-                       actionId: "question_answer", value: "\(i + 1)")
-            }
-            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
+            // choices 组件:客户端本地管理选择状态(多选勾选可见),提交时一次性回传
+            kids.append([
+                "type": "choices",
+                "props": [
+                    "multi": q?.multiSelect == true,
+                    "options": opts.map { ["label": $0.label, "description": $0.description ?? ""] }
+                ],
+                "action": ["id": "question_answer", "value": ""]
+            ])
+            kids.append(button(label: "改在电脑上回答", style: "default",
+                               actionId: "question_local", value: sid))
         }
         return card(title: title, icon: "questionmark.circle.fill",
                     style: r.answered ? "default" : "warning", children: kids)
@@ -680,44 +670,31 @@ final class RelayAgent: NSObject, ObservableObject {
         // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)
         if actionId == "question_answer" {
             guard let sid = obj["sid"] as? String,
-                  let digit = body["value"] as? String, !digit.isEmpty else { return }
-            // 记下选项文字,PostToolUse 确认后展示在已答卡上
-            if let e = store.sessions.first(where: { $0.id == sid }),
-               let pq = e.pendingQuestion {
-                if pq.tool == "ExitPlanMode" {
-                    phoneChoice[sid] = digit == "1" ? "同意执行" : "继续讨论"
-                } else if pq.questions.first?.multiSelect == true {
-                    if digit == "enter" {
-                        phoneChoice[sid] = multiPicks[sid]?.sorted().joined(separator: "、") ?? "已提交"
-                        multiPicks[sid] = nil
-                    } else if let i = Int(digit),
-                              let opts = pq.questions.first?.options, i >= 1, i <= opts.count {
-                        // 切换勾选状态(再点一次取消)
-                        var set = multiPicks[sid] ?? []
-                        let label = opts[i - 1].label
-                        if set.contains(label) { set.remove(label) } else { set.insert(label) }
-                        multiPicks[sid] = set
-                    }
-                } else if let i = Int(digit),
-                          let opts = pq.questions.first?.options, i >= 1, i <= opts.count {
-                    phoneChoice[sid] = opts[i - 1].label
-                }
-            }
-            // 即时反馈:让卡片立刻显示"已发送/已勾选",用户知道点击生效了
+                  let value = body["value"] as? String, !value.isEmpty else { return }
+            // value = "2"(单选)或 "1,3"(多选,完成后一次性回传)
+            let digits = value.split(separator: ",").map(String.init).filter { Int($0) != nil }
+            guard !digits.isEmpty else { return }
+            var isMulti = false
             if let e = store.sessions.first(where: { $0.id == sid }), let pq = e.pendingQuestion {
-                if digit == "enter" {
-                    answerFeedback[sid] = "已提交,等待终端确认…"
-                } else if pq.questions.first?.multiSelect == true {
-                    let picks = multiPicks[sid] ?? []
-                    answerFeedback[sid] = picks.isEmpty ? "已全部取消勾选"
-                        : "已勾选: " + picks.sorted().joined(separator: "、")
-                } else {
-                    answerFeedback[sid] = "已选「\(digit)」,等待终端确认…"
+                isMulti = pq.questions.first?.multiSelect == true
+                if pq.tool == "ExitPlanMode" {
+                    phoneChoice[sid] = digits.first == "1" ? "同意执行" : "继续讨论"
+                } else if let opts = pq.questions.first?.options {
+                    let labels = digits.compactMap { d -> String? in
+                        guard let i = Int(d), i >= 1, i <= opts.count else { return nil }
+                        return opts[i - 1].label
+                    }
+                    phoneChoice[sid] = labels.joined(separator: "、")
                 }
+                answerFeedback[sid] = "已收到选择: \(phoneChoice[sid] ?? value),已回传给 Claude…"
             }
-            vlog("question_answer sid=\(sid.prefix(8)) digit=\(digit)")
-            onRemoteAnswer?(sid, digit)
+            vlog("question_answer sid=\(sid.prefix(8)) digits=\(digits) multi=\(isMulti)")
+            onRemoteAnswer?(sid, digits, isMulti, phoneChoice[sid] ?? digits.joined(separator: ","))
             syncToServer()   // 卡片即时重渲染(反馈可见)
+            return
+        }
+        if actionId == "question_local" {
+            if let sid = obj["sid"] as? String { onRemoteAnswerLocal?(sid) }
             return
         }
         // sid 优先取 value;回退用 msg_id("sess:<sid>")
