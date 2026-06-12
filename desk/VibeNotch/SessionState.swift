@@ -15,6 +15,13 @@ enum TurnStep: Equatable {
     case tool(name: String, input: String?)
 }
 
+/// 终端 TUI 正在等待用户选择的问题(AskUserQuestion / ExitPlanMode 计划确认)。
+struct PendingQuestion: Equatable {
+    let tool: String                 // AskUserQuestion | ExitPlanMode
+    let questions: [QuestionItem]    // AskUserQuestion 的题目(含选项)
+    let plan: String?                // ExitPlanMode 的计划内容
+}
+
 struct SessionEntry: Identifiable, Equatable {
     let id: String
     var state: SessionState
@@ -23,6 +30,8 @@ struct SessionEntry: Identifiable, Equatable {
     var transcriptPath: String? = nil   // 当前会话转录路径(算文件改动 +N 行数用)
     var turnSteps: [TurnStep]
     var toolDetail: String?
+    /// TUI 正在等用户选择的问题(1/2/3 选项、计划 Yes/No);PostToolUse 时清除。
+    var pendingQuestion: PendingQuestion? = nil
     var terminal: TerminalKind
     var terminalPID: pid_t?
     /// claude/shell 进程 pid(= hook 的 $PPID)。终端被关/强杀时它会消失,

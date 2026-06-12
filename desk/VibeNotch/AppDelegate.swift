@@ -143,6 +143,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 TerminalTyper.type(message)
             }
         }
+        agent.onRemoteAnswer = { [weak self] sid, digit in
+            guard let self else { return }
+            guard let entry = self.store.sessions.first(where: { $0.id == sid }),
+                  entry.pendingQuestion != nil else {
+                vlog("relay answer ignored: sid=\(sid.prefix(8)) 没有待答问题")
+                return
+            }
+            if !WindowActivator.isAccessibilityTrusted {
+                WindowActivator.requestAccessibilityIfNeeded()
+                return
+            }
+            guard self.jumpToTerminal(sessionId: sid) else {
+                vlog("relay answer dropped: terminal activation failed sid=\(sid.prefix(8))")
+                return
+            }
+            vlog("relay answer sid=\(sid.prefix(8)) digit=\(digit)")
+            // TUI 的选项对话框按数字键即选中确认,无需回车
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(digit, thenReturn: false)
+            }
+        }
         agent.start()
         relayAgent = agent
         SettingsWindowController.shared.relayAgent = agent

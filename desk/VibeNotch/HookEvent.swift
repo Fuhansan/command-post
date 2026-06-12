@@ -57,6 +57,19 @@ struct HookEvent: Codable {
 
 /// Best-effort decode of `tool_input` for the tools VibeNotch displays subtitles for.
 /// All fields optional; mismatched types are silently swallowed.
+/// AskUserQuestion 的一个选项 / 一道题(原样保留,供刘海与手机渲染交互卡)。
+struct QuestionOption: Codable, Equatable {
+    let label: String
+    let description: String?
+}
+
+struct QuestionItem: Codable, Equatable {
+    let question: String
+    let header: String?
+    let multiSelect: Bool?
+    let options: [QuestionOption]?
+}
+
 struct ToolInputView: Codable {
     let filePath: String?
     let command: String?
@@ -64,6 +77,8 @@ struct ToolInputView: Codable {
     let url: String?
     let prompt: String?
     let path: String?
+    let questions: [QuestionItem]?   // AskUserQuestion
+    let plan: String?                // ExitPlanMode
 
     enum CodingKeys: String, CodingKey {
         case filePath = "file_path"
@@ -72,6 +87,8 @@ struct ToolInputView: Codable {
         case url
         case prompt
         case path
+        case questions
+        case plan
     }
 
     init(from decoder: Decoder) throws {
@@ -82,6 +99,8 @@ struct ToolInputView: Codable {
         url = try? c.decode(String.self, forKey: .url)
         prompt = try? c.decode(String.self, forKey: .prompt)
         path = try? c.decode(String.self, forKey: .path)
+        questions = try? c.decode([QuestionItem].self, forKey: .questions)
+        plan = try? c.decode(String.self, forKey: .plan)
     }
 
     func encode(to encoder: Encoder) throws { /* not needed */ }

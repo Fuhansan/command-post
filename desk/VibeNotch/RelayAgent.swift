@@ -44,6 +44,8 @@ final class RelayAgent: NSObject, ObservableObject {
     var onRemoteClose: ((String) -> Void)?
     /// 手机发来的输入(文字 + 已落盘的图片路径)。由 AppDelegate 注入对应终端。
     var onRemoteInput: ((String, String, [String]) -> Void)?
+    /// 手机对 TUI 选择题的回答(数字键)。由 AppDelegate 注入对应终端。
+    var onRemoteAnswer: ((String, String) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -68,6 +70,16 @@ final class RelayAgent: NSObject, ObservableObject {
         var decision: String? // nil=待决定;"allow"/"deny"/"timeout"/"expired"
     }
     private var permRecords: [String: [PermRecord]] = [:]  // 会话 → 审批记录
+    /// 一次 TUI 选择题 = 一条记录 = 一张交互卡(同审批卡:回答后原地变已答,留存历史)。
+    private struct QuestionRecord {
+        let pfx: String
+        let idx: Int
+        let payload: PendingQuestion
+        var answered: Bool = false
+        var choiceLabel: String?      // 手机选的选项文字;电脑上答的为「已在电脑上选择」
+    }
+    private var questionRecords: [String: [QuestionRecord]] = [:]
+    private var phoneChoice: [String: String] = [:]   // 会话 → 手机刚选的选项文字(等 PostToolUse 确认)
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
     private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
@@ -259,7 +271,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
     /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
     private func sessionMeta(_ e: SessionEntry) -> [String: Any] {
-        let isPending = pending.pendingIDs.contains(e.id)
+        let isPending = pending.pendingIDs.contains(e.id) || e.pendingQuestion != nil
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
         let cwd = e.cwd
         let base = (cwd as NSString).lastPathComponent
@@ -405,8 +417,31 @@ final class RelayAgent: NSObject, ObservableObject {
                                root: permCard(detail: r.detail, sid: sid), fallback: "需要批准"))
             }
         }
-        if recs.contains(where: { $0.pfx == pfx }) {
-            // 有审批卡时不再追加 waiting 提示
+        // TUI 选择题(AskUserQuestion / ExitPlanMode):待答 → 交互卡;答完原地变已答。
+        var qrecs = questionRecords[sid] ?? []
+        if let pq = e.pendingQuestion {
+            if let i = qrecs.indices.last, !qrecs[i].answered, qrecs[i].pfx == pfx {
+                // 同一道题仍在等(或同轮换了内容则更新)
+                if qrecs[i].payload != pq {
+                    qrecs[i] = QuestionRecord(pfx: pfx, idx: qrecs[i].idx, payload: pq)
+                }
+            } else {
+                let idx = qrecs.filter { $0.pfx == pfx }.count
+                qrecs.append(QuestionRecord(pfx: pfx, idx: idx, payload: pq))
+            }
+        } else if let i = qrecs.indices.last, !qrecs[i].answered {
+            qrecs[i].answered = true
+            qrecs[i].choiceLabel = phoneChoice.removeValue(forKey: sid) ?? "已在电脑上选择"
+        }
+        questionRecords[sid] = qrecs
+        for r in qrecs where r.pfx == pfx {
+            out.append(Msg(id: "\(pfx)ask\(r.idx)", role: "agent",
+                           root: questionCard(r, sid: sid),
+                           fallback: r.answered ? "已选择" : "等待你选择"))
+        }
+
+        if recs.contains(where: { $0.pfx == pfx }) || !qrecs.isEmpty {
+            // 有审批/选择卡时不再追加 waiting 提示
         } else if out.isEmpty, case .waiting(let msg) = e.state {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
@@ -441,6 +476,53 @@ final class RelayAgent: NSObject, ObservableObject {
         if let detail { kids.append(code(detail)) }
         kids.append(badge(label, color: color))
         return card(title: "审批请求", icon: icon, style: style, children: kids)
+    }
+
+    /// TUI 选择题卡:AskUserQuestion → 题目+选项按钮;ExitPlanMode → 计划+编号按钮。
+    /// 已回答 → 按钮换成结果徽标,卡片留存历史。
+    private func questionCard(_ r: QuestionRecord, sid: String) -> [String: Any] {
+        var kids: [[String: Any]] = []
+        if r.payload.tool == "ExitPlanMode" {
+            if let plan = r.payload.plan, !plan.isEmpty {
+                kids.append(text(cap(plan, 1500), markdown: true))
+            }
+            if r.answered {
+                kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
+            } else {
+                kids.append(text("请选择(编号与电脑终端中列出的选项一一对应):", color: "secondary", style: "caption"))
+                kids.append(["type": "button_group", "props": ["buttons": [
+                    button(label: "1 · 同意执行", style: "danger", actionId: "question_answer", value: "1"),
+                    button(label: "2 · 继续讨论", style: "default", actionId: "question_answer", value: "2")
+                ]]])
+            }
+            return card(title: "计划待确认", icon: "list.bullet.clipboard.fill",
+                        style: r.answered ? "default" : "warning", children: kids)
+        }
+        // AskUserQuestion(先支持第一题;多选题引导回电脑)
+        let q = r.payload.questions.first
+        let title = q?.header?.isEmpty == false ? q!.header! : "请选择"
+        if let qt = q?.question, !qt.isEmpty { kids.append(text(qt, bold: true)) }
+        let opts = q?.options ?? []
+        for (i, o) in opts.enumerated() {
+            let desc = (o.description?.isEmpty == false) ? " —— \(o.description!)" : ""
+            kids.append(text("\(i + 1). \(o.label)\(cap(desc, 120))", color: "secondary", style: "caption"))
+        }
+        if r.payload.questions.count > 1 {
+            kids.append(text("(共 \(r.payload.questions.count) 题,其余请在电脑上作答)", color: "secondary", style: "caption"))
+        }
+        if r.answered {
+            kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
+        } else if q?.multiSelect == true {
+            kids.append(text("多选题,请在电脑终端上完成选择", color: "warning", style: "caption"))
+        } else {
+            let buttons = opts.prefix(4).enumerated().map { i, o in
+                button(label: "\(i + 1) · \(cap(o.label, 14))", style: i == 0 ? "danger" : "default",
+                       actionId: "question_answer", value: "\(i + 1)")
+            }
+            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
+        }
+        return card(title: title, icon: "questionmark.circle.fill",
+                    style: r.answered ? "default" : "warning", children: kids)
     }
 
     /// 读不到图时:把 [Image …] 换成简洁标记。
@@ -572,6 +654,23 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         guard let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
+        // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)
+        if actionId == "question_answer" {
+            guard let sid = obj["sid"] as? String,
+                  let digit = body["value"] as? String, !digit.isEmpty else { return }
+            // 记下选项文字,PostToolUse 确认后展示在已答卡上
+            if let e = store.sessions.first(where: { $0.id == sid }),
+               let pq = e.pendingQuestion {
+                if pq.tool == "ExitPlanMode" {
+                    phoneChoice[sid] = digit == "1" ? "同意执行" : "继续讨论"
+                } else if let i = Int(digit),
+                          let opts = pq.questions.first?.options, i >= 1, i <= opts.count {
+                    phoneChoice[sid] = opts[i - 1].label
+                }
+            }
+            onRemoteAnswer?(sid, digit)
+            return
+        }
         // sid 优先取 value;回退用 msg_id("sess:<sid>")
         let sid = (body["value"] as? String)
             ?? (body["msg_id"] as? String).map { $0.replacingOccurrences(of: "msg:", with: "") }

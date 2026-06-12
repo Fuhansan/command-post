@@ -79,6 +79,7 @@ final class SessionStore: ObservableObject {
                 entry?.state = .working(currentTool: nil, since: Date())
                 entry?.promptSummary = summary
                 entry?.toolDetail = nil
+                entry?.pendingQuestion = nil
                 entry?.turnSteps = []  // new turn — discard last turn's reply
             }
 
@@ -92,13 +93,30 @@ final class SessionStore: ObservableObject {
                 entry?.toolDetail = formatToolDetail(name: event.toolName, input: event.toolInput)
                 if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool) {
                     entry?.state = .waiting(message: "Run \(tool)?")
+                } else if event.toolName == "AskUserQuestion" {
+                    // TUI 选择题:进入等待 + 保留题目结构(刘海/手机渲染交互卡)
+                    let qs = event.toolInput?.questions ?? []
+                    entry?.pendingQuestion = PendingQuestion(tool: "AskUserQuestion", questions: qs, plan: nil)
+                    entry?.state = .waiting(message: qs.first?.question ?? "等待你选择")
+                } else if event.toolName == "ExitPlanMode" {
+                    entry?.pendingQuestion = PendingQuestion(tool: "ExitPlanMode", questions: [],
+                                                             plan: event.toolInput?.plan)
+                    entry?.state = .waiting(message: "计划待确认")
                 } else {
                     entry?.state = .working(currentTool: event.toolName, since: since)
                 }
             }
 
         case "PostToolUse":
-            break
+            // 选择题被回答(电脑或手机)→ 清除等待,恢复运行
+            if event.toolName == "AskUserQuestion" || event.toolName == "ExitPlanMode" {
+                upsert(id: sid) { entry in
+                    entry?.pendingQuestion = nil
+                    if case .waiting = entry?.state {
+                        entry?.state = .working(currentTool: nil, since: Date())
+                    }
+                }
+            }
 
         case "Notification":
             upsert(id: sid) { entry in
