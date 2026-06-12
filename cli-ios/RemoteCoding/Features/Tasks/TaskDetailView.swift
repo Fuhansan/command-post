@@ -1,4 +1,5 @@
 import SwiftUI
+import PhotosUI
 
 /// 屏 2 —— 会话详情(对话流)。每条消息 = 左侧头像 + 悬浮内容卡;用户输入靠右蓝气泡。
 /// 内容全部来自该 `sid` 会话的实时下行(agent 下发的组件树)。
@@ -8,6 +9,10 @@ struct TaskDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var draft = ""
     @State private var showEndConfirm = false
+    @State private var stagedImages: [UIImage] = []          // 暂存待发送的图片
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showLibrary = false
+    @State private var showCamera = false
 
     private var session: RelaySession? { relay.session(id: sessionId) }
 
@@ -151,30 +156,140 @@ struct TaskDetailView: View {
     }
 
     private var inputBar: some View {
-        HStack(spacing: 10) {
-            TextField("", text: $draft, prompt: Text("输入指令…").foregroundColor(Theme.textTer))
-                .font(.system(size: 15))
-                .foregroundStyle(Theme.text)
-                .padding(.horizontal, 16).padding(.vertical, 12)
-                .background(Theme.field)
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .onSubmit(send)
-            Button(action: send) {
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(.white)
-                    .frame(width: 46, height: 46)
-                    .background(Theme.blueBtn)
+        VStack(spacing: 0) {
+            if !stagedImages.isEmpty { stagingStrip }
+            HStack(spacing: 10) {
+                Menu {
+                    Button { showLibrary = true } label: { Label("相册选图", systemImage: "photo.on.rectangle") }
+                    Button { showCamera = true } label: { Label("拍照", systemImage: "camera") }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Theme.textSec)
+                        .frame(width: 38, height: 46)
+                }
+                TextField("", text: $draft,
+                          prompt: Text(stagedImages.isEmpty ? "输入指令…" : "配上说明文字(可选)…")
+                              .foregroundColor(Theme.textTer))
+                    .font(.system(size: 15))
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 16).padding(.vertical, 12)
+                    .background(Theme.field)
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .onSubmit(send)
+                Button(action: send) {
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.white)
+                        .frame(width: 46, height: 46)
+                        .background(Theme.blueBtn)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+            }
+            .padding(16)
+        }
+        .background(Theme.bg)
+        .photosPicker(isPresented: $showLibrary, selection: $pickerItems,
+                      maxSelectionCount: 4, matching: .images)
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            Task {
+                for item in items {
+                    if let data = try? await item.loadTransferable(type: Data.self),
+                       let ui = UIImage(data: data) {
+                        stagedImages.append(ui)
+                    }
+                }
+                pickerItems = []
             }
         }
-        .padding(16)
-        .background(Theme.bg)
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker { img in stagedImages.append(img) }
+                .ignoresSafeArea()
+        }
+    }
+
+    /// 暂存框:已选图片缩略图横排,可单张移除;发送时与文字合并为一条消息。
+    private var stagingStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(Array(stagedImages.enumerated()), id: \.offset) { i, img in
+                    Image(uiImage: img)
+                        .resizable().scaledToFill()
+                        .frame(width: 64, height: 64)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(alignment: .topTrailing) {
+                            Button {
+                                stagedImages.remove(at: i)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 17))
+                                    .foregroundStyle(.white, .black.opacity(0.6))
+                            }
+                            .offset(x: 6, y: -6)
+                        }
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 12).padding(.trailing, 6)
+        }
     }
 
     private func send() {
-        relay.sendInput(text: draft, sessionId: sessionId)
+        if stagedImages.isEmpty {
+            relay.sendInput(text: draft, sessionId: sessionId)
+        } else {
+            let payloads = stagedImages.enumerated().compactMap { i, img -> StagedImagePayload? in
+                guard let jpeg = img.resized(maxDim: 1568).jpegData(compressionQuality: 0.7) else { return nil }
+                return StagedImagePayload(
+                    data: jpeg.base64EncodedString(), ext: "jpg",
+                    name: "photo_\(i + 1).jpg", kind: "JPEG",
+                    size: jpeg.count >= 1_000_000
+                        ? String(format: "%.1f MB", Double(jpeg.count) / 1_000_000)
+                        : "\(jpeg.count / 1_000) KB")
+            }
+            relay.sendImageInput(images: payloads, text: draft, sessionId: sessionId)
+            stagedImages = []
+        }
         draft = ""
+    }
+}
+
+private extension UIImage {
+    /// 等比缩到最长边 maxDim(已小于则原样返回)。
+    func resized(maxDim: CGFloat) -> UIImage {
+        let m = max(size.width, size.height)
+        guard m > maxDim else { return self }
+        let scale = maxDim / m
+        let newSize = CGSize(width: size.width * scale, height: size.height * scale)
+        return UIGraphicsImageRenderer(size: newSize).image { _ in
+            draw(in: CGRect(origin: .zero, size: newSize))
+        }
+    }
+}
+
+/// 系统相机(UIImagePickerController 封装)。
+struct CameraPicker: UIViewControllerRepresentable {
+    let onCapture: (UIImage) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let p = UIImagePickerController()
+        p.sourceType = .camera
+        p.delegate = context.coordinator
+        return p
+    }
+    func updateUIViewController(_ vc: UIImagePickerController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: CameraPicker
+        init(_ parent: CameraPicker) { self.parent = parent }
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            if let img = info[.originalImage] as? UIImage { parent.onCapture(img) }
+            parent.dismiss()
+        }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { parent.dismiss() }
     }
 }

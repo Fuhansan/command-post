@@ -112,6 +112,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.store.removeSession(sessionId: sid)
             }
         }
+        agent.onRemoteInput = { [weak self] sid, text, imagePaths in
+            guard let self else { return }
+            guard self.store.sessions.contains(where: { $0.id == sid }) else {
+                vlog("relay input ignored: sid=\(sid.prefix(8)) unknown")
+                return
+            }
+            if !WindowActivator.isAccessibilityTrusted {
+                WindowActivator.requestAccessibilityIfNeeded()
+                vlog("relay input: AX not trusted — prompted, dropping input")
+                return
+            }
+            // 组装注入文本:用户文字 + 图片路径(claude 会自己读路径里的图)
+            var parts: [String] = []
+            if !text.isEmpty { parts.append(text) }
+            if !imagePaths.isEmpty {
+                parts.append(imagePaths.count == 1 && text.isEmpty
+                             ? "请查看这张图片: \(imagePaths[0])"
+                             : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
+            }
+            let message = parts.joined(separator: " ")
+            vlog("relay input sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
+            // 必须确认激活了目标终端窗口才打字,否则会敲进用户当前聚焦的任意应用
+            guard self.jumpToTerminal(sessionId: sid) else {
+                vlog("relay input dropped: terminal activation failed sid=\(sid.prefix(8))")
+                return
+            }
+            // 等窗口激活、输入焦点就位后再打字
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(message)
+            }
+        }
         agent.start()
         relayAgent = agent
     }
@@ -291,15 +322,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// `app.activate` brings the app forward but not the *right* window.
     /// We first try the Accessibility path to raise the window whose title
     /// matches the session's cwd; whole-app activate is the fallback.
-    func jumpToTerminal(sessionId: String) {
-        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return }
+    @discardableResult
+    func jumpToTerminal(sessionId: String) -> Bool {
+        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return false }
         guard let pid = entry.terminalPID else {
             vlog("jump: no terminalPID for sid=\(sessionId.prefix(8))")
-            return
+            return false
         }
         guard let app = NSRunningApplication(processIdentifier: pid) else {
             vlog("jump: NSRunningApplication(pid=\(pid)) not found — terminal may have quit")
-            return
+            return false
         }
 
         if Self.ideTerminalKinds.contains(entry.terminal) {
@@ -308,7 +340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("jump: AX not trusted — prompting; falling back to whole-app activate")
             } else if WindowActivator.activateWindow(pid: pid, cwd: entry.cwd) {
                 vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) AX-window-match cwd=\(entry.cwd)")
-                return
+                return true
             } else {
                 vlog("jump: sid=\(sessionId.prefix(8)) AX no window match for cwd=\(entry.cwd) — falling back")
             }
@@ -316,6 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let ok = app.activate(options: [.activateAllWindows])
         vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) ok=\(ok)")
+        return ok
     }
 
     /// 45-second watchdog tripped without an Allow/Deny click. Connection is

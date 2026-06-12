@@ -30,6 +30,15 @@ struct Component: Identifiable {
     }
 }
 
+/// 暂存待发送的一张图片(已编码,可直接入帧/回显)。
+struct StagedImagePayload {
+    let data: String   // base64 JPEG
+    let ext: String    // "jpg"
+    let name: String   // 展示文件名
+    let kind: String   // "JPEG"
+    let size: String   // "1.2 MB"
+}
+
 /// PROTOCOL §5 —— 一条渲染用的富消息。由 `t: "ui"` 的 Frame 构造。
 struct UIMessage: Identifiable {
     let id: String
@@ -59,6 +68,24 @@ struct UIMessage: Identifiable {
             "props": .object(["text": .string(text)])
         ]))
         self.fallbackText = text
+        self.time = Self.hhmm.string(from: Date())
+    }
+
+    /// 本地构造一条图文消息(手机发送图片时的即时回显,与 agent 的 photomsg 同构)。
+    init(localUserImages images: [StagedImagePayload], text: String) {
+        self.id = UUID().uuidString
+        self.seq = .max
+        self.role = "user"
+        var props: [String: JSONValue] = [
+            "images": .array(images.map { .object([
+                "data": .string($0.data), "name": .string($0.name),
+                "kind": .string($0.kind), "size": .string($0.size)
+            ]) }),
+            "time": .string(Self.hhmm.string(from: Date()))
+        ]
+        if !text.isEmpty { props["text"] = .string(text) }
+        self.root = Component(json: .object(["type": .string("photomsg"), "props": .object(props)]))
+        self.fallbackText = text.isEmpty ? "图片" : text
         self.time = Self.hhmm.string(from: Date())
     }
 

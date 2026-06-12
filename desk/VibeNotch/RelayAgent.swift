@@ -19,6 +19,8 @@ final class RelayAgent: NSObject, ObservableObject {
 
     /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。
     var onRemoteClose: ((String) -> Void)?
+    /// 手机发来的输入(文字 + 已落盘的图片路径)。由 AppDelegate 注入对应终端。
+    var onRemoteInput: ((String, String, [String]) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -94,6 +96,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
     private func connect() {
         let t = session.webSocketTask(with: Self.relayURL)
+        t.maximumMessageSize = 8 << 20   // 手机上行图片帧可达数百 KB,默认 1MB 太紧
         task = t
         t.resume()
         receiveLoop()
@@ -475,6 +478,10 @@ final class RelayAgent: NSObject, ObservableObject {
     private func ingest(_ text: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if (obj["t"] as? String) == "input" {
+            ingestInput(obj)
+            return
+        }
         guard (obj["t"] as? String) == "action",
               let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
@@ -489,6 +496,29 @@ final class RelayAgent: NSObject, ObservableObject {
         case "session_close": onRemoteClose?(sid)
         default: break
         }
+    }
+
+    /// 手机输入帧:{kind:"text"|"image", text, images:[{data,ext}]}。
+    /// 图片落盘到 ~/.vibenotch/inbox/<sid>/,路径交给 AppDelegate 一并注入终端。
+    private func ingestInput(_ obj: [String: Any]) {
+        guard let sid = obj["sid"] as? String,
+              let body = obj["body"] as? [String: Any] else { return }
+        let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var paths: [String] = []
+        if let images = body["images"] as? [[String: Any]] {
+            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            for (i, img) in images.enumerated() {
+                guard let b64 = img["data"] as? String,
+                      let data = Data(base64Encoded: b64) else { continue }
+                let ext = (img["ext"] as? String ?? "jpg").lowercased()
+                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
+                guard FileManager.default.createFile(atPath: path, contents: data) else { continue }
+                paths.append(path)
+            }
+        }
+        guard !text.isEmpty || !paths.isEmpty else { return }
+        onRemoteInput?(sid, text, paths)
     }
 
     // MARK: - 收发底层

@@ -31,6 +31,7 @@ final class WebSocketClient: NSObject, ObservableObject {
         self.url = url
         state = .connecting
         let task = session.webSocketTask(with: url)
+        task.maximumMessageSize = 8 << 20   // 收发大帧(图片)余量
         self.task = task
         task.resume()
         receiveLoop()

@@ -161,6 +161,21 @@ final class RelayClient: ObservableObject {
                   body: .object(["kind": .string("text"), "text": .string(trimmed)]))
     }
 
+    /// 图文输入:图片(base64)+ 可选文字一起发往电脑端,注入对应终端。本地先回显一条图文气泡。
+    func sendImageInput(images: [StagedImagePayload], text: String, sessionId: String) {
+        guard !images.isEmpty else { return sendInput(text: text, sessionId: sessionId) }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].messages.append(UIMessage(localUserImages: images, text: trimmed))
+        }
+        sendFrame(t: "input", id: "in_\(UUID().uuidString)", sid: sessionId,
+                  body: .object([
+                    "kind": .string("image"),
+                    "text": .string(trimmed),
+                    "images": .array(images.map { .object(["data": .string($0.data), "ext": .string($0.ext)]) })
+                  ]))
+    }
+
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
     func endSession(sessionId: String) {
         sendFrame(t: "action", id: "act_\(UUID().uuidString)", sid: sessionId,
