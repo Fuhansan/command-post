@@ -32,7 +32,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 被扣住的 AskUserQuestion hook 连接(sid → conn):手机经 hook 直接回答,
     /// 超时或用户选「改在电脑上回答」才放行到终端 TUI。
     private var questionGates: [String: HookConnection] = [:]
-    private var questionGateWatchTimer: Timer?
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
     private static let waitingAutoExpandSeconds: TimeInterval = 8
@@ -65,22 +64,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startIdleSweep()
         startLivenessSweep()
         setupRelayAgent()
-        startQuestionGateWatch()
-    }
-
-    /// 每 2s 巡检被扣住的问题连接:hook 脚本被 claude 超时杀掉(POLLHUP)→
-    /// 立即收尾并让手机卡片翻成「已转电脑作答」,而不是等用户提交才发现失效。
-    private func startQuestionGateWatch() {
-        questionGateWatchTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, !self.questionGates.isEmpty else { return }
-                for (sid, conn) in self.questionGates where conn.isPeerClosed {
-                    vlog("question gate peer closed(被打断/超时)→ 转电脑作答 sid=\(sid.prefix(8))")
-                    self.questionGates[sid] = nil
-                    self.relayAgent?.questionGateExpired(sid: sid)
-                }
-            }
-        }
     }
 
     /// 快速清扫:每 5 秒检查各会话的 owner 进程是否还活着,移除已死的(终端被关/强杀、
@@ -101,6 +84,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.pendingStore.cancel(sid: sid)
                 }
             }
+        }
+    }
+
+    /// 刘海上点了选项 → 与手机同一条 hook 通道回答(先答先得)。
+    func answerQuestionFromNotch(sessionId sid: String, picks: [Int]) {
+        guard let entry = store.sessions.first(where: { $0.id == sid }),
+              let pq = entry.pendingQuestion else { return }
+        let opts = pq.questions.first?.options ?? []
+        let labels = picks.compactMap { $0 >= 0 && $0 < opts.count ? opts[$0].label : nil }
+            .joined(separator: "、")
+        if answerQuestionViaGate(sid: sid, question: pq.questions.first?.question ?? "", labels: labels) {
+            vlog("notch answer ok sid=\(sid.prefix(8)) labels=\(labels)")
+        } else {
+            vlog("notch answer: gate 已死,请在终端作答 sid=\(sid.prefix(8))")
         }
     }
 
@@ -640,6 +637,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     },
                     onOpenFile: { sid, path in
                         self?.openFile(sessionId: sid, path: path)
+                    },
+                    onAnswerQuestion: { sid, picks in
+                        self?.answerQuestionFromNotch(sessionId: sid, picks: picks)
                     }
                 )
             },

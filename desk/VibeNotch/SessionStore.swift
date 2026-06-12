@@ -142,6 +142,7 @@ final class SessionStore: ObservableObject {
                 entry = ensure(entry, sid: sid, cwd: cwd, terminal: terminal, terminalPID: terminalPID)
                 entry?.state = .done(summary: "Done", finishedAt: Date())
                 entry?.toolDetail = nil
+                entry?.pendingQuestion = nil   // 回合结束/被打断 → 问题不再等待
             }
 
         case "SessionEnd":
