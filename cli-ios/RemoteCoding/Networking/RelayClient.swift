@@ -22,7 +22,28 @@ final class RelayClient: ObservableObject {
     @Published private(set) var sessions: [RelaySession] = []
 
     /// 中转地址。iOS 模拟器可直连宿主机 127.0.0.1;真机改成电脑的局域网 IP。
-    static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
+    // MARK: - 服务器地址(可在设置页修改,存 UserDefaults)
+
+    static let urlDefaultsKey = "relay.serverURL"
+    static let defaultURLString = "ws://127.0.0.1:8090/ws"
+
+    /// 当前生效的服务器地址(设置页保存的值,缺省回退默认)。
+    static func currentURL() -> URL {
+        let raw = UserDefaults.standard.string(forKey: urlDefaultsKey) ?? defaultURLString
+        return URL(string: normalizeURL(raw)) ?? URL(string: defaultURLString)!
+    }
+
+    /// 宽容解析用户输入:`192.168.1.5` / `192.168.1.5:8090` / `ws://host/ws` /
+    /// `wss://example.com` 都行——自动补全 ws:// 前缀、8090 端口、/ws 路径。
+    static func normalizeURL(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return defaultURLString }
+        if !s.hasPrefix("ws://") && !s.hasPrefix("wss://") { s = "ws://" + s }
+        guard var comp = URLComponents(string: s) else { return defaultURLString }
+        if comp.port == nil { comp.port = 8090 }
+        if comp.path.isEmpty || comp.path == "/" { comp.path = "/ws" }
+        return comp.string ?? defaultURLString
+    }
 
     private let ws = WebSocketClient()
     private var account: String?
@@ -40,7 +61,16 @@ final class RelayClient: ObservableObject {
         self.account = account
         sessions = []
         agents = []
-        ws.connect(to: Self.relayURL)
+        ws.connect(to: Self.currentURL())
+    }
+
+    /// 设置页修改服务器地址后调用:断开并按新地址重连(沿用当前账号)。
+    func reconnectToCurrentServer() {
+        guard account != nil else { return }
+        ws.disconnect()
+        sessions = []
+        agents = []
+        ws.connect(to: Self.currentURL())
     }
 
     func disconnect() {
