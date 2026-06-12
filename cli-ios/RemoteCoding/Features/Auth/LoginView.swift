@@ -1,8 +1,9 @@
 import SwiftUI
 import GoogleSignIn
 
-/// 登录页。主力为账号密码(只连你自己的服务器,国内单 Tailscale 即可);
-/// Google 登录作为可选(需能访问 Google,与 Tailscale 在 iOS 上互斥)。
+/// 登录页。账号体系:
+///   注册 = 用 Google 验证邮箱(只此一次,需能访问 Google),首次登录后设置密码;
+///   日常 = 邮箱 + 密码(只连自己的服务器,国内单 Tailscale 即可,不再碰 Google)。
 struct LoginView: View {
     @EnvironmentObject private var appState: AppState
     @AppStorage(RelayClient.hostKey) private var serverHost: String = RelayClient.defaultHost
@@ -16,13 +17,19 @@ struct LoginView: View {
 
     @State private var account = ""
     @State private var password = ""
-    @State private var isRegister = false
     @State private var loading = false
     @State private var errorMessage: String?
 
+    // 首次 Google 登录后设密码
+    @State private var setPwToken: String?
+    @State private var setPwAccount = ""
+    @State private var newPassword = ""
+    @State private var showSetPassword = false
+    @State private var setPwError: String?
+
     private var port: Int { Int(portText) ?? 0 }
     private var serverValid: Bool { !RelayClient.sanitizeHost(host).isEmpty && (1...65535).contains(port) }
-    private var canSubmit: Bool {
+    private var canLogin: Bool {
         reachable && !account.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 4
     }
 
@@ -53,18 +60,17 @@ struct LoginView: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .onAppear { host = serverHost; portText = String(serverPort) }
+        .sheet(isPresented: $showSetPassword) { setPasswordSheet }
     }
-
-    // MARK: - 服务器
 
     private var serverCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("中转服务器(电脑的局域网 / Tailscale IP)")
                 .font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textSec)
             HStack(spacing: 10) {
-                field($host, prompt: "IP,如 100.84.170.113", keyboard: .URL, width: nil)
+                field($host, prompt: "IP,如 100.84.170.113", keyboard: .URL, width: nil, secure: false)
                     .onChange(of: host) { _, _ in reachable = false; serverMsg = nil }
-                field($portText, prompt: "端口", keyboard: .numberPad, width: 78)
+                field($portText, prompt: "端口", keyboard: .numberPad, width: 78, secure: false)
                     .onChange(of: portText) { _, _ in reachable = false; serverMsg = nil }
             }
             Button(action: testConnection) {
@@ -87,53 +93,40 @@ struct LoginView: View {
         .padding(16).frame(maxWidth: .infinity, alignment: .leading).cardStyle()
     }
 
-    // MARK: - 登录 / 注册
-
     private var loginCard: some View {
         VStack(spacing: 12) {
-            Picker("", selection: $isRegister) {
-                Text("登录").tag(false)
-                Text("注册").tag(true)
-            }
-            .pickerStyle(.segmented)
-
-            field($account, prompt: "账号(任意字符,如邮箱或昵称)", keyboard: .default, width: nil)
+            Text("邮箱密码登录").font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.textSec).frame(maxWidth: .infinity, alignment: .leading)
+            field($account, prompt: "邮箱(注册时的 Google 邮箱)", keyboard: .emailAddress, width: nil, secure: false)
                 .textContentType(.username)
-            SecureField("", text: $password, prompt: Text("密码(至少 4 位)").foregroundColor(Theme.textTer))
-                .font(.system(size: 15)).foregroundStyle(Theme.text)
-                .padding(.horizontal, 12).padding(.vertical, 11)
-                .background(Theme.field)
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+            field($password, prompt: "密码", keyboard: .default, width: nil, secure: true)
 
-            Button(action: submitCredentials) {
+            Button(action: doLogin) {
                 HStack(spacing: 8) {
                     if loading { ProgressView().tint(.white) }
-                    Text(isRegister ? "注册并登录" : "登录")
-                        .font(.system(size: 16, weight: .semibold))
+                    Text("登录").font(.system(size: 16, weight: .semibold))
                 }
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity).padding(.vertical, 13)
-                .background(canSubmit ? Theme.blueBtn : Theme.cardHi)
+                .background(canLogin ? Theme.blueBtn : Theme.cardHi)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            .buttonStyle(.plain).disabled(!canSubmit || loading)
+            .buttonStyle(.plain).disabled(!canLogin || loading)
 
             if !reachable {
                 Text("请先在上方测试连接到服务器")
                     .font(.system(size: 12)).foregroundStyle(Theme.textTer)
             }
 
-            // 分隔 + Google(可选)
             HStack {
                 Rectangle().fill(Theme.stroke).frame(height: 1)
-                Text("或").font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                Text("首次使用").font(.system(size: 12)).foregroundStyle(Theme.textTer)
                 Rectangle().fill(Theme.stroke).frame(height: 1)
             }
             Button(action: signInGoogle) {
                 HStack(spacing: 8) {
                     Image(systemName: "g.circle.fill").font(.system(size: 18))
-                    Text("使用 Google 登录").font(.system(size: 14, weight: .semibold))
+                    Text("用 Google 注册 / 设置密码").font(.system(size: 14, weight: .semibold))
                 }
                 .foregroundStyle(reachable ? Theme.text : Theme.textTer)
                 .frame(maxWidth: .infinity).padding(.vertical, 11)
@@ -142,23 +135,60 @@ struct LoginView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .buttonStyle(.plain).disabled(loading || !reachable)
-            Text("Google 需能访问 Google 服务(国内须额外代理,与 Tailscale 互斥)")
+            Text("用 Google 验证邮箱来创建账号(仅首次,需能访问 Google);设好密码后,以后用邮箱密码登录即可")
                 .font(.system(size: 11)).foregroundStyle(Theme.textTer)
                 .multilineTextAlignment(.center)
         }
         .padding(16).cardStyle()
     }
 
-    private func field(_ text: Binding<String>, prompt: String, keyboard: UIKeyboardType, width: CGFloat?) -> some View {
-        TextField("", text: text, prompt: Text(prompt).foregroundColor(Theme.textTer))
-            .font(.system(size: 15, design: keyboard == .URL ? .monospaced : .default))
-            .foregroundStyle(Theme.text)
-            .keyboardType(keyboard).autocorrectionDisabled().textInputAutocapitalization(.never)
-            .frame(width: width)
-            .padding(.horizontal, 12).padding(.vertical, 11)
-            .background(Theme.field)
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+    private var setPasswordSheet: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 16) {
+                Text("设置密码").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
+                Text("账号 \(setPwAccount) 验证成功。设置一个密码,以后用邮箱密码登录(不再需要 Google)。")
+                    .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                field($newPassword, prompt: "新密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
+                if let setPwError {
+                    Text(setPwError).font(.system(size: 13)).foregroundStyle(Theme.coral)
+                }
+                Button(action: doSetPassword) {
+                    HStack(spacing: 8) {
+                        if loading { ProgressView().tint(.white) }
+                        Text("设置密码并进入").font(.system(size: 16, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity).padding(.vertical, 13)
+                    .background(newPassword.count >= 4 ? Theme.blueBtn : Theme.cardHi)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain).disabled(newPassword.count < 4 || loading)
+                Spacer()
+            }
+            .padding(24)
+        }
+        .interactiveDismissDisabled(true)
+    }
+
+    @ViewBuilder
+    private func field(_ text: Binding<String>, prompt: String, keyboard: UIKeyboardType, width: CGFloat?, secure: Bool) -> some View {
+        Group {
+            if secure {
+                SecureField("", text: text, prompt: Text(prompt).foregroundColor(Theme.textTer))
+            } else {
+                TextField("", text: text, prompt: Text(prompt).foregroundColor(Theme.textTer))
+                    .keyboardType(keyboard)
+            }
+        }
+        .font(.system(size: 15, design: keyboard == .URL ? .monospaced : .default))
+        .foregroundStyle(Theme.text)
+        .autocorrectionDisabled().textInputAutocapitalization(.never)
+        .frame(width: width)
+        .padding(.horizontal, 12).padding(.vertical, 11)
+        .background(Theme.field)
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - 动作
@@ -175,18 +205,14 @@ struct LoginView: View {
         }
     }
 
-    private func submitCredentials() {
+    private func doLogin() {
         errorMessage = nil; loading = true
         let acc = account.trimmingCharacters(in: .whitespaces), pwd = password
-        let reg = isRegister
         Task {
             do {
-                let r = reg ? try await AuthAPI.register(account: acc, password: pwd)
-                            : try await AuthAPI.login(account: acc, password: pwd)
+                let r = try await AuthAPI.login(account: acc, password: pwd)
                 appState.login(account: r.account, token: r.token)
-            } catch {
-                errorMessage = error.localizedDescription
-            }
+            } catch { errorMessage = error.localizedDescription }
             loading = false
         }
     }
@@ -211,12 +237,32 @@ struct LoginView: View {
                 }
                 do {
                     let r = try await AuthAPI.loginWithGoogle(idToken: idToken)
-                    appState.login(account: r.account, token: r.token)
-                } catch {
-                    errorMessage = error.localizedDescription
-                }
+                    if r.hasPassword == "true" {
+                        appState.login(account: r.account, token: r.token)   // 已设过密码,直接进
+                    } else {
+                        // 首次:引导设密码
+                        setPwToken = r.token
+                        setPwAccount = r.account
+                        newPassword = ""; setPwError = nil
+                        showSetPassword = true
+                    }
+                } catch { errorMessage = error.localizedDescription }
                 loading = false
             }
+        }
+    }
+
+    private func doSetPassword() {
+        guard let token = setPwToken else { return }
+        setPwError = nil; loading = true
+        let pwd = newPassword
+        Task {
+            do {
+                try await AuthAPI.setPassword(token: token, password: pwd)
+                showSetPassword = false
+                appState.login(account: setPwAccount, token: token)   // 设好即登录
+            } catch { setPwError = error.localizedDescription }
+            loading = false
         }
     }
 }

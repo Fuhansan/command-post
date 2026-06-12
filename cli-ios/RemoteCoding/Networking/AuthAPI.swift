@@ -6,6 +6,7 @@ enum AuthAPI {
         let account: String
         let token: String
         let name: String?
+        let hasPassword: String?   // Google 返回:"true"/"false"(是否已设密码)
     }
 
     enum AuthError: LocalizedError {
@@ -56,21 +57,10 @@ enum AuthAPI {
         return try JSONDecoder().decode(AuthResult.self, from: data)
     }
 
-    /// 账号密码登录(国内主力:不依赖 Google,只连你自己的服务器)。
+    /// 邮箱密码登录(日常主力:不依赖 Google,只连你自己的服务器)。
     @MainActor
     static func login(account: String, password: String) async throws -> AuthResult {
-        try await credCall(path: "login", account: account, password: password)
-    }
-
-    /// 账号密码注册(首次创建账号,返回的令牌可直接登录)。
-    @MainActor
-    static func register(account: String, password: String) async throws -> AuthResult {
-        try await credCall(path: "register", account: account, password: password)
-    }
-
-    @MainActor
-    private static func credCall(path: String, account: String, password: String) async throws -> AuthResult {
-        guard let url = URL(string: "\(baseURL)/\(path)") else { throw URLError(.badURL) }
+        guard let url = URL(string: "\(baseURL)/login") else { throw URLError(.badURL) }
         var req = URLRequest(url: url, timeoutInterval: 12)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -79,8 +69,24 @@ enum AuthAPI {
         guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard http.statusCode == 200 else {
             let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
-            throw AuthError.server(msg ?? "失败(\(http.statusCode))")
+            throw AuthError.server(msg ?? "登录失败(\(http.statusCode))")
         }
         return try JSONDecoder().decode(AuthResult.self, from: data)
+    }
+
+    /// 设置密码:用 Google 登录拿到的 token 给账号设密码,之后可邮箱密码登录。
+    @MainActor
+    static func setPassword(token: String, password: String) async throws {
+        guard let url = URL(string: "\(baseURL)/set-password") else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["token": token, "password": password])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw AuthError.server(msg ?? "设置密码失败(\(http.statusCode))")
+        }
     }
 }

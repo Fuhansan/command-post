@@ -74,12 +74,27 @@ public class UserStore {
         return users.containsKey(account);
     }
 
+    /** 该账号是否已设置密码(可用邮箱密码登录)。外部账号(external:)未设密码时为 false。 */
+    public boolean hasPassword(String account) {
+        String stored = users.get(account);
+        return stored != null && !stored.startsWith("external:");
+    }
+
     /** 外部登录(Google 等)的账号:首次出现时登记,无本地密码。 */
     public synchronized void ensureExternal(String account, String provider) {
         if (!users.containsKey(account)) {
             users.put(account, "external:" + provider);
             persist(usersFile, users);
         }
+    }
+
+    /** 给账号设置/更新密码(Google 验证身份后调用,之后可邮箱密码登录)。 */
+    public synchronized void setPassword(String account, String password) {
+        byte[] salt = new byte[16];
+        random.nextBytes(salt);
+        String saltHex = HexFormat.of().formatHex(salt);
+        users.put(account, saltHex + ":" + hash(saltHex, password));
+        persist(usersFile, users);
     }
 
     private static String hash(String saltHex, String password) {

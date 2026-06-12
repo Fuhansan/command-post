@@ -75,9 +75,12 @@ public class GoogleAuthController {
             }
             store.ensureExternal(email, "google");
             String token = store.issueToken(email);
-            log.info("google login ok: {}", email);
+            boolean hasPassword = store.hasPassword(email);
+            log.info("google login ok: {} (hasPassword={})", email, hasPassword);
+            // hasPassword=false → 客户端引导设置密码(之后可邮箱密码登录,不再需要 Google)
             return ResponseEntity.ok(Map.of("account", email, "token", token,
-                    "name", info.path("name").asText("")));
+                    "name", info.path("name").asText(""),
+                    "hasPassword", String.valueOf(hasPassword)));
         } catch (Exception e) {
             log.warn("google login error", e);
             return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body(Map.of("error", "校验 Google 令牌失败,请重试"));
