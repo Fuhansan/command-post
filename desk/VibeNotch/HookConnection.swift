@@ -35,6 +35,16 @@ final class HookConnection {
         return ok
     }
 
+    /// 对端(hook 脚本)是否已整体关闭 —— 脚本被 claude 超时杀掉时变 true。
+    /// 注意脚本发送后会半关写侧(EOF 是常态),只有 POLLHUP 才代表进程已死。
+    var isPeerClosed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !resolved else { return true }
+        var pfd = pollfd(fd: fd, events: Int16(POLLHUP), revents: 0)
+        let n = poll(&pfd, 1, 0)
+        return n > 0 && (pfd.revents & Int16(POLLHUP)) != 0
+    }
+
     /// Close the connection without writing anything (the script will read EOF
     /// and exit with empty stdout — claude continues with its normal flow).
     func dismiss() {

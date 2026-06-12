@@ -33,7 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 超时或用户选「改在电脑上回答」才放行到终端 TUI。
     private var questionGates: [String: HookConnection] = [:]
     private var questionGateTimers: [String: Task<Void, Never>] = [:]
-    private static let questionGateTimeoutSeconds: TimeInterval = 120
+    private static let questionGateTimeoutSeconds: TimeInterval = 280
+    private var questionGateWatchTimer: Timer?
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
     private static let waitingAutoExpandSeconds: TimeInterval = 8
@@ -66,6 +67,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startIdleSweep()
         startLivenessSweep()
         setupRelayAgent()
+        startQuestionGateWatch()
+    }
+
+    /// 每 2s 巡检被扣住的问题连接:hook 脚本被 claude 超时杀掉(POLLHUP)→
+    /// 立即收尾并让手机卡片翻成「已转电脑作答」,而不是等用户提交才发现失效。
+    private func startQuestionGateWatch() {
+        questionGateWatchTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.questionGates.isEmpty else { return }
+                for (sid, conn) in self.questionGates where conn.isPeerClosed {
+                    vlog("question gate peer closed(被 claude 超时杀掉)→ 转电脑作答 sid=\(sid.prefix(8))")
+                    self.questionGateTimers[sid]?.cancel(); self.questionGateTimers[sid] = nil
+                    self.questionGates[sid] = nil
+                    self.relayAgent?.questionGateExpired(sid: sid)
+                }
+            }
+        }
     }
 
     /// 快速清扫:每 5 秒检查各会话的 owner 进程是否还活着,移除已死的(终端被关/强杀、

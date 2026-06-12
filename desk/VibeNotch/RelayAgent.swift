@@ -195,6 +195,12 @@ final class RelayAgent: NSObject, ObservableObject {
         syncToServer()
     }
 
+    /// 门禁被 claude 超时杀掉(巡检发现)→ 手机卡片立即翻成「已转电脑作答」。
+    func questionGateExpired(sid: String) {
+        answerFeedback[sid] = "手机作答窗口已过,题目已在电脑终端弹出,请在电脑上完成选择"
+        syncToServer()
+    }
+
     /// 凭据变化(配对成功/退出)→ 先以旧身份清掉本机数据,再以新身份重连。
     func restart() {
         sendReset()   // 旧账号的手机立刻看到本机会话消失(+ presence 离线)
