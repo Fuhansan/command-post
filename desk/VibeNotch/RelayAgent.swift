@@ -249,7 +249,8 @@ final class RelayAgent: NSObject, ObservableObject {
         // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(文件信息栏 + 图 + 说明,同一张卡片)。
         if let p = e.promptSummary, !p.isEmpty {
             var imageItems: [[String: Any]] = []
-            for path in extractImagePaths(p, sessionId: sid) {
+            let imgPaths = extractImagePaths(p, sessionId: sid)
+            for path in imgPaths {
                 guard let data = thumbnailBase64(path: path) else { continue }
                 var item: [String: Any] = ["data": data]
                 let url = URL(fileURLWithPath: path)
@@ -261,8 +262,15 @@ final class RelayAgent: NSObject, ObservableObject {
                 imageItems.append(item)
             }
             let hasImage = !imageItems.isEmpty
-            let textOnly = (hasImage ? stripImages(p) : cleanPrompt(p))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            var textOnly = (hasImage ? stripImages(p) : cleanPrompt(p))
+            if hasImage {
+                // 路径已经以缩略图展示,从文字里清掉裸路径和注入时加的「图片:」标记
+                for path in imgPaths { textOnly = textOnly.replacingOccurrences(of: path, with: "") }
+                for marker in ["请查看这张图片:", "图片:"] {
+                    textOnly = textOnly.replacingOccurrences(of: marker, with: "")
+                }
+            }
+            textOnly = textOnly.trimmingCharacters(in: .whitespacesAndNewlines)
 
             if hasImage {
                 var props: [String: Any] = ["images": imageItems,

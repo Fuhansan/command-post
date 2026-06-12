@@ -115,6 +115,11 @@ final class RelayClient: ObservableObject {
             s.status = meta["status"]?.stringValue ?? s.status
             s.needsAction = meta["needsAction"]?.boolValue ?? s.needsAction
         }
+        if msg.role == "user" {
+            // 正式的用户消息(经 agent 从转录回传)到达 → 移除发送时的本地回显,
+            // 否则同一条消息显示两遍(本地一条 + 正式一条)。
+            s.messages.removeAll { $0.seq == .max && $0.role == "user" }
+        }
         if let mIdx = s.messages.firstIndex(where: { $0.id == msg.id }) {
             s.messages[mIdx] = msg
         } else {
