@@ -197,7 +197,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
     /// 门禁被 claude 超时杀掉(巡检发现)→ 手机卡片立即翻成「已转电脑作答」。
     func questionGateExpired(sid: String) {
-        answerFeedback[sid] = "手机作答窗口已过,题目已在电脑终端弹出,请在电脑上完成选择"
+        answerFeedback[sid] = "本题已转到电脑终端(被打断或转电脑作答),请在电脑上完成"
         syncToServer()
     }
 

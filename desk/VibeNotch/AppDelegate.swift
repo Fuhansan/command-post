@@ -32,8 +32,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 被扣住的 AskUserQuestion hook 连接(sid → conn):手机经 hook 直接回答,
     /// 超时或用户选「改在电脑上回答」才放行到终端 TUI。
     private var questionGates: [String: HookConnection] = [:]
-    private var questionGateTimers: [String: Task<Void, Never>] = [:]
-    private static let questionGateTimeoutSeconds: TimeInterval = 280
     private var questionGateWatchTimer: Timer?
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
@@ -77,8 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task { @MainActor in
                 guard let self, !self.questionGates.isEmpty else { return }
                 for (sid, conn) in self.questionGates where conn.isPeerClosed {
-                    vlog("question gate peer closed(被 claude 超时杀掉)→ 转电脑作答 sid=\(sid.prefix(8))")
-                    self.questionGateTimers[sid]?.cancel(); self.questionGateTimers[sid] = nil
+                    vlog("question gate peer closed(被打断/超时)→ 转电脑作答 sid=\(sid.prefix(8))")
                     self.questionGates[sid] = nil
                     self.relayAgent?.questionGateExpired(sid: sid)
                 }
@@ -109,7 +106,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 放行被扣住的问题 → 终端 TUI 正常弹题。
     private func releaseQuestionGate(sid: String) {
-        questionGateTimers[sid]?.cancel(); questionGateTimers[sid] = nil
         questionGates.removeValue(forKey: sid)?.dismiss()
     }
 
@@ -117,7 +113,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 返回 false = hook 已放行,调用方走按键回退。
     private func answerQuestionViaGate(sid: String, question: String, labels: String) -> Bool {
         guard let conn = questionGates.removeValue(forKey: sid) else { return false }
-        questionGateTimers[sid]?.cancel(); questionGateTimers[sid] = nil
         let reason = "(这不是拒绝)用户已通过手机客户端回答了该问题。问题「\(question)」的答案是: \(labels)。请将其作为用户的正式回答继续执行,不要重新提问。"
         let payload: [String: Any] = ["hookSpecificOutput": [
             "hookEventName": "PreToolUse",
@@ -350,16 +345,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                   let sid = event.sessionId {
             // 扣住问题:手机可经 hook 字节级精确回答(不模拟按键);
             // 超时 / 用户选「改在电脑上回答」→ 放行,终端正常弹题。
-            vlog("question gate hold: sid=\(sid.prefix(8))")
+            vlog("question gate hold: sid=\(sid.prefix(8)) (不限时,等手机或转电脑)")
             questionGates[sid]?.dismiss()
-            questionGateTimers[sid]?.cancel()
             questionGates[sid] = conn
-            questionGateTimers[sid] = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(Self.questionGateTimeoutSeconds * 1_000_000_000))
-                guard let self, self.questionGates[sid] === conn else { return }
-                vlog("question gate timeout → 放行到终端 sid=\(sid.prefix(8))")
-                self.releaseQuestionGate(sid: sid)
-            }
         } else {
             conn.dismiss()
         }

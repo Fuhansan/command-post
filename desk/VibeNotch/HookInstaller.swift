@@ -20,8 +20,8 @@ enum HookInstaller {
 
     static let scriptTemplate = #"""
     #!/bin/bash
-    # VibeNotch hook forwarder — managed by VibeNotch.app (v4)
-    # Sends event to UDS, half-closes write side, then waits up to 290s for the
+    # VibeNotch hook forwarder — managed by VibeNotch.app (v5)
+    # Sends event to UDS, half-closes write side, then waits (up to 24h) for the
     # App's response (used by PreToolUse permissionDecision). For non-blocking
     # events, the App dismisses the connection immediately and we read EOF in
     # under 10ms. Always exits 0 — never breaks claude.
@@ -39,7 +39,7 @@ enum HookInstaller {
         payload = (data + "\n").encode()
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(290.0)
+        s.settimeout(86400.0)
         s.connect(sock_path)
         s.sendall(payload)
         try:
@@ -181,8 +181,8 @@ enum HookInstaller {
                 guard var hookList = groups[gi]["hooks"] as? [[String: Any]] else { continue }
                 for hi in hookList.indices where (hookList[hi]["command"] as? String) == scriptPath {
                     alreadyInstalled = true
-                    if (hookList[hi]["timeout"] as? Int) != 300 {
-                        hookList[hi]["timeout"] = 300
+                    if (hookList[hi]["timeout"] as? Int) != 86400 {
+                        hookList[hi]["timeout"] = 86400
                         groups[gi]["hooks"] = hookList
                         hooks[ev.name] = groups
                         addedAny = true
@@ -193,7 +193,7 @@ enum HookInstaller {
 
             groups.append([
                 "hooks": [
-                    ["type": "command", "command": scriptPath, "timeout": 300],
+                    ["type": "command", "command": scriptPath, "timeout": 86400],
                 ],
             ])
             hooks[ev.name] = groups
