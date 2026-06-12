@@ -1,5 +1,6 @@
 package com.aicodingremote.server;
 
+import com.aicodingremote.server.auth.UserStore;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
@@ -17,10 +18,12 @@ final class WsServerInitializer extends ChannelInitializer<SocketChannel> {
 
     private final Hub hub;
     private final String path;
+    private final UserStore users;
 
-    WsServerInitializer(Hub hub, String path) {
+    WsServerInitializer(Hub hub, String path, UserStore users) {
         this.hub = hub;
         this.path = path;
+        this.users = users;
     }
 
     @Override
@@ -34,6 +37,6 @@ final class WsServerInitializer extends ChannelInitializer<SocketChannel> {
         // 第三参 true = 处理关闭帧；WS 协议层 ping/pong 由它处理,应用层 ping/pong 走 JSON 文本帧。
         // 第四参:WS 单帧上限(默认 64KB,不够装图片)。
         p.addLast(new WebSocketServerProtocolHandler(path, null, true, MAX_FRAME));
-        p.addLast(new FrameHandler(hub));
+        p.addLast(new FrameHandler(hub, users));
     }
 }

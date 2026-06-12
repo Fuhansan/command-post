@@ -1,5 +1,6 @@
 package com.aicodingremote.server;
 
+import com.aicodingremote.server.auth.UserStore;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoopGroup;
@@ -22,15 +23,17 @@ public class RelayServer implements SmartLifecycle {
 
     private final Hub hub;
     private final RelayProperties props;
+    private final UserStore users;
 
     private EventLoopGroup boss;
     private EventLoopGroup worker;
     private Channel serverChannel;
     private volatile boolean running;
 
-    public RelayServer(Hub hub, RelayProperties props) {
+    public RelayServer(Hub hub, RelayProperties props, UserStore users) {
         this.hub = hub;
         this.props = props;
+        this.users = users;
     }
 
     @Override
@@ -41,7 +44,7 @@ public class RelayServer implements SmartLifecycle {
             ServerBootstrap b = new ServerBootstrap();
             b.group(boss, worker)
                     .channel(NioServerSocketChannel.class)
-                    .childHandler(new WsServerInitializer(hub, props.getPath()));
+                    .childHandler(new WsServerInitializer(hub, props.getPath(), users));
             serverChannel = b.bind(props.getPort()).syncUninterruptibly().channel();
             running = true;
             log.info("中转 WS 已启动: ws://0.0.0.0:{}{}", props.getPort(), props.getPath());

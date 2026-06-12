@@ -27,3 +27,4 @@ dist/
 
 # Backed-up nested git dirs
 *_git_backup/
+coding-server/data/

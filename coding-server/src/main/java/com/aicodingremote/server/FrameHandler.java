@@ -1,5 +1,6 @@
 package com.aicodingremote.server;
 
+import com.aicodingremote.server.auth.UserStore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.channel.Channel;
@@ -22,9 +23,11 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
     static final AttributeKey<Connection> CONN = AttributeKey.valueOf("aicr.conn");
 
     private final Hub hub;
+    private final UserStore users;
 
-    FrameHandler(Hub hub) {
+    FrameHandler(Hub hub, UserStore users) {
         this.hub = hub;
+        this.users = users;
     }
 
     @Override
@@ -62,8 +65,11 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
     private void handleAuth(ChannelHandlerContext ctx, JsonNode root) {
         JsonNode body = root.path("body");
         String token = body.path("token").asText("");
-        // 配对键:优先显式 account,否则用 token 本身当账号(最小版的会合机制)。
-        String account = body.hasNonNull("account") ? body.path("account").asText() : token;
+        // 配对键:优先用登录令牌解析真实账号(不信任客户端自报);
+        // 解析不到则回退「显式 account / token 当账号」的旧会合机制(Agent 仍走这条)。
+        String resolved = users.accountOf(token);
+        String account = resolved != null ? resolved
+                : (body.hasNonNull("account") ? body.path("account").asText() : token);
         if (account.isEmpty()) {
             send(ctx.channel(), Frames.error("no_account", "缺少 token/account", true));
             ctx.close();
