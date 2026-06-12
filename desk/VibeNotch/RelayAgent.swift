@@ -80,6 +80,7 @@ final class RelayAgent: NSObject, ObservableObject {
     }
     private var questionRecords: [String: [QuestionRecord]] = [:]
     private var phoneChoice: [String: String] = [:]   // 会话 → 手机刚选的选项文字(等 PostToolUse 确认)
+    private var multiPicks: [String: Set<String>] = [:]   // 会话 → 多选题已勾选的选项文字
     private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
     private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
     private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
@@ -513,7 +514,15 @@ final class RelayAgent: NSObject, ObservableObject {
         if r.answered {
             kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
         } else if q?.multiSelect == true {
-            kids.append(text("多选题,请在电脑终端上完成选择", color: "warning", style: "caption"))
+            kids.append(text("多选:点选项切换勾选(再点一次取消),选好后点「完成选择」提交",
+                             color: "secondary", style: "caption"))
+            var buttons = opts.prefix(4).enumerated().map { i, o in
+                button(label: "\(i + 1) · \(cap(o.label, 12))", style: "default",
+                       actionId: "question_answer", value: "\(i + 1)")
+            }
+            buttons.append(button(label: "✓ 完成选择", style: "danger",
+                                  actionId: "question_answer", value: "enter"))
+            kids.append(["type": "button_group", "props": ["buttons": Array(buttons)]])
         } else {
             let buttons = opts.prefix(4).enumerated().map { i, o in
                 button(label: "\(i + 1) · \(cap(o.label, 14))", style: i == 0 ? "danger" : "default",
@@ -663,6 +672,18 @@ final class RelayAgent: NSObject, ObservableObject {
                let pq = e.pendingQuestion {
                 if pq.tool == "ExitPlanMode" {
                     phoneChoice[sid] = digit == "1" ? "同意执行" : "继续讨论"
+                } else if pq.questions.first?.multiSelect == true {
+                    if digit == "enter" {
+                        phoneChoice[sid] = multiPicks[sid]?.sorted().joined(separator: "、") ?? "已提交"
+                        multiPicks[sid] = nil
+                    } else if let i = Int(digit),
+                              let opts = pq.questions.first?.options, i >= 1, i <= opts.count {
+                        // 切换勾选状态(再点一次取消)
+                        var set = multiPicks[sid] ?? []
+                        let label = opts[i - 1].label
+                        if set.contains(label) { set.remove(label) } else { set.insert(label) }
+                        multiPicks[sid] = set
+                    }
                 } else if let i = Int(digit),
                           let opts = pq.questions.first?.options, i >= 1, i <= opts.count {
                     phoneChoice[sid] = opts[i - 1].label

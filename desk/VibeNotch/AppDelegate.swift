@@ -159,9 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             vlog("relay answer sid=\(sid.prefix(8)) digit=\(digit)")
-            // TUI 的选项对话框按数字键即选中确认,无需回车
+            // 单选:数字键即选中确认;多选:数字键切换勾选,enter 提交
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                TerminalTyper.type(digit, thenReturn: false)
+                if digit == "enter" {
+                    TerminalTyper.type("", thenReturn: true)
+                } else {
+                    TerminalTyper.type(digit, thenReturn: false)
+                }
             }
         }
         agent.start()
