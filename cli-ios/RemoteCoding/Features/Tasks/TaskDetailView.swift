@@ -41,6 +41,8 @@ struct TaskDetailView: View {
                             // 撑满视口且顶部对齐:消息少时头部贴顶,不随 bottom 锚点沉底
                             .frame(minHeight: geo.size.height, alignment: .top)
                         }
+                        .scrollDismissesKeyboard(.interactively)   // 下拉消息区即收键盘
+                        .dismissKeyboardOnTap()                    // 点击消息区空白也收键盘
                         .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
                         .onChange(of: session?.messages.count ?? 0) { _, _ in
                             if session?.status == "working" {

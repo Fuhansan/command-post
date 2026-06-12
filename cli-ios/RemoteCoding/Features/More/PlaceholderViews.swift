@@ -100,6 +100,7 @@ struct DevicesView: View {
                 }
                 .padding(16)
             }
+            .dismissKeyboardOnTap()
         }
     }
 }

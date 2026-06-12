@@ -58,6 +58,7 @@ struct LoginView: View {
                 .padding(20)
             }
             .scrollDismissesKeyboard(.interactively)
+            .dismissKeyboardOnTap()
         }
         .onAppear { host = serverHost; portText = String(serverPort) }
         .sheet(isPresented: $showSetPassword) { setPasswordSheet }
