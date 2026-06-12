@@ -102,6 +102,8 @@ struct DevicesView: View {
 struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var relay: RelayClient
+    @EnvironmentObject private var updater: UpdateChecker
+    @State private var checkingUpdate = false
     @AppStorage(RelayClient.hostKey) private var savedHost: String = RelayClient.defaultHost
     @AppStorage(RelayClient.portKey) private var savedPort: Int = RelayClient.defaultPort
     @State private var host: String = ""
@@ -209,6 +211,41 @@ struct SettingsView: View {
                             .font(.system(size: 14, weight: .medium))
                             .foregroundStyle(Theme.coral)
                             .padding(.top, 4)
+                    }
+                    .padding(16).frame(maxWidth: .infinity, alignment: .leading).cardStyle()
+
+                    // 关于 / 版本
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("关于").font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.textSec)
+                        HStack {
+                            Text("版本 \(UpdateChecker.currentVersion) (\(UpdateChecker.currentBuild))")
+                                .font(.system(size: 15)).foregroundStyle(Theme.text)
+                            Spacer()
+                            Button {
+                                checkingUpdate = true
+                                Task {
+                                    await updater.check(manual: true)
+                                    checkingUpdate = false
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    if checkingUpdate { ProgressView().controlSize(.mini) }
+                                    Text(checkingUpdate ? "检查中…" : "检查更新")
+                                }
+                                .font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.blue)
+                            }
+                            .disabled(checkingUpdate)
+                        }
+                        switch updater.status {
+                        case .upToDate:
+                            Label("已是最新版本", systemImage: "checkmark.circle.fill")
+                                .font(.system(size: 13)).foregroundStyle(Theme.green)
+                        case .updateAvailable(let info):
+                            Label("发现新版本 \(info.latest),点上方「检查更新」查看公告", systemImage: "arrow.up.circle.fill")
+                                .font(.system(size: 13)).foregroundStyle(Theme.gold)
+                        case .unknown, .forceUpdate:
+                            EmptyView()
+                        }
                     }
                     .padding(16).frame(maxWidth: .infinity, alignment: .leading).cardStyle()
                 }

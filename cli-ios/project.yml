@@ -36,6 +36,8 @@ targets:
       path: RemoteCoding/Info.plist
       properties:
         CFBundleDisplayName: AI Coding Remote
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         # 原生能力用途说明(相册 / 相机)
