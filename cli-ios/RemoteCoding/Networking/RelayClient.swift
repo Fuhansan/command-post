@@ -22,27 +22,72 @@ final class RelayClient: ObservableObject {
     @Published private(set) var sessions: [RelaySession] = []
 
     /// 中转地址。iOS 模拟器可直连宿主机 127.0.0.1;真机改成电脑的局域网 IP。
-    // MARK: - 服务器地址(可在设置页修改,存 UserDefaults)
+    // MARK: - 服务器地址(设置页只填 IP + 端口,其余固定拼接)
 
-    static let urlDefaultsKey = "relay.serverURL"
-    static let defaultURLString = "ws://127.0.0.1:8090/ws"
+    static let hostKey = "relay.serverHost"
+    static let portKey = "relay.serverPort"
+    static let defaultHost = "127.0.0.1"
+    static let defaultPort = 8090
 
-    /// 当前生效的服务器地址(设置页保存的值,缺省回退默认)。
-    static func currentURL() -> URL {
-        let raw = UserDefaults.standard.string(forKey: urlDefaultsKey) ?? defaultURLString
-        return URL(string: normalizeURL(raw)) ?? URL(string: defaultURLString)!
+    static var savedHost: String {
+        UserDefaults.standard.string(forKey: hostKey) ?? defaultHost
+    }
+    static var savedPort: Int {
+        let p = UserDefaults.standard.integer(forKey: portKey)
+        return p > 0 ? p : defaultPort
     }
 
-    /// 宽容解析用户输入:`192.168.1.5` / `192.168.1.5:8090` / `ws://host/ws` /
-    /// `wss://example.com` 都行——自动补全 ws:// 前缀、8090 端口、/ws 路径。
-    static func normalizeURL(_ raw: String) -> String {
+    /// 由 IP/主机 + 端口拼出最终地址:ws://<host>:<port>/ws。
+    static func buildURL(host: String, port: Int) -> URL? {
+        let h = sanitizeHost(host)
+        guard !h.isEmpty, (1...65535).contains(port) else { return nil }
+        return URL(string: "ws://\(h):\(port)/ws")
+    }
+
+    /// 当前生效的服务器地址。
+    static func currentURL() -> URL {
+        buildURL(host: savedHost, port: savedPort) ?? URL(string: "ws://\(defaultHost):\(defaultPort)/ws")!
+    }
+
+    /// 清洗主机输入:容忍用户粘贴完整 URL —— 去掉 scheme、路径、自带端口。
+    static func sanitizeHost(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return defaultURLString }
-        if !s.hasPrefix("ws://") && !s.hasPrefix("wss://") { s = "ws://" + s }
-        guard var comp = URLComponents(string: s) else { return defaultURLString }
-        if comp.port == nil { comp.port = 8090 }
-        if comp.path.isEmpty || comp.path == "/" { comp.path = "/ws" }
-        return comp.string ?? defaultURLString
+        for prefix in ["ws://", "wss://", "http://", "https://"] where s.hasPrefix(prefix) {
+            s = String(s.dropFirst(prefix.count))
+        }
+        if let slash = s.firstIndex(of: "/") { s = String(s[..<slash]) }
+        if let colon = s.lastIndex(of: ":"), !s.contains("]") { s = String(s[..<colon]) }   // 非 IPv6 时去掉端口
+        return s
+    }
+
+    /// 连通性测试:握手 + WS 协议层 ping,返回是否可达与往返耗时。
+    static func testServer(host: String, port: Int) async -> (ok: Bool, message: String) {
+        guard let url = buildURL(host: host, port: port) else { return (false, "地址无效") }
+        let task = URLSession.shared.webSocketTask(with: url)
+        task.resume()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+        let start = Date()
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                        task.sendPing { err in
+                            if let err { cont.resume(throwing: err) } else { cont.resume() }
+                        }
+                    }
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 5_000_000_000)
+                    throw URLError(.timedOut)
+                }
+                try await group.next()
+                group.cancelAll()
+            }
+            let ms = max(1, Int(Date().timeIntervalSince(start) * 1000))
+            return (true, "连通正常 · \(ms)ms")
+        } catch {
+            return (false, "无法连接")
+        }
     }
 
     private let ws = WebSocketClient()
