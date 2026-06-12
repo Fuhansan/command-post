@@ -65,13 +65,13 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
     private void handleAuth(ChannelHandlerContext ctx, JsonNode root) {
         JsonNode body = root.path("body");
         String token = body.path("token").asText("");
-        // 配对键:优先用登录令牌解析真实账号(不信任客户端自报);
-        // 解析不到则回退「显式 account / token 当账号」的旧会合机制(Agent 仍走这条)。
-        String resolved = users.accountOf(token);
-        String account = resolved != null ? resolved
-                : (body.hasNonNull("account") ? body.path("account").asText() : token);
-        if (account.isEmpty()) {
-            send(ctx.channel(), Frames.error("no_account", "缺少 token/account", true));
+        // 第二道防线:必须持有效令牌(手机=登录签发,Agent=配对签发),
+        // 令牌解析出账号才放行;不再信任客户端自报的 account。
+        String account = users.accountOf(token);
+        if (account == null || account.isEmpty()) {
+            log.info("auth 拒绝: 无效令牌 from={}", root.path("from").asText("?"));
+            send(ctx.channel(), Frames.error("auth_failed",
+                    "未登录/未配对:手机请先登录,电脑请先在 VibeNotch 设置里配对手机", true));
             ctx.close();
             return;
         }

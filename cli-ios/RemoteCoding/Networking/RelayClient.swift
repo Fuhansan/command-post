@@ -164,6 +164,12 @@ final class RelayClient: ObservableObject {
         case .ui:        applyUI(frame)
         case .patch:     applyPatch(frame)
         case .ack:       applyAck(frame)
+        case .error:
+            // 致命错误(如令牌失效被服务器拒绝)→ 停止自动重连,避免风暴;
+            // 用户重新登录后会以新令牌重连。
+            if frame.body?["fatal"]?.boolValue == true {
+                ws.disconnect()
+            }
         default:         break
         }
     }

@@ -23,16 +23,10 @@ final class RelayAgent: NSObject, ObservableObject {
         return v
     }()
 
-    /// 配对账号:优先手机配对授权的凭据;其次 ~/.vibenotch/account 文件;缺省 demo。
-    static var account: String {
-        if let a = AgentCredentials.account, !a.isEmpty { return a }
-        let path = NSString(string: "~/.vibenotch/account").expandingTildeInPath
-        if let s = try? String(contentsOfFile: path, encoding: .utf8) {
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if !t.isEmpty { return t }
-        }
-        return "demo"
-    }
+    /// 配对账号:只来自手机配对授权的凭据。未配对 = 无账号 = 不连服务器(第一道防线)。
+    static var account: String { AgentCredentials.account ?? "" }
+    /// 是否已与手机配对。
+    static var isPaired: Bool { !(AgentCredentials.token ?? "").isEmpty }
     // 每个 claude 会话(终端)= 一个独立协议 sid = entry.id → 手机端分成多个任务。
 
     /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。
@@ -118,6 +112,12 @@ final class RelayAgent: NSObject, ObservableObject {
     // MARK: - 连接 / 鉴权
 
     private func connect() {
+        // 第一道防线:未配对(无凭据)不连接服务器。配对成功后经
+        // credentialsChanged 通知 → restart() 再进来。
+        guard Self.isPaired else {
+            vlog("relay: 未配对,保持离线(在 VibeNotch 设置里配对手机)")
+            return
+        }
         let t = session.webSocketTask(with: Self.relayURL)
         t.maximumMessageSize = 8 << 20   // 手机上行图片帧可达数百 KB,默认 1MB 太紧
         task = t
@@ -149,8 +149,8 @@ final class RelayAgent: NSObject, ObservableObject {
         sendJSON([
             "v": 1, "t": "auth", "id": "h_agent", "from": "agent",
             "body": [
-                // 配对授权拿到的 token:服务器优先据此解析账号(没有则回退 account 会合)
-                "token": AgentCredentials.token ?? "agent",
+                // 配对授权拿到的 token:服务器据此解析账号(无有效 token 会被拒绝)
+                "token": AgentCredentials.token ?? "",
                 "account": Self.account,
                 "device": ["id": Self.deviceId, "platform": "mac", "name": name],
                 "caps": ["protocol": 1]
