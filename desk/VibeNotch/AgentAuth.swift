@@ -23,6 +23,9 @@ enum AgentCredentials {
     static func clear() {
         UserDefaults.standard.removeObject(forKey: accountKey)
         UserDefaults.standard.removeObject(forKey: tokenKey)
+        // 旧的文件配置一并清掉,避免退出后又从文件回落到原账号
+        try? FileManager.default.removeItem(
+            atPath: NSString(string: "~/.vibenotch/account").expandingTildeInPath)
         NotificationCenter.default.post(name: .relayCredentialsChanged, object: nil)
     }
 }

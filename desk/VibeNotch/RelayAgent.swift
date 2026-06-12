@@ -14,6 +14,15 @@ import Foundation
 final class RelayAgent: NSObject, ObservableObject {
 
     static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
+    /// 本机 Agent 的稳定唯一标识(多台电脑同账号时区分会话/快照/在线状态)。
+    static let deviceId: String = {
+        let key = "agent.deviceId"
+        if let v = UserDefaults.standard.string(forKey: key), !v.isEmpty { return v }
+        let v = "mac_" + String(UUID().uuidString.prefix(8)).lowercased()
+        UserDefaults.standard.set(v, forKey: key)
+        return v
+    }()
+
     /// 配对账号:优先手机配对授权的凭据;其次 ~/.vibenotch/account 文件;缺省 demo。
     static var account: String {
         if let a = AgentCredentials.account, !a.isEmpty { return a }
@@ -132,7 +141,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private func sendReset() {
         seq += 1
         send(jsonString(["v": 1, "t": "patch", "id": "reset", "seq": seq,
-                         "from": "agent", "body": ["op": "reset"]]))
+                         "from": "agent", "body": ["op": "reset", "agent": Self.deviceId]]))
     }
 
     private func sendAuth() {
@@ -143,17 +152,21 @@ final class RelayAgent: NSObject, ObservableObject {
                 // 配对授权拿到的 token:服务器优先据此解析账号(没有则回退 account 会合)
                 "token": AgentCredentials.token ?? "agent",
                 "account": Self.account,
-                "device": ["id": "agent_mac", "platform": "mac", "name": name],
+                "device": ["id": Self.deviceId, "platform": "mac", "name": name],
                 "caps": ["protocol": 1]
             ]
         ])
     }
 
-    /// 凭据变化(配对成功/退出)→ 以新身份重连。
+    /// 凭据变化(配对成功/退出)→ 先以旧身份清掉本机数据,再以新身份重连。
     func restart() {
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
-        connect()
+        sendReset()   // 旧账号的手机立刻看到本机会话消失(+ presence 离线)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)   // 给 reset 帧出门的时间
+            self.task?.cancel(with: .goingAway, reason: nil)
+            self.task = nil
+            self.connect()
+        }
     }
 
     // MARK: - 上行:会话 → 协议组件
@@ -238,6 +251,7 @@ final class RelayAgent: NSObject, ObservableObject {
         // 标题优先用项目名(cwd 末段);取不到再退回终端名。
         let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
         return [
+            "agent": Self.deviceId,                // 来自哪台电脑
             "title": project,                     // 项目名(主标题)
             "terminal": e.terminal.displayName,    // 终端 / IDE
             "cwd": cwd,                            // 项目工作目录

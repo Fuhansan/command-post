@@ -111,14 +111,15 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         Connection conn = ctx.channel().attr(CONN).get();
         if (conn == null) return;
         String msgId = root.path("id").asText("");
-        if (!msgId.isEmpty()) hub.snapshot(conn.account, msgId, text);
+        if (!msgId.isEmpty()) hub.snapshot(conn.account, msgId, text, conn.deviceId);
     }
 
     /** patch 路由:op=reset 清空账号全部快照并转发(让手机清空);否则正常转发 + 处理删除快照。 */
     private void handlePatch(ChannelHandlerContext ctx, JsonNode root, String text) {
         Connection conn = ctx.channel().attr(CONN).get();
         if (conn != null && "reset".equals(root.path("body").path("op").asText(""))) {
-            hub.clearSnapshots(conn.account);
+            // 只清这台 Agent 的快照与会话(多电脑同账号时互不影响)
+            hub.clearSnapshots(conn.account, conn.deviceId);
             for (Connection c : hub.clientsOf(conn.account)) send(c.channel, text);
             return;
         }

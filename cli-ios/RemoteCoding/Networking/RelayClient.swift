@@ -10,6 +10,7 @@ struct RelaySession: Identifiable {
     var subtitle: String        // prompt 摘要 / 当前活动
     var status: String          // idle | working | waiting | done | ended
     var needsAction: Bool       // 是否有待批准的命令
+    var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
     var messages: [UIMessage]   // 该会话的下行富消息
 }
 
@@ -185,8 +186,9 @@ final class RelayClient: ObservableObject {
         let idx = sessions.firstIndex(where: { $0.id == sid })
         var s = idx.map { sessions[$0] }
             ?? RelaySession(id: sid, title: "会话", terminal: "", cwd: "", subtitle: "",
-                            status: "working", needsAction: false, messages: [])
+                            status: "working", needsAction: false, agentId: "", messages: [])
         if let meta {
+            s.agentId = meta["agent"]?.stringValue ?? s.agentId
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
             s.cwd = meta["cwd"]?.stringValue ?? s.cwd
@@ -212,8 +214,12 @@ final class RelayClient: ObservableObject {
     private func applyPatch(_ frame: Frame) {
         guard let body = frame.body else { return }
         let op = body.string("op", default: "replace")
-        if op == "reset" {   // agent 进程重启 → 清空全部会话,作废旧数据
-            sessions.removeAll()
+        if op == "reset" {   // 某台电脑的 agent 重启/退出配对 → 只清它的会话(老格式不带 agent 则全清)
+            if let agentId = body["agent"]?.stringValue, !agentId.isEmpty {
+                sessions.removeAll { $0.agentId == agentId || $0.agentId.isEmpty }
+            } else {
+                sessions.removeAll()
+            }
             return
         }
         guard let sid = frame.sid else { return }
