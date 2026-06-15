@@ -47,8 +47,15 @@ struct LoginView: View {
     @State private var regInfo: String?
     @State private var regError: String?
 
+    // 分步流程(仿 App Store:先邮箱,下一步再密码;验证码同理单独一步)
+    enum Step { case email, code, password }
+    @State private var loginStep: Step = .email
+    @State private var regStep: Step = .email
+    @State private var resetStep: Step = .email
+
     private var port: Int { Int(portText) ?? 0 }
     private var serverValid: Bool { !RelayClient.sanitizeHost(host).isEmpty && (1...65535).contains(port) }
+    private func isEmail(_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).contains("@") }
     private var canLogin: Bool {
         reachable && !account.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 4
     }
@@ -129,79 +136,106 @@ struct LoginView: View {
     }
 
     private var loginCard: some View {
-        VStack(spacing: 12) {
-            Text("邮箱密码登录").font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(Theme.textSec).frame(maxWidth: .infinity, alignment: .leading)
-            field($account, prompt: "邮箱(注册时的 Google 邮箱)", keyboard: .emailAddress, width: nil, secure: false)
-                .textContentType(.username)
-            field($password, prompt: "密码", keyboard: .default, width: nil, secure: true)
+        VStack(spacing: 14) {
+            if loginStep == .email {
+                Text("登录").font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Theme.text).frame(maxWidth: .infinity, alignment: .leading)
+                field($account, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
+                    .textContentType(.username)
+                Button {
+                    errorMessage = nil
+                    withAnimation { loginStep = .password }
+                } label: { primaryLabel("下一步") }
+                .buttonStyle(.plain).disabled(!reachable || !isEmail(account))
 
-            Button(action: doLogin) {
-                HStack(spacing: 8) {
-                    if loading { ProgressView().tint(.white) }
-                    Text("登录").font(.system(size: 16, weight: .semibold))
+                if !reachable {
+                    Text("请先在上方测试连接到服务器")
+                        .font(.system(size: 12)).foregroundStyle(Theme.textTer)
                 }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity).padding(.vertical, 13)
-                .background(canLogin ? Theme.blueBtn : Theme.cardHi)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            }
-            .buttonStyle(.plain).disabled(!canLogin || loading)
 
-            if !reachable {
-                Text("请先在上方测试连接到服务器")
-                    .font(.system(size: 12)).foregroundStyle(Theme.textTer)
-            }
-
-            Button {
-                resetAccount = account.trimmingCharacters(in: .whitespaces)
-                resetCode = ""; resetNewPassword = ""
-                resetCodeSent = false; resetInfo = nil; resetError = nil
-                showReset = true
-            } label: {
-                Text("忘记密码?").font(.system(size: 13)).foregroundStyle(Theme.blue)
-            }
-            .buttonStyle(.plain).disabled(!reachable)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-
-            HStack {
-                Rectangle().fill(Theme.stroke).frame(height: 1)
-                Text("首次使用").font(.system(size: 12)).foregroundStyle(Theme.textTer)
-                Rectangle().fill(Theme.stroke).frame(height: 1)
-            }
-            // 邮箱验证码注册(主路径,国内 VPS 可用)
-            Button {
-                regAccount = account.trimmingCharacters(in: .whitespaces)
-                regCode = ""; regPassword = ""
-                regCodeSent = false; regInfo = nil; regError = nil
-                showRegister = true
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "envelope.fill").font(.system(size: 16))
-                    Text("用邮箱注册").font(.system(size: 14, weight: .semibold))
+                HStack {
+                    Rectangle().fill(Theme.stroke).frame(height: 1)
+                    Text("首次使用").font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                    Rectangle().fill(Theme.stroke).frame(height: 1)
                 }
-                .foregroundStyle(reachable ? Theme.text : Theme.textTer)
-                .frame(maxWidth: .infinity).padding(.vertical, 11)
-                .background(Theme.cardHi)
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-            .buttonStyle(.plain).disabled(loading || !reachable)
-            // Google 注册(次路径,需服务器能访问 Google)
-            Button(action: signInGoogle) {
-                HStack(spacing: 6) {
-                    Image(systemName: "g.circle.fill").font(.system(size: 15))
-                    Text("或用 Google 注册").font(.system(size: 13))
+                // 邮箱验证码注册(主路径,国内 VPS 可用)
+                Button {
+                    regAccount = account.trimmingCharacters(in: .whitespaces)
+                    regCode = ""; regPassword = ""; regInfo = nil; regError = nil
+                    regCodeSent = false; regStep = .email
+                    showRegister = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "envelope.fill").font(.system(size: 16))
+                        Text("用邮箱注册").font(.system(size: 14, weight: .semibold))
+                    }
+                    .foregroundStyle(reachable ? Theme.text : Theme.textTer)
+                    .frame(maxWidth: .infinity).padding(.vertical, 11)
+                    .background(Theme.cardHi)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
-                .foregroundStyle(reachable ? Theme.textSec : Theme.textTer)
-                .frame(maxWidth: .infinity).padding(.vertical, 8)
+                .buttonStyle(.plain).disabled(loading || !reachable)
+                // Google 注册(次路径,需服务器能访问 Google)
+                Button(action: signInGoogle) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "g.circle.fill").font(.system(size: 15))
+                        Text("或用 Google 注册").font(.system(size: 13))
+                    }
+                    .foregroundStyle(reachable ? Theme.textSec : Theme.textTer)
+                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+                }
+                .buttonStyle(.plain).disabled(loading || !reachable)
+                Text("用邮箱验证码创建账号;Google 注册需服务器能访问 Google(国内服务器不可用)")
+                    .font(.system(size: 11)).foregroundStyle(Theme.textTer)
+                    .multilineTextAlignment(.center)
+            } else {
+                // 密码步:顶部显示邮箱,可点返回改邮箱
+                accountHeader(account) {
+                    withAnimation { loginStep = .email }
+                    password = ""; errorMessage = nil
+                }
+                field($password, prompt: "密码", keyboard: .default, width: nil, secure: true)
+                Button(action: doLogin) { primaryLabel("登录", loading: loading) }
+                    .buttonStyle(.plain).disabled(!canLogin || loading)
+                Button {
+                    resetAccount = account.trimmingCharacters(in: .whitespaces)
+                    resetCode = ""; resetNewPassword = ""; resetInfo = nil; resetError = nil
+                    resetCodeSent = false; resetStep = .email
+                    showReset = true
+                } label: {
+                    Text("忘记密码?").font(.system(size: 13)).foregroundStyle(Theme.blue)
+                }
+                .buttonStyle(.plain).frame(maxWidth: .infinity, alignment: .trailing)
             }
-            .buttonStyle(.plain).disabled(loading || !reachable)
-            Text("用邮箱验证码创建账号;Google 注册需服务器能访问 Google(国内服务器不可用)")
-                .font(.system(size: 11)).foregroundStyle(Theme.textTer)
-                .multilineTextAlignment(.center)
         }
         .padding(16).cardStyle()
+    }
+
+    /// 主操作按钮的统一样式(蓝底白字,可带 loading)。
+    private func primaryLabel(_ title: String, loading: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            if loading { ProgressView().tint(.white) }
+            Text(title).font(.system(size: 16, weight: .semibold))
+        }
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity).padding(.vertical, 13)
+        .background(Theme.blueBtn)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// 分步流程顶部的「‹ 邮箱」可点返回行。
+    private func accountHeader(_ email: String, onBack: @escaping () -> Void) -> some View {
+        Button(action: onBack) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.left").font(.system(size: 13, weight: .semibold))
+                Text(email).font(.system(size: 14, weight: .medium)).lineLimit(1)
+                Spacer()
+                Text("更改").font(.system(size: 12)).foregroundStyle(Theme.blue)
+            }
+            .foregroundStyle(Theme.textSec)
+        }
+        .buttonStyle(.plain)
     }
 
     private var setPasswordSheet: some View {
@@ -239,39 +273,33 @@ struct LoginView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("邮箱注册").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
-                    Text("用邮箱接收验证码创建账号,不依赖 Google。注册成功直接登录。")
-                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
 
-                    field($regAccount, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
-                        .textContentType(.username)
-
-                    Button(action: sendRegCode) {
-                        HStack(spacing: 8) {
-                            if regSending { ProgressView().tint(.white) }
-                            Text(regCodeSent ? "重新发送验证码" : "发送验证码")
-                                .font(.system(size: 15, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .background(canSendReg ? Theme.blueBtn : Theme.cardHi)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain).disabled(!canSendReg || regSending)
-
-                    if regCodeSent {
+                    switch regStep {
+                    case .email:
+                        Text("输入邮箱,我们会发送验证码。不依赖 Google。")
+                            .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                        field($regAccount, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
+                            .textContentType(.username)
+                        Button(action: sendRegCode) { primaryLabel(regSending ? "发送中…" : "发送验证码", loading: regSending) }
+                            .buttonStyle(.plain).disabled(!canSendReg || regSending)
+                    case .code:
+                        accountHeader(regAccount) { withAnimation { regStep = .email }; regCode = ""; regError = nil }
+                        Text("验证码已发到 \(regAccount),请查收(可能在垃圾箱)。")
+                            .font(.system(size: 13)).foregroundStyle(Theme.textSec)
                         field($regCode, prompt: "6 位验证码", keyboard: .numberPad, width: nil, secure: false)
-                        field($regPassword, prompt: "设置密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
-                        Button(action: doRegister) {
-                            HStack(spacing: 8) {
-                                if loading { ProgressView().tint(.white) }
-                                Text("注册并登录").font(.system(size: 16, weight: .semibold))
-                            }
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity).padding(.vertical, 13)
-                            .background(canRegister ? Theme.blueBtn : Theme.cardHi)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button { regError = nil; withAnimation { regStep = .password } } label: { primaryLabel("下一步") }
+                            .buttonStyle(.plain).disabled(regCode.trimmingCharacters(in: .whitespaces).count < 4)
+                        Button(action: sendRegCode) {
+                            Text(regSending ? "发送中…" : "重新发送验证码").font(.system(size: 13)).foregroundStyle(Theme.blue)
                         }
-                        .buttonStyle(.plain).disabled(!canRegister || loading)
+                        .buttonStyle(.plain).disabled(regSending).frame(maxWidth: .infinity)
+                    case .password:
+                        accountHeader(regAccount) { withAnimation { regStep = .code }; regError = nil }
+                        Text("设置登录密码,完成注册并进入。")
+                            .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                        field($regPassword, prompt: "设置密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
+                        Button(action: doRegister) { primaryLabel("注册并登录", loading: loading) }
+                            .buttonStyle(.plain).disabled(regPassword.count < 4 || loading)
                     }
 
                     if let regInfo {
@@ -280,10 +308,8 @@ struct LoginView: View {
                     if let regError {
                         Text(regError).font(.system(size: 13)).foregroundStyle(Theme.coral)
                     }
-
                     Button("取消") { showRegister = false }
-                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
-                        .frame(maxWidth: .infinity)
+                        .font(.system(size: 14)).foregroundStyle(Theme.textSec).frame(maxWidth: .infinity)
                     Spacer(minLength: 8)
                 }
                 .padding(24)
@@ -299,39 +325,33 @@ struct LoginView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("重置密码").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
-                    Text("输入注册邮箱,把验证码发到该邮箱,再用验证码设置新密码。")
-                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
 
-                    field($resetAccount, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
-                        .textContentType(.username)
-
-                    Button(action: sendResetCode) {
-                        HStack(spacing: 8) {
-                            if resetSending { ProgressView().tint(.white) }
-                            Text(resetCodeSent ? "重新发送验证码" : "发送验证码")
-                                .font(.system(size: 15, weight: .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .background(canSendReset ? Theme.blueBtn : Theme.cardHi)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain).disabled(!canSendReset || resetSending)
-
-                    if resetCodeSent {
+                    switch resetStep {
+                    case .email:
+                        Text("输入注册邮箱,我们会把验证码发到该邮箱。")
+                            .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                        field($resetAccount, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
+                            .textContentType(.username)
+                        Button(action: sendResetCode) { primaryLabel(resetSending ? "发送中…" : "发送验证码", loading: resetSending) }
+                            .buttonStyle(.plain).disabled(!canSendReset || resetSending)
+                    case .code:
+                        accountHeader(resetAccount) { withAnimation { resetStep = .email }; resetCode = ""; resetError = nil }
+                        Text("验证码已发到 \(resetAccount),请查收(可能在垃圾箱)。")
+                            .font(.system(size: 13)).foregroundStyle(Theme.textSec)
                         field($resetCode, prompt: "6 位验证码", keyboard: .numberPad, width: nil, secure: false)
-                        field($resetNewPassword, prompt: "新密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
-                        Button(action: doResetPassword) {
-                            HStack(spacing: 8) {
-                                if loading { ProgressView().tint(.white) }
-                                Text("重置密码").font(.system(size: 16, weight: .semibold))
-                            }
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity).padding(.vertical, 13)
-                            .background(canReset ? Theme.blueBtn : Theme.cardHi)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button { resetError = nil; withAnimation { resetStep = .password } } label: { primaryLabel("下一步") }
+                            .buttonStyle(.plain).disabled(resetCode.trimmingCharacters(in: .whitespaces).count < 4)
+                        Button(action: sendResetCode) {
+                            Text(resetSending ? "发送中…" : "重新发送验证码").font(.system(size: 13)).foregroundStyle(Theme.blue)
                         }
-                        .buttonStyle(.plain).disabled(!canReset || loading)
+                        .buttonStyle(.plain).disabled(resetSending).frame(maxWidth: .infinity)
+                    case .password:
+                        accountHeader(resetAccount) { withAnimation { resetStep = .code }; resetError = nil }
+                        Text("设置新密码,完成重置。")
+                            .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                        field($resetNewPassword, prompt: "新密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
+                        Button(action: doResetPassword) { primaryLabel("重置密码", loading: loading) }
+                            .buttonStyle(.plain).disabled(resetNewPassword.count < 4 || loading)
                     }
 
                     if let resetInfo {
@@ -340,10 +360,8 @@ struct LoginView: View {
                     if let resetError {
                         Text(resetError).font(.system(size: 13)).foregroundStyle(Theme.coral)
                     }
-
                     Button("取消") { showReset = false }
-                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
-                        .frame(maxWidth: .infinity)
+                        .font(.system(size: 14)).foregroundStyle(Theme.textSec).frame(maxWidth: .infinity)
                     Spacer(minLength: 8)
                 }
                 .padding(24)
@@ -440,8 +458,8 @@ struct LoginView: View {
         Task {
             do {
                 try await AuthAPI.registerCode(account: acc)
-                regCodeSent = true
-                regInfo = "验证码已发送到 \(acc),请查收(可能在垃圾箱)。"
+                regInfo = nil
+                withAnimation { if regStep == .email { regStep = .code } }
             } catch { regError = error.localizedDescription }
             regSending = false
         }
@@ -468,8 +486,8 @@ struct LoginView: View {
         Task {
             do {
                 try await AuthAPI.forgotPassword(account: acc)
-                resetCodeSent = true
-                resetInfo = "验证码已发送到 \(acc),请查收(可能在垃圾箱)。"
+                resetInfo = nil
+                withAnimation { if resetStep == .email { resetStep = .code } }
             } catch { resetError = error.localizedDescription }
             resetSending = false
         }
@@ -484,7 +502,7 @@ struct LoginView: View {
             do {
                 try await AuthAPI.resetPassword(account: acc, code: code, password: pwd)
                 showReset = false
-                account = acc; password = ""       // 回登录页,预填邮箱,让用户用新密码登录
+                account = acc; password = ""; loginStep = .password   // 回登录页密码步,预填邮箱
                 errorMessage = "密码已重置,请用新密码登录"
             } catch { resetError = error.localizedDescription }
             loading = false
