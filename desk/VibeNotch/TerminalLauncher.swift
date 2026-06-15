@@ -26,7 +26,12 @@ enum TerminalLauncher {
         if let cdTarget = leadingCdPath(in: cmd) { trustDirs.append(cdTarget) }
         if !dir.isEmpty { trustDirs.append(dir) }
         if trustDirs.isEmpty { trustDirs.append(NSHomeDirectory()) }
-        ClaudeTrust.trust(directories: trustDirs)
+        // 按命令工具名路由到对应适配器做信任预置(claude→ClaudeTrust;其他工具各自实现)
+        if let tool = mainTool(in: cmd), let agent = CodingAgents.forCommand(tool) {
+            agent.preTrust(directories: trustDirs)
+        } else {
+            ClaudeAgent().preTrust(directories: trustDirs)   // 默认按 claude 处理
+        }
 
         // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本。
         // 关键:只补**装了该命令的那一个** node 版本的 bin(不是所有版本)——

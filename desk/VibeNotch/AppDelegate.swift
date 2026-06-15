@@ -314,7 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let sid = event.sessionId, let path = event.transcriptPath {
             switch event.hookEventName {
             case "PreToolUse", "PostToolUse", "Stop", "Notification":
-                store.updateTurnSteps(sessionId: sid, steps: TranscriptReader.currentTurnSteps(transcriptPath: path))
+                store.updateTurnSteps(sessionId: sid, steps: CodingAgents.turnSteps(transcriptPath: path))
             default:
                 break
             }
@@ -367,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let started = Date()
             while !Task.isCancelled {
                 guard let self else { return }
-                let steps = TranscriptReader.currentTurnSteps(transcriptPath: transcriptPath)
+                let steps = CodingAgents.turnSteps(transcriptPath: transcriptPath)
                 if steps != lastSteps {
                     lastSteps = steps
                     self.store.updateTurnSteps(sessionId: sessionId, steps: steps)

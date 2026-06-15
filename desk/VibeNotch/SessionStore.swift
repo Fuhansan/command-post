@@ -50,7 +50,7 @@ final class SessionStore: ObservableObject {
                     state: .idle,
                     cwd: cwd,
                     promptSummary: prevPrompt,
-                    turnSteps: TranscriptReader.currentTurnSteps(transcriptPath: path),
+                    turnSteps: CodingAgents.turnSteps(transcriptPath: path),
                     toolDetail: nil,
                     terminal: terminal,
                     terminalPID: terminalPID,
