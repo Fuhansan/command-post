@@ -12,30 +12,31 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Map;
 
 /**
- * 忘记密码:验证码发到账号绑定邮箱(账号本身就是邮箱),验码后重设密码。
- *   POST /api/auth/forgot {account}                  → 发验证码(账号不存在也回 200,防探测)
- *   POST /api/auth/reset  {account, code, password}  → 验码 + 改密
+ * 邮箱验证码注册(替代 Google:国内 VPS 连不上 Google,没法用 Google 验证邮箱建号)。
+ *   POST /api/auth/register/code {account}                 → 给该邮箱发注册验证码(已注册则报错)
+ *   POST /api/auth/register      {account, code, password} → 验码 + 创建账号 + 返回 {account, token}
  * 验证码逻辑见 {@link VerificationService}。
  */
 @RestController
 @RequestMapping("/api/auth")
-public class PasswordResetController {
+public class RegistrationController {
 
-    private static final Logger log = LoggerFactory.getLogger(PasswordResetController.class);
+    private static final Logger log = LoggerFactory.getLogger(RegistrationController.class);
 
-    public record ForgotReq(String account) {}
-    public record ResetReq(String account, String code, String password) {}
+    public record CodeReq(String account) {}
+    public record RegisterReq(String account, String code, String password) {}
 
     private final UserStore store;
     private final VerificationService codes;
 
-    public PasswordResetController(UserStore store, VerificationService codes) {
+    public RegistrationController(UserStore store, VerificationService codes) {
         this.store = store;
         this.codes = codes;
     }
 
-    @PostMapping("/forgot")
-    public ResponseEntity<Map<String, String>> forgot(@RequestBody ForgotReq req) {
+    /** 请求注册验证码。 */
+    @PostMapping("/register/code")
+    public ResponseEntity<Map<String, String>> sendCode(@RequestBody CodeReq req) {
         String account = norm(req.account());
         if (account.isEmpty() || !account.contains("@")) {
             return ResponseEntity.badRequest().body(Map.of("error", "请输入有效邮箱"));
@@ -43,12 +44,10 @@ public class PasswordResetController {
         if (!codes.isMailReady()) {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", "服务器未配置邮件发送"));
         }
-        // 账号不存在:静默返回成功(防探测),不发信
-        if (!store.exists(account)) {
-            log.info("forgot: 账号不存在,静默忽略 {}", account);
-            return ResponseEntity.ok(Map.of("message", "若该邮箱已注册,验证码已发送"));
+        if (store.exists(account)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "该邮箱已注册,请直接登录或用「忘记密码」"));
         }
-        return switch (codes.send(account, "重置密码")) {
+        return switch (codes.send(account, "注册")) {
             case SENT          -> ResponseEntity.ok(Map.of("message", "验证码已发送"));
             case RATE_LIMITED  -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "验证码已发送,请稍后再试"));
             case NO_MAIL       -> ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(Map.of("error", "服务器未配置邮件发送"));
@@ -56,18 +55,23 @@ public class PasswordResetController {
         };
     }
 
-    @PostMapping("/reset")
-    public ResponseEntity<Map<String, String>> reset(@RequestBody ResetReq req) {
+    /** 验码并创建账号,直接返回登录令牌。 */
+    @PostMapping("/register")
+    public ResponseEntity<Map<String, String>> register(@RequestBody RegisterReq req) {
         String account = norm(req.account());
         String password = req.password() == null ? "" : req.password();
         if (password.length() < 4) {
             return ResponseEntity.badRequest().body(Map.of("error", "密码至少 4 位"));
         }
+        if (store.exists(account)) {
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of("error", "该邮箱已注册"));
+        }
         return switch (codes.check(account, req.code())) {
             case OK -> {
-                store.setPassword(account, password);
-                log.info("reset: 密码已重置 {}", account);
-                yield ResponseEntity.ok(Map.of("account", account, "message", "密码已重置,请用新密码登录"));
+                store.createWithPassword(account, password, null);
+                String token = store.issueToken(account);
+                log.info("register: 新账号已创建 {}", account);
+                yield ResponseEntity.ok(Map.of("account", account, "token", token));
             }
             case WRONG     -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "验证码错误"));
             case TOO_MANY  -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "尝试次数过多,请重新获取验证码"));

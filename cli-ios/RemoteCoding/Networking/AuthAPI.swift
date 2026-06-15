@@ -74,6 +74,39 @@ enum AuthAPI {
         return try JSONDecoder().decode(AuthResult.self, from: data)
     }
 
+    /// 注册 - 第一步:请求把注册验证码发到该邮箱(已注册会报错)。
+    @MainActor
+    static func registerCode(account: String) async throws {
+        guard let url = URL(string: "\(baseURL)/register/code") else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 20)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["account": account])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw AuthError.server(msg ?? "发送失败(\(http.statusCode))")
+        }
+    }
+
+    /// 注册 - 第二步:验码 + 创建账号,直接返回登录令牌。
+    @MainActor
+    static func register(account: String, code: String, password: String) async throws -> AuthResult {
+        guard let url = URL(string: "\(baseURL)/register") else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 12)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["account": account, "code": code, "password": password])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"]
+            throw AuthError.server(msg ?? "注册失败(\(http.statusCode))")
+        }
+        return try JSONDecoder().decode(AuthResult.self, from: data)
+    }
+
     /// 忘记密码 - 第一步:请求把验证码发到该邮箱。
     @MainActor
     static func forgotPassword(account: String) async throws {
