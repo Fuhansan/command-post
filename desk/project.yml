@@ -36,6 +36,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         NSHumanReadableCopyright: ""
+        # 手机「新建会话」用 AppleScript 控制 Terminal.app 开窗口跑命令(自动化权限)
+        NSAppleEventsUsageDescription: "VibeNotch 需要控制终端来从手机端新建会话(打开终端运行命令)。"
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
     settings:

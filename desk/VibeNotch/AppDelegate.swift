@@ -222,8 +222,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
         }
         agent.onRemoteLaunch = { command in
-            vlog("relay launch: \(command)")
-            TerminalLauncher.run(command: command)
+            let dir = AppSettings.shared.defaultWorkdir
+            vlog("relay launch: \(command) (workdir=\(dir.isEmpty ? "~" : dir))")
+            TerminalLauncher.run(command: command, workdir: dir)
         }
         agent.start()
         relayAgent = agent

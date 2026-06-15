@@ -34,6 +34,17 @@ struct SettingsView: View {
                 Toggle(L10n.t(.settingsMuteSounds, locale: locale), isOn: $settings.muted)
             }
 
+            // 手机「新建会话」用的默认工作目录
+            Section("新建会话") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("默认工作目录(如 ~/Projects)", text: $settings.defaultWorkdir)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                    Text("手机点「+」新建会话时,新终端先 cd 进此目录再运行命令。留空则用 ~ 。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+
             Section {
                 Text(L10n.t(.settingsConfigPath, locale: locale))
                     .font(.system(size: 11, design: .monospaced))
