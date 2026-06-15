@@ -324,21 +324,37 @@ final class RelayClient: ObservableObject {
                      body: .object(["kind": .string("text"), "text": .string(trimmed)]))
     }
 
-    /// 图文输入:图片(base64)+ 可选文字一起发往电脑端,注入对应终端。本地先回显一条图文气泡。
-    func sendImageInput(images: [StagedImagePayload], text: String, sessionId: String) {
-        guard !images.isEmpty else { return sendInput(text: text, sessionId: sessionId) }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let frameId = "in_\(UUID().uuidString)"
-        var msg = UIMessage(localUserImages: images, text: trimmed)
-        msg.status = .sending; msg.upstreamId = frameId
+    /// 图文回显:即时在气泡里显示(缩略图,仅本地展示),先不发送。
+    /// 返回本地消息 id,供图片上传完成后关联发送 / 更新投递状态。
+    func beginImageEcho(thumbs: [StagedImagePayload], text: String, sessionId: String) -> String {
+        var msg = UIMessage(localUserImages: thumbs, text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        msg.status = .sending
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[idx].messages.append(msg)
         }
-        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: msg.id,
+        return msg.id
+    }
+
+    /// 图片上传换回 id 后,发送图文输入帧 —— 控制通道**只带图片 id**,不带 base64。
+    /// 电脑端 VibeNotch 凭 id 经 HTTP 把图拉下来再注入。
+    func sendImageRefs(refs: [(id: String, ext: String)], text: String, sessionId: String, localMsgId: String) {
+        guard !refs.isEmpty else {
+            // 全部上传失败 → 标记失败,气泡可手动重发(此时无 pendingFrame,重发走重新上传由 UI 兜底)
+            setStatus(.failed, localMsgId: localMsgId, sessionId: sessionId)
+            return
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let frameId = "in_\(UUID().uuidString)"
+        // 把上行帧 id 记到回显消息上(重发/对账用)
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+           let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == localMsgId }) {
+            sessions[sIdx].messages[mIdx].upstreamId = frameId
+        }
+        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: localMsgId,
                      body: .object([
                        "kind": .string("image"),
                        "text": .string(trimmed),
-                       "images": .array(images.map { .object(["data": .string($0.data), "ext": .string($0.ext)]) })
+                       "images": .array(refs.map { .object(["id": .string($0.id), "ext": .string($0.ext)]) })
                      ]))
     }
 

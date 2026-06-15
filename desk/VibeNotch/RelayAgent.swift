@@ -745,21 +745,50 @@ final class RelayAgent: NSObject, ObservableObject {
         guard let sid = obj["sid"] as? String,
               let body = obj["body"] as? [String: Any] else { return }
         let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        var paths: [String] = []
-        if let images = body["images"] as? [[String: Any]] {
-            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            for (i, img) in images.enumerated() {
-                guard let b64 = img["data"] as? String,
-                      let data = Data(base64Encoded: b64) else { continue }
-                let ext = (img["ext"] as? String ?? "jpg").lowercased()
-                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
-                guard FileManager.default.createFile(atPath: path, contents: data) else { continue }
-                paths.append(path)
+        let images = body["images"] as? [[String: Any]] ?? []
+        // 图片要从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程注入终端。
+        Task.detached(priority: .userInitiated) { [weak self] in
+            var paths: [String] = []
+            if !images.isEmpty {
+                let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                for (i, img) in images.enumerated() {
+                    let ext = (img["ext"] as? String ?? "jpg").lowercased()
+                    let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
+                    let data: Data?
+                    if let id = img["id"] as? String, !id.isEmpty {
+                        data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
+                    } else if let b64 = img["data"] as? String {
+                        data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
+                    } else {
+                        data = nil
+                    }
+                    guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
+                    paths.append(path)
+                }
             }
+            guard !text.isEmpty || !paths.isEmpty else { return }
+            await MainActor.run { self?.onRemoteInput?(sid, text, paths) }
         }
-        guard !text.isEmpty || !paths.isEmpty else { return }
-        onRemoteInput?(sid, text, paths)
+    }
+
+    /// 凭 id 从服务器(HTTP 8080,与 WS 的 8090 同主机)下载图片字节。
+    /// 已在后台调用,同步等待结果。带配对 token(服务器据此按账号取图)。
+    nonisolated private static func downloadImage(id: String) -> Data? {
+        let host = relayURL.host ?? "127.0.0.1"
+        guard let url = URL(string: "http://\(host):8080/api/image/\(id)") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 30)
+        if let token = AgentCredentials.token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        var out: Data?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { out = data }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 30)
+        return out
     }
 
     // MARK: - 收发底层

@@ -292,22 +292,31 @@ struct TaskDetailView: View {
         let sid = sessionId
         stagedImages = []
         draft = ""
-        // 缩放 / JPEG / base64 编码很重(原图越大越明显,HEIC 还要先解码),
-        // 之前全在主线程同步跑、且要编完才回显气泡 → 点完按钮 UI 冻一下才动,
-        // 就是「发图贼慢」的根源。挪到后台线程,编完再回主线程回显+发送。
+        // 图片走 HTTP 数据通道,WS 控制通道只传 id(不再塞 base64)。全程后台:
+        //   ① 编码:缩略图(回显用)+ 全尺寸 JPEG(上传用)—— 不卡主线程
+        //   ② 即时回显缩略图(点完按钮马上看到气泡)
+        //   ③ 逐张 HTTP 上传换回 id
+        //   ④ 控制帧只带 id 发出
         Task.detached(priority: .userInitiated) { [relay] in
-            let payloads = images.enumerated().compactMap { i, img -> StagedImagePayload? in
-                guard let jpeg = img.resized(maxDim: 1568).jpegData(compressionQuality: 0.7) else { return nil }
-                return StagedImagePayload(
-                    data: jpeg.base64EncodedString(), ext: "jpg",
+            var thumbs: [StagedImagePayload] = []   // 本地回显(小缩略图 base64)
+            var fulls: [Data] = []                  // 上传用(1568px JPEG)
+            for (i, img) in images.enumerated() {
+                guard let full = img.resized(maxDim: 1568).jpegData(compressionQuality: 0.7) else { continue }
+                let thumb = img.resized(maxDim: 600).jpegData(compressionQuality: 0.5) ?? full
+                fulls.append(full)
+                thumbs.append(StagedImagePayload(
+                    data: thumb.base64EncodedString(), ext: "jpg",
                     name: "photo_\(i + 1).jpg", kind: "JPEG",
-                    size: jpeg.count >= 1_000_000
-                        ? String(format: "%.1f MB", Double(jpeg.count) / 1_000_000)
-                        : "\(jpeg.count / 1_000) KB")
+                    size: full.count >= 1_000_000
+                        ? String(format: "%.1f MB", Double(full.count) / 1_000_000)
+                        : "\(full.count / 1_000) KB"))
             }
-            await MainActor.run {
-                relay.sendImageInput(images: payloads, text: text, sessionId: sid)
+            let localMsgId = await relay.beginImageEcho(thumbs: thumbs, text: text, sessionId: sid)
+            var refs: [(id: String, ext: String)] = []
+            for full in fulls {
+                if let id = try? await ImageAPI.upload(jpeg: full) { refs.append((id: id, ext: "jpg")) }
             }
+            await relay.sendImageRefs(refs: refs, text: text, sessionId: sid, localMsgId: localMsgId)
         }
     }
 }
