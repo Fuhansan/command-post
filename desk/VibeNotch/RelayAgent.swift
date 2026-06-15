@@ -24,7 +24,8 @@ final class RelayAgent: NSObject, ObservableObject {
     }
     @Published private(set) var connState: ConnState = .offline
 
-    static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
+    /// 中转地址改由 AgentServer 提供(可在设置里填 VPS 公网 IP),不再写死本机。
+    static var relayURL: URL { AgentServer.wsURL }
     /// 本机 Agent 的稳定唯一标识(多台电脑同账号时区分会话/快照/在线状态)。
     static let deviceId: String = {
         let key = "agent.deviceId"
@@ -778,8 +779,7 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 凭 id 从服务器(HTTP 8080,与 WS 的 8090 同主机)下载图片字节。
     /// 已在后台调用,同步等待结果。带配对 token(服务器据此按账号取图)。
     nonisolated private static func downloadImage(id: String) -> Data? {
-        let host = relayURL.host ?? "127.0.0.1"
-        guard let url = URL(string: "http://\(host):8080/api/image/\(id)") else { return nil }
+        guard let url = URL(string: "\(AgentServer.httpBase)/api/image/\(id)") else { return nil }
         var req = URLRequest(url: url, timeoutInterval: 30)
         if let token = AgentCredentials.token, !token.isEmpty {
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

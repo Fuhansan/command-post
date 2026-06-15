@@ -30,8 +30,34 @@ enum AgentCredentials {
     }
 }
 
+/// Agent 连接的中转服务器地址(host)。默认 127.0.0.1(服务器在本机时);
+/// 服务器搬到公网 VPS 后,在设置里填 VPS 公网 IP,WS / 图片下载 / 配对都用它。
+/// 用 UserDefaults 存 —— nonisolated,可在任意线程读(图片下载在后台线程要用)。
+enum AgentServer {
+    private static let hostKey = "relay.serverHost"
+
+    static var host: String {
+        get {
+            let h = (UserDefaults.standard.string(forKey: hostKey) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return h.isEmpty ? "127.0.0.1" : h
+        }
+        set {
+            UserDefaults.standard.set(
+                newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: hostKey)
+            // 地址变了 → 复用「凭据变更」通知让 RelayAgent 按新地址重连。
+            NotificationCenter.default.post(name: .relayCredentialsChanged, object: nil)
+        }
+    }
+
+    /// 中转 WebSocket 地址(8090)。
+    static var wsURL: URL { URL(string: "ws://\(host):8090/ws")! }
+    /// HTTP REST 基址(8080:登录 / 配对 / 图片上传下载)。
+    static var httpBase: String { "http://\(host):8080" }
+}
+
 extension Notification.Name {
-    /// 配对成功/退出登录 → RelayAgent 用新身份重连。
+    /// 配对成功/退出登录/服务器地址变更 → RelayAgent 用新身份/新地址重连。
     static let relayCredentialsChanged = Notification.Name("vibenotch.relayCredentialsChanged")
 }
 
@@ -47,7 +73,7 @@ final class PairingController: ObservableObject {
     }
     @Published var state: State = .idle
 
-    private static let api = "http://127.0.0.1:8080/api/pair"
+    private static var api: String { "\(AgentServer.httpBase)/api/pair" }
     private var pollTask: Task<Void, Never>?
 
     func start() {
