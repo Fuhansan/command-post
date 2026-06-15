@@ -473,6 +473,13 @@ final class RelayAgent: NSObject, ObservableObject {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
         }
+        // 刚启动、还没任何内容的会话也要出现在手机上(否则从手机新建的会话看不到、
+        // 没法发第一条指令)。占位消息;真实内容到达后会被同轮 diff 清理。
+        if out.isEmpty {
+            out.append(Msg(id: "\(pfx)ready", role: "agent",
+                           root: bubble(role: "agent", "会话已就绪,发送指令开始 👇"),
+                           fallback: "会话已就绪"))
+        }
         return out
     }
 
