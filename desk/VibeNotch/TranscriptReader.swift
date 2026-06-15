@@ -49,7 +49,9 @@ enum TranscriptReader {
     /// AND every tool_use, in the order they appear. Powers the milestone
     /// view in DetailCard.
     static func currentTurnSteps(transcriptPath: String) -> [TurnStep] {
-        guard let data = readTail(path: transcriptPath, maxBytes: 256 * 1024),
+        // 1MB 尾部:工具输出很大的长回合(几十次工具调用)也能容下本轮起点;
+        // 真超过 1MB(极长回合)时下面有兜底,不会丢最新回复。
+        guard let data = readTail(path: transcriptPath, maxBytes: 1024 * 1024),
               let blob = String(data: data, encoding: .utf8) else { return [] }
         let lines = blob.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         var lastUserIdx: Int? = nil
@@ -72,10 +74,13 @@ enum TranscriptReader {
                 break
             }
         }
-        guard let userIdx = lastUserIdx else { return [] }
+        // 兜底:尾部窗口里找不到真实用户提问 = 这一整轮的内容就超过了 1MB,
+        // 起始提问已滚出窗口。此时整个尾部都属于当前回合(中间没有新提问),
+        // 从头解析所有 assistant 步骤,保证最新回复(如收尾文字)不被丢掉。
+        let startIdx = lastUserIdx.map { $0 + 1 } ?? 0
 
         var steps: [TurnStep] = []
-        for line in lines[(userIdx + 1)...] {
+        for line in lines[startIdx...] {
             guard let lineData = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
                 continue
