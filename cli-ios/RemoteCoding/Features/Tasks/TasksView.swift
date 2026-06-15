@@ -50,6 +50,11 @@ struct TasksView: View {
                     }
                     .padding(16)
                 }
+                .refreshable {
+                    // 下拉刷新:强制重连重新拉取(连接半死/代理干扰时手动恢复)
+                    relay.reconnectToCurrentServer()
+                    try? await Task.sleep(nanoseconds: 800_000_000)
+                }
             }
             .navigationDestination(for: String.self) { sid in
                 TaskDetailView(sessionId: sid)
