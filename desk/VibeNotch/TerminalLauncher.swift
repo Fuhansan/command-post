@@ -28,11 +28,12 @@ enum TerminalLauncher {
         if trustDirs.isEmpty { trustDirs.append(NSHomeDirectory()) }
         ClaudeTrust.trust(directories: trustDirs)
 
-        // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本
-        // (用户的工具常装在某个特定 node 版本里)→ 把所有 nvm 版本的 bin
-        // 与常用工具目录都补进 PATH,保证 claude/codex 等能被找到。
+        // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本。
+        // 关键:只补**装了该命令的那一个** node 版本的 bin(不是所有版本)——
+        // 否则 PATH 里 node 版本错配,会让交互式 claude 的插件/LSP 子进程跑在
+        // 错误 node 版本上而初始化失败、不写转录(手动启动时是单版本,所以正常)。
         // 顺序:代理 → PATH → cd → 命令
-        let full = "\(proxyPart)export PATH=\"\(extraPathPrefix())$PATH\"; \(cdPart)\(cmd)"
+        let full = "\(proxyPart)export PATH=\"\(pathPrefix(forCommand: cmd))$PATH\"; \(cdPart)\(cmd)"
 
         let escaped = full
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -76,22 +77,48 @@ enum TerminalLauncher {
         "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    /// 所有 nvm node 版本的 bin + 常用工具目录,拼成 "a:b:c:" 前缀(末尾带冒号)。
-    private static func extraPathPrefix() -> String {
+    /// 从命令里取要运行的工具名(跳过开头的 cd…&&,取真正的可执行名)。
+    private static func mainTool(in command: String) -> String? {
+        var c = command.trimmingCharacters(in: .whitespaces)
+        // 去掉开头的 cd ... (&& | ;)
+        if c.hasPrefix("cd ") {
+            for sep in ["&&", ";"] {
+                if let r = c.range(of: sep) { c = String(c[r.upperBound...]).trimmingCharacters(in: .whitespaces); break }
+            }
+        }
+        // 去掉前面的 VAR=val 赋值
+        while let sp = c.firstIndex(of: " "), c[..<sp].contains("="), !c[..<sp].contains("/") {
+            c = String(c[c.index(after: sp)...]).trimmingCharacters(in: .whitespaces)
+        }
+        let tool = c.split(whereSeparator: { $0 == " " }).first.map(String.init)
+        // 绝对/相对路径形式取最后一段
+        return tool.map { ($0 as NSString).lastPathComponent }
+    }
+
+    /// 只补**装了该命令工具的那一个** nvm 版本的 bin + 常用目录(保持 node 单版本一致)。
+    /// 找不到具体版本时回退所有版本(至少能找到命令)。
+    private static func pathPrefix(forCommand command: String) -> String {
         let home = NSHomeDirectory()
+        let nvmRoot = "\(home)/.nvm/versions/node"
+        let versions = ((try? FileManager.default.contentsOfDirectory(atPath: nvmRoot)) ?? []).sorted(by: >)
         var dirs: [String] = []
 
-        // 所有 nvm node 版本的 bin(claude/codex 等可能装在任一版本里)
-        let nvmVersions = "\(home)/.nvm/versions/node"
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: nvmVersions) {
-            for v in entries.sorted(by: >) {   // 新版本优先
-                let bin = "\(nvmVersions)/\(v)/bin"
+        if let tool = mainTool(in: command) {
+            // 找第一个 bin 里有这个工具的版本,只用它
+            if let v = versions.first(where: {
+                FileManager.default.fileExists(atPath: "\(nvmRoot)/\($0)/bin/\(tool)")
+            }) {
+                dirs.append("\(nvmRoot)/\(v)/bin")
+            }
+        }
+        if dirs.isEmpty {
+            // 工具不在任何 nvm 版本(或解析不出)→ 回退:补所有版本,至少能跑起来
+            for v in versions {
+                let bin = "\(nvmRoot)/\(v)/bin"
                 if FileManager.default.fileExists(atPath: bin) { dirs.append(bin) }
             }
         }
-        // 常用工具目录
-        for d in ["/opt/homebrew/bin", "/usr/local/bin",
-                  "\(home)/.local/bin", "\(home)/.cargo/bin"] {
+        for d in ["/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/.cargo/bin"] {
             if FileManager.default.fileExists(atPath: d) { dirs.append(d) }
         }
         return dirs.isEmpty ? "" : dirs.joined(separator: ":") + ":"

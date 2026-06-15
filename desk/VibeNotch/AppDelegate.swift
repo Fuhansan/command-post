@@ -306,7 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let p = event.ppid, p > 1 else { return "?" }
             return ProcessUtils.findTerminalKind(startPid: pid_t(p)).displayName
         }()
-        vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term)")
+        vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term) tx=\(event.transcriptPath ?? "<nil>")")
         store.apply(event)
 
         // 每个工具/停止事件来时立即读一次转录,不等下一次 800ms 轮询 → 执行完一步即时显示
