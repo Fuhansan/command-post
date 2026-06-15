@@ -281,10 +281,22 @@ struct TaskDetailView: View {
     }
 
     private func send() {
+        let text = draft
         if stagedImages.isEmpty {
-            relay.sendInput(text: draft, sessionId: sessionId)
-        } else {
-            let payloads = stagedImages.enumerated().compactMap { i, img -> StagedImagePayload? in
+            relay.sendInput(text: text, sessionId: sessionId)
+            draft = ""
+            return
+        }
+        // 先取出待发图片并立刻清空输入区 → 点击即时有反馈,不必干等编码。
+        let images = stagedImages
+        let sid = sessionId
+        stagedImages = []
+        draft = ""
+        // 缩放 / JPEG / base64 编码很重(原图越大越明显,HEIC 还要先解码),
+        // 之前全在主线程同步跑、且要编完才回显气泡 → 点完按钮 UI 冻一下才动,
+        // 就是「发图贼慢」的根源。挪到后台线程,编完再回主线程回显+发送。
+        Task.detached(priority: .userInitiated) { [relay] in
+            let payloads = images.enumerated().compactMap { i, img -> StagedImagePayload? in
                 guard let jpeg = img.resized(maxDim: 1568).jpegData(compressionQuality: 0.7) else { return nil }
                 return StagedImagePayload(
                     data: jpeg.base64EncodedString(), ext: "jpg",
@@ -293,10 +305,10 @@ struct TaskDetailView: View {
                         ? String(format: "%.1f MB", Double(jpeg.count) / 1_000_000)
                         : "\(jpeg.count / 1_000) KB")
             }
-            relay.sendImageInput(images: payloads, text: draft, sessionId: sessionId)
-            stagedImages = []
+            await MainActor.run {
+                relay.sendImageInput(images: payloads, text: text, sessionId: sid)
+            }
         }
-        draft = ""
     }
 }
 
