@@ -39,7 +39,7 @@ enum CodingAgents {
     /// 已支持的工具。加新工具就往这里加一个适配器。
     static let all: [CodingAgent] = [
         ClaudeAgent(),
-        // CodexAgent(),   // ← 待实现:解析 ~/.codex/sessions 的 {timestamp,type,payload} 事件流
+        CodexAgent(),   // 解析 ~/.codex/sessions 的事件流转录拿回复
     ]
 
     /// 按转录路径找适配器(读回复用)。
@@ -72,22 +72,14 @@ struct ClaudeAgent: CodingAgent {
     }
 }
 
-/*
- 待实现:Codex 适配器。codex 的 hook 已能接进 VibeNotch(~/.codex/hooks.json),
- 会话/ prompt 已能显示;只差解析它的转录拿回复 + 信任预置(若需要)。
-
- struct CodexAgent: CodingAgent {
-     let id = "codex"
-     func handlesCommand(tool: String) -> Bool { tool == "codex" }
-     func handlesTranscript(path: String) -> Bool { path.contains("/.codex/") }
-     func turnSteps(transcriptPath: String) -> [TurnStep] {
-         // codex 转录是事件流:每行 {timestamp, type, payload}
-         // 需要按 type 取出 assistant 文本 / 工具调用,翻成 [TurnStep]
-         CodexTranscriptReader.currentTurnSteps(transcriptPath: transcriptPath)
-     }
-     func preTrust(directories: [String]) {
-         // codex 的信任/批准机制(若有)写这里
-     }
- }
- 然后取消 CodingAgents.all 里 CodexAgent() 的注释即可。
-*/
+/// 第二个适配器:Codex。hook 已能接进 VibeNotch(~/.codex/hooks.json),
+/// 会话/prompt 已显示;这里补上解析它的事件流转录拿回复。
+struct CodexAgent: CodingAgent {
+    let id = "codex"
+    func handlesCommand(tool: String) -> Bool { tool == "codex" }
+    func handlesTranscript(path: String) -> Bool { path.contains("/.codex/") }
+    func turnSteps(transcriptPath: String) -> [TurnStep] {
+        CodexTranscriptReader.currentTurnSteps(transcriptPath: transcriptPath)
+    }
+    // codex 默认在沙箱里运行,无 claude 那种文件夹信任弹窗 → 无需预置(空实现)。
+}
