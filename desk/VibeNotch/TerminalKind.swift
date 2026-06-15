@@ -72,7 +72,10 @@ enum TerminalKind: String, Equatable {
         if jetbrainsNames.contains(where: { lower == $0 || lower.contains($0) }) {
             return .jetbrains
         }
-        if lower.contains("code") { return .vscode }
+        // 注意:必须精确匹配,否则 "codex"(含子串 "code")会被误判成 VS Code,
+        // 进而把 codex 自己的 pid 当成终端 pid,导致 NSRunningApplication 找不到、注入失败。
+        // VS Code 的进程 comm 是 "Code" / "Code Helper" / "Code Helper (Plugin)" 等。
+        if lower == "code" || lower.hasPrefix("code ") { return .vscode }
         if lower == "tmux" || lower.hasPrefix("tmux:") { return .tmux }
         return nil
     }
