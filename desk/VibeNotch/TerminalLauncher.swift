@@ -20,10 +20,12 @@ enum TerminalLauncher {
         let cdPart = dir.isEmpty ? "" : "cd \(shellQuote(dir)); "
 
         // 预置信任:避免新会话卡在「Do you trust the files in this folder?」
-        // (该提示早于 hook,手机接不到)。信任默认目录 + 命令里 cd 的目标。
+        // (该提示早于 hook,手机接不到)。信任 claude 实际启动的目录:
+        // 命令里 cd 的目标 > 默认目录 > 家目录(都没有时终端默认在家目录起)。
         var trustDirs: [String] = []
-        if !dir.isEmpty { trustDirs.append(dir) }
         if let cdTarget = leadingCdPath(in: cmd) { trustDirs.append(cdTarget) }
+        if !dir.isEmpty { trustDirs.append(dir) }
+        if trustDirs.isEmpty { trustDirs.append(NSHomeDirectory()) }
         ClaudeTrust.trust(directories: trustDirs)
 
         // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本
