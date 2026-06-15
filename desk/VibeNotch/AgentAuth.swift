@@ -61,6 +61,22 @@ extension Notification.Name {
     static let relayCredentialsChanged = Notification.Name("vibenotch.relayCredentialsChanged")
 }
 
+extension URLSession {
+    /// 直连会话:**禁用系统/环境代理**。
+    /// VibeNotch 只连自己的中转服务器,绝不能被给 Claude/Google 用的代理
+    /// (如 Clash 127.0.0.1:7890)劫持 —— 否则发往公网 VPS 的请求会被塞进代理,
+    /// 报 ATS / 连接失败。配对、WS、图片下载都用这个会话。
+    static let direct: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.connectionProxyDictionary = [
+            "HTTPEnable": 0,
+            "HTTPSEnable": 0,
+            "SOCKSEnable": 0,
+        ]
+        return URLSession(configuration: cfg)
+    }()
+}
+
 /// 配对流程(设置窗口里使用):取码 → 展示 → 轮询 → 拿到 Agent token。
 @MainActor
 final class PairingController: ObservableObject {
@@ -108,7 +124,7 @@ final class PairingController: ObservableObject {
     private static func fetchCode() async throws -> String {
         var req = URLRequest(url: URL(string: "\(api)/start")!, timeoutInterval: 8)
         req.httpMethod = "POST"
-        let (data, _) = try await URLSession.shared.data(for: req)
+        let (data, _) = try await URLSession.direct.data(for: req)
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: String],
               let code = obj["code"] else { throw URLError(.badServerResponse) }
         return code
@@ -116,7 +132,7 @@ final class PairingController: ObservableObject {
 
     /// 认领完成返回凭据;仍在等待返回 nil;过期抛错。
     private static func poll(code: String) async throws -> (account: String, token: String)? {
-        let (data, resp) = try await URLSession.shared.data(
+        let (data, resp) = try await URLSession.direct.data(
             from: URL(string: "\(api)/poll?code=\(code)")!)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
             throw NSError(domain: "pair", code: 1,

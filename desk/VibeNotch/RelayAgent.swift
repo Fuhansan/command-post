@@ -59,7 +59,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private let pending: PendingDecisionStore
 
     private var task: URLSessionWebSocketTask?
-    private lazy var session = URLSession(configuration: .default)
+    private lazy var session = URLSession.direct   // 直连中转服务器,不走系统代理
     private var cancellables = Set<AnyCancellable>()
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
@@ -786,7 +786,7 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         var out: Data?
         let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
+        URLSession.direct.dataTask(with: req) { data, resp, _ in
             if let http = resp as? HTTPURLResponse, http.statusCode == 200 { out = data }
             sem.signal()
         }.resume()
