@@ -1,6 +1,8 @@
 package com.aicodingremote.server;
 
 import com.aicodingremote.server.auth.UserStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -41,6 +43,7 @@ public class ImageController {
     private static final long MAX_BYTES = 12L * 1024 * 1024;  // 单图上限 12MB(压缩后远小于此)
     private static final Set<String> ALLOWED = Set.of("jpg", "jpeg", "png", "gif", "webp");
 
+    private static final Logger log = LoggerFactory.getLogger(ImageController.class);
     private final UserStore store;
     private final SecureRandom rnd = new SecureRandom();
 
@@ -54,7 +57,10 @@ public class ImageController {
                                     @RequestParam(value = "ext", defaultValue = "jpg") String ext,
                                     @RequestBody(required = false) byte[] body) {
         String account = accountOf(auth);
-        if (account == null) return ResponseEntity.status(401).body(Map.of("error", "unauthorized"));
+        if (account == null) {
+            log.warn("image upload 拒绝:无效 token (authHeader={})", auth == null ? "无" : "有");
+            return ResponseEntity.status(401).body(Map.of("error", "unauthorized"));
+        }
         if (body == null || body.length == 0) return ResponseEntity.badRequest().body(Map.of("error", "empty body"));
         if (body.length > MAX_BYTES) return ResponseEntity.status(413).body(Map.of("error", "too large"));
 
@@ -73,6 +79,7 @@ public class ImageController {
         } catch (IOException ex) {
             return ResponseEntity.status(500).body(Map.of("error", "write failed"));
         }
+        log.info("image upload: account={} bytes={} → id={}", account, body.length, id);
         return ResponseEntity.ok(Map.of("id", id, "ext", e));
     }
 

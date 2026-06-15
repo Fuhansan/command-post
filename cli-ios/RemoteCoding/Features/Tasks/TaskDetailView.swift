@@ -312,10 +312,17 @@ struct TaskDetailView: View {
                         : "\(full.count / 1_000) KB"))
             }
             let localMsgId = await relay.beginImageEcho(thumbs: thumbs, text: text, sessionId: sid)
-            var refs: [(id: String, ext: String)] = []
-            for full in fulls {
-                if let id = try? await ImageAPI.upload(jpeg: full) { refs.append((id: id, ext: "jpg")) }
+            // 并行上传(多图不再逐张排队),用下标回填保持原顺序。
+            let uploaded: [Int: String] = await withTaskGroup(of: (Int, String?).self) { group in
+                for (idx, full) in fulls.enumerated() {
+                    group.addTask { (idx, try? await ImageAPI.upload(jpeg: full)) }
+                }
+                var byIdx: [Int: String] = [:]
+                for await (idx, id) in group { if let id { byIdx[idx] = id } }
+                return byIdx
             }
+            var refs: [(id: String, ext: String)] = []
+            for i in fulls.indices { if let id = uploaded[i] { refs.append((id: id, ext: "jpg")) } }
             await relay.sendImageRefs(refs: refs, text: text, sessionId: sid, localMsgId: localMsgId)
         }
     }
@@ -357,7 +364,11 @@ private extension UIImage {
         guard m > maxDim else { return self }
         let scale = maxDim / m
         let newSize = CGSize(width: size.width * scale, height: size.height * scale)
-        return UIGraphicsImageRenderer(size: newSize).image { _ in
+        // 关键:format.scale=1,让输出像素 = 点尺寸。否则 renderer 默认用屏幕 3x,
+        // 「1568 点」会被渲成 4704 像素(约 3MB),缩放形同虚设、发图依旧又大又慢。
+        let fmt = UIGraphicsImageRendererFormat.default()
+        fmt.scale = 1
+        return UIGraphicsImageRenderer(size: newSize, format: fmt).image { _ in
             draw(in: CGRect(origin: .zero, size: newSize))
         }
     }

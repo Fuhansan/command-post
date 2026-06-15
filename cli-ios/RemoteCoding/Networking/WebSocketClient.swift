@@ -87,9 +87,13 @@ final class WebSocketClient: NSObject, ObservableObject {
     }
 
     private func receiveLoop() {
-        task?.receive { [weak self] result in
+        // 绑定本次连接的 task:切换服务器/重连时,旧 task 被 cancel 后其回调会**异步晚到**,
+        // 那时新 task 已就位。若不甄别,旧回调会掐掉新连接的心跳、触发多余重连(切服务器抖动)。
+        let myTask = task
+        myTask?.receive { [weak self] result in
             guard let self else { return }
             Task { @MainActor in
+                guard myTask === self.task else { return }   // 过期 task 的回调,丢弃
                 switch result {
                 case .success(let message):
                     if case .string(let text) = message, let frame = Frame.decode(text) {

@@ -758,10 +758,13 @@ final class RelayAgent: NSObject, ObservableObject {
                     let data: Data?
                     if let id = img["id"] as? String, !id.isEmpty {
                         data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
+                        vlog("relay image[\(i)] 走 id=\(id) → \(data != nil ? "下载成功 \(data!.count)B" : "下载失败")")
                     } else if let b64 = img["data"] as? String {
                         data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
+                        vlog("relay image[\(i)] 走 base64(旧链路) \(data?.count ?? 0)B")
                     } else {
                         data = nil
+                        vlog("relay image[\(i)] 既无 id 也无 data,跳过 keys=\(Array(img.keys))")
                     }
                     guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
                     paths.append(path)
