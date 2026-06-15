@@ -6,9 +6,14 @@ enum TerminalLauncher {
 
     /// - command: 要运行的命令(如 claude)
     /// - workdir: 默认工作目录;非空时先 cd 进去再跑命令(命令自带 cd 则二者叠加,以命令为准)
-    static func run(command: String, workdir: String = "") {
+    /// - proxy: 代理设置命令(如 export https_proxy=…),非空时在命令最前执行(大陆用户需要)
+    static func run(command: String, workdir: String = "", proxy: String = "") {
         let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cmd.isEmpty else { return }
+
+        // 代理前缀(大陆用户跑 claude 要先设代理,否则连不上 Anthropic)
+        let proxyTrim = proxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proxyPart = proxyTrim.isEmpty ? "" : "\(proxyTrim); "
 
         // 默认工作目录:展开 ~ 后 cd 进去(目录不存在则 shell 自然报错,不影响命令本身)
         let dir = (workdir as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -24,7 +29,8 @@ enum TerminalLauncher {
         // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本
         // (用户的工具常装在某个特定 node 版本里)→ 把所有 nvm 版本的 bin
         // 与常用工具目录都补进 PATH,保证 claude/codex 等能被找到。
-        let full = "export PATH=\"\(extraPathPrefix())$PATH\"; \(cdPart)\(cmd)"
+        // 顺序:代理 → PATH → cd → 命令
+        let full = "\(proxyPart)export PATH=\"\(extraPathPrefix())$PATH\"; \(cdPart)\(cmd)"
 
         let escaped = full
             .replacingOccurrences(of: "\\", with: "\\\\")

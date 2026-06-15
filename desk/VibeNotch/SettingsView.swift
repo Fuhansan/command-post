@@ -34,7 +34,7 @@ struct SettingsView: View {
                 Toggle(L10n.t(.settingsMuteSounds, locale: locale), isOn: $settings.muted)
             }
 
-            // 手机「新建会话」用的默认工作目录
+            // 手机「新建会话」用的默认工作目录 + 代理
             Section("新建会话") {
                 VStack(alignment: .leading, spacing: 4) {
                     TextField("默认工作目录(如 ~/Projects)", text: $settings.defaultWorkdir)
@@ -42,6 +42,20 @@ struct SettingsView: View {
                         .font(.system(size: 12, design: .monospaced))
                     Text("手机点「+」新建会话时,新终端先 cd 进此目录再运行命令。留空则用 ~ 。")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("代理命令(大陆用户跑 claude 需要)", text: $settings.launchProxy, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1...3)
+                    HStack(spacing: 6) {
+                        Text("命令前自动执行,设代理后 claude 才能连上 Anthropic。留空则不设。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        Button("填入默认") {
+                            settings.launchProxy = "export https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 all_proxy=socks5://127.0.0.1:7890"
+                        }
+                        .font(.system(size: 11))
+                    }
                 }
             }
 

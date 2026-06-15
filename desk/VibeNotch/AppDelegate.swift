@@ -223,8 +223,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onRemoteLaunch = { command in
             let dir = AppSettings.shared.defaultWorkdir
-            vlog("relay launch: \(command) (workdir=\(dir.isEmpty ? "~" : dir))")
-            TerminalLauncher.run(command: command, workdir: dir)
+            let proxy = AppSettings.shared.launchProxy
+            vlog("relay launch: \(command) (workdir=\(dir.isEmpty ? "~" : dir)) proxy=\(proxy.isEmpty ? "无" : "有")")
+            TerminalLauncher.run(command: command, workdir: dir, proxy: proxy)
         }
         agent.start()
         relayAgent = agent

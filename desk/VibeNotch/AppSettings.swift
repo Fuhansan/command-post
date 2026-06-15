@@ -14,6 +14,8 @@ final class AppSettings: ObservableObject {
     @Published var muted: Bool        { didSet { persist(); SoundPlayer.shared.muted = muted } }
     /// 手机「新建会话」时,新终端先 cd 进的默认工作目录(空=用 ~ )。
     @Published var defaultWorkdir: String { didSet { persist() } }
+    /// 新建会话时在命令前自动执行的代理设置(大陆用户跑 claude 需要;空=不设)。
+    @Published var launchProxy: String { didSet { persist() } }
 
     /// Mirrors `SMAppService.mainApp.status`; the setter actually
     /// (un)registers the login item, so the UI's binding is one-shot truth.
@@ -41,6 +43,7 @@ final class AppSettings: ObservableObject {
         self.language = loaded?.language ?? .system
         self.muted    = loaded?.muted    ?? false
         self.defaultWorkdir = loaded?.defaultWorkdir ?? ""
+        self.launchProxy = loaded?.launchProxy ?? ""
         SoundPlayer.shared.muted = self.muted
     }
 
@@ -53,10 +56,11 @@ final class AppSettings: ObservableObject {
         var language: Language
         var muted: Bool
         var defaultWorkdir: String?
+        var launchProxy: String?
     }
 
     private func persist() {
-        let snap = Stored(language: language, muted: muted, defaultWorkdir: defaultWorkdir)
+        let snap = Stored(language: language, muted: muted, defaultWorkdir: defaultWorkdir, launchProxy: launchProxy)
         do {
             try FileManager.default.createDirectory(
                 atPath: Self.configDir,
