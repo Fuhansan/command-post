@@ -24,6 +24,11 @@ dist/
 .idea/
 .claude/
 .vscode/
+.omc/
 
 # Backed-up nested git dirs
 *_git_backup/
+coding-server/data/
+
+cli-ios/build-device/
+cli-ios/build-device

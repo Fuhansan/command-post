@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+local.properties
+captures/
+.cxx/
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+
+# Kotlin
+.kotlin/
+
+# 构建产物
+/app/build/
+/app/release/
+
+# macOS
+.DS_Store
+
+# Claude 本地设置
+.claude/settings.local.json
