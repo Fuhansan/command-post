@@ -2,6 +2,7 @@ import SwiftUI
 
 /// 主框架:底部 4 Tab(任务 / 通知 / 设备 / 设置)。
 struct MainTabView: View {
+    @EnvironmentObject private var relay: RelayClient
     @State private var selection: Int
 
     init(initialTab: Int = 0) {
@@ -23,7 +24,7 @@ struct MainTabView: View {
 
             NotificationsView()
                 .tabItem { Label("通知", systemImage: "bell") }
-                .badge(2)
+                .badge(relay.pendingCount)
                 .tag(1)
 
             DevicesView()

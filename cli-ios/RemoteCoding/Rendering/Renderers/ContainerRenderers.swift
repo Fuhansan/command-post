@@ -7,7 +7,8 @@ struct StackRenderer: View {
     var body: some View {
         let spacing = component.props.double("spacing").map { CGFloat($0) } ?? 10
         let padding = component.props.double("padding").map { CGFloat($0) } ?? 0
-        VStack(alignment: .leading, spacing: spacing) {
+        let align: HorizontalAlignment = component.props.string("align") == "trailing" ? .trailing : .leading
+        VStack(alignment: align, spacing: spacing) {
             ChildrenView(children: component.children)
         }
         .padding(padding)

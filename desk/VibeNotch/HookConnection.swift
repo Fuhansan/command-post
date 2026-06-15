@@ -19,16 +19,30 @@ final class HookConnection {
 
     /// Write `json` + "\n" to the script's stdout side, then close.
     /// Used for PreToolUse permissionDecision payloads.
-    func respond(json: String) {
+    /// 返回 false = 连接已死(脚本被 claude 超时杀掉等),内容没送出去。
+    @discardableResult
+    func respond(json: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !resolved else { return }
+        guard !resolved else { return false }
         resolved = true
         let payload = json + "\n"
         let data = Data(payload.utf8)
+        var ok = false
         data.withUnsafeBytes { buf in
-            _ = write(fd, buf.baseAddress, buf.count)
+            ok = write(fd, buf.baseAddress, buf.count) == buf.count
         }
         close(fd)
+        return ok
+    }
+
+    /// 对端(hook 脚本)是否已整体关闭 —— 脚本被 claude 超时杀掉时变 true。
+    /// 注意脚本发送后会半关写侧(EOF 是常态),只有 POLLHUP 才代表进程已死。
+    var isPeerClosed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !resolved else { return true }
+        var pfd = pollfd(fd: fd, events: Int16(POLLHUP), revents: 0)
+        let n = poll(&pfd, 1, 0)
+        return n > 0 && (pfd.revents & Int16(POLLHUP)) != 0
     }
 
     /// Close the connection without writing anything (the script will read EOF

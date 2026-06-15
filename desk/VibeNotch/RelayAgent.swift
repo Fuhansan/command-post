@@ -13,10 +13,44 @@ import Foundation
 @MainActor
 final class RelayAgent: NSObject, ObservableObject {
 
+    /// 与中转服务器的连接状态(设置窗口展示用)。
+    enum ConnState: Equatable {
+        case unpaired            // 未配对,不连接
+        case connecting          // 连接/鉴权中
+        case online              // 已上线
+        case suspendedByPhone    // 被手机「断开」挂起,等待手机点重连
+        case rejected(String)    // 被服务器拒绝(令牌失效等)
+        case offline             // 断线,自动重连中
+    }
+    @Published private(set) var connState: ConnState = .offline
+
     static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
-    static let account = "demo"
+    /// 本机 Agent 的稳定唯一标识(多台电脑同账号时区分会话/快照/在线状态)。
+    static let deviceId: String = {
+        let key = "agent.deviceId"
+        if let v = UserDefaults.standard.string(forKey: key), !v.isEmpty { return v }
+        let v = "mac_" + String(UUID().uuidString.prefix(8)).lowercased()
+        UserDefaults.standard.set(v, forKey: key)
+        return v
+    }()
+
+    /// 配对账号:只来自手机配对授权的凭据。未配对 = 无账号 = 不连服务器(第一道防线)。
+    static var account: String { AgentCredentials.account ?? "" }
+    /// 是否已与手机配对。
+    static var isPaired: Bool { !(AgentCredentials.token ?? "").isEmpty }
     // 每个 claude 会话(终端)= 一个独立协议 sid = entry.id → 手机端分成多个任务。
 
+    /// 手机请求结束任务(关闭该 claude 会话)。由 AppDelegate 接到进程终止逻辑。
+    var onRemoteClose: ((String) -> Void)?
+    /// 手机发来的输入(文字 + 已落盘的图片路径)。由 AppDelegate 注入对应终端。
+    var onRemoteInput: ((String, String, [String]) -> Void)?
+    /// 手机对选择题的回答:(sid, 数字序列, 是否多选, 所选选项文字)。
+    /// AppDelegate 优先经 hook 直接回传答案;hook 已放行时回退按键注入。
+    var onRemoteAnswer: ((String, [String], Bool, String) -> Void)?
+    /// 手机选择「改在电脑上回答」→ 放行 hook,让终端正常弹题。
+    var onRemoteAnswerLocal: ((String) -> Void)?
+    /// 手机请求新建会话:打开 Terminal.app 运行命令(如 `claude`)。
+    var onRemoteLaunch: ((String) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -32,8 +66,44 @@ final class RelayAgent: NSObject, ObservableObject {
     private var imageCache: [String: String?] = [:] // 图片路径 → 缩略图 base64(nil=读取失败,避免重复尝试)
     private var turnCount: [String: Int] = [:]      // 会话 → 当前轮次(prompt 变化即 +1),消息 id 带轮次 → 客户端累积历史
     private var turnPrompt: [String: String] = [:]  // 会话 → 上次见到的 prompt,用于检测新一轮
+    /// 一次审批请求 = 一条记录 = 一张独立卡片(id 带轮内序号)。
+    /// 同一轮多次审批时,每次都是新卡追加在会话末尾,旧卡保留各自的结果。
+    private struct PermRecord {
+        let pfx: String       // 请求发生时的轮次前缀
+        let idx: Int          // 轮内序号(同轮第几次审批)
+        var detail: String?   // 请求的命令
+        var decision: String? // nil=待决定;"allow"/"deny"/"timeout"/"expired"
+    }
+    private var permRecords: [String: [PermRecord]] = [:]  // 会话 → 审批记录
+    /// 一次 TUI 选择题 = 一条记录 = 一张交互卡(同审批卡:回答后原地变已答,留存历史)。
+    private struct QuestionRecord {
+        let pfx: String
+        let idx: Int
+        let payload: PendingQuestion
+        var answered: Bool = false
+        var choiceLabel: String?      // 手机选的选项文字;电脑上答的为「已在电脑上选择」
+    }
+    private var questionRecords: [String: [QuestionRecord]] = [:]
+    private var phoneChoice: [String: String] = [:]   // 会话 → 手机刚选的选项文字(等 PostToolUse 确认)
+    private var answerFeedback: [String: String] = [:]    // 会话 → 已收到选择的反馈(显示在卡上)
+    private var appliedDecisionSeq = 0                     // 已消费的决定事件水位
+    private var msgTime: [String: String] = [:]            // 消息 → 首次出现时间(HH:mm),保证时间戳稳定不漂移
+    private var seenFrameIds: Set<String> = []              // 已处理的上行帧 id(幂等去重)
+    private var seenFrameOrder: [String] = []               // 同上,FIFO 容量控制
+    private var lastPongAt = Date()                         // 最近一次 pong,用于检测僵死连接
+    private var heartbeatTimer: Timer?
+    private var coolDownUntil = Date.distantPast            // 被服务器拒绝(挂起/令牌失效)后的重连冷却
+
+    /// 消息首次出现的时间;之后同 id 始终返回同一值。
+    private func stamp(for msgId: String) -> String {
+        if let t = msgTime[msgId] { return t }
+        let t = Self.hhmm.string(from: Date())
+        msgTime[msgId] = t
+        return t
+    }
     private var retry = 0
     private var started = false
+    private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
 
     init(store: SessionStore, pending: PendingDecisionStore) {
         self.store = store
@@ -55,11 +125,16 @@ final class RelayAgent: NSObject, ObservableObject {
         pending.$pendingIDs
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
+        pending.$decisionEvents
+            .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
+            .store(in: &cancellables)
         connect()
     }
 
     func stop() {
+        connState = .offline
         cancellables.removeAll()
+        heartbeatTimer?.invalidate(); heartbeatTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         started = false
@@ -68,15 +143,38 @@ final class RelayAgent: NSObject, ObservableObject {
     // MARK: - 连接 / 鉴权
 
     private func connect() {
+        // 第一道防线:未配对(无凭据)不连接服务器。配对成功后经
+        // credentialsChanged 通知 → restart() 再进来。
+        guard Self.isPaired else {
+            vlog("relay: 未配对,保持离线(在 VibeNotch 设置里配对手机)")
+            connState = .unpaired
+            return
+        }
+        connState = .connecting
         let t = session.webSocketTask(with: Self.relayURL)
+        t.maximumMessageSize = 8 << 20   // 手机上行图片帧可达数百 KB,默认 1MB 太紧
         task = t
         t.resume()
         receiveLoop()
         sendAuth()
+        startHeartbeat()
         retry = 0
         lastSent.removeAll()
         knownSids.removeAll()
+        // 进程刚启动(非网络重连)→ 让服务器+手机清掉上个进程实例的残留消息,
+        // 避免重启后轮次重置导致旧 id(如 t2:img0/prompt)与新 id 并存的孤儿气泡。
+        if firstConnect {
+            firstConnect = false
+            sendReset()
+        }
         syncToServer()   // 连上后补发当前所有会话
+    }
+
+    /// 清空本账号在服务器与手机端的全部会话(agent 进程重启时调用)。
+    private func sendReset() {
+        seq += 1
+        send(jsonString(["v": 1, "t": "patch", "id": "reset", "seq": seq,
+                         "from": "agent", "body": ["op": "reset", "agent": Self.deviceId]]))
     }
 
     private func sendAuth() {
@@ -84,12 +182,36 @@ final class RelayAgent: NSObject, ObservableObject {
         sendJSON([
             "v": 1, "t": "auth", "id": "h_agent", "from": "agent",
             "body": [
-                "token": "agent",
+                // 配对授权拿到的 token:服务器据此解析账号(无有效 token 会被拒绝)
+                "token": AgentCredentials.token ?? "",
                 "account": Self.account,
-                "device": ["id": "agent_mac", "platform": "mac", "name": name],
+                "device": ["id": Self.deviceId, "platform": "mac", "name": name],
                 "caps": ["protocol": 1]
             ]
         ])
+    }
+
+    /// 答案没能回传(hook 已超时放行,题目已在终端弹出)→ 卡片改提示。
+    func questionAnswerFailed(sid: String) {
+        answerFeedback[sid] = "回传超时,题目已在电脑终端弹出,请在电脑上完成选择"
+        syncToServer()
+    }
+
+    /// 门禁被 claude 超时杀掉(巡检发现)→ 手机卡片立即翻成「已转电脑作答」。
+    func questionGateExpired(sid: String) {
+        answerFeedback[sid] = "本题已转到电脑终端(被打断或转电脑作答),请在电脑上完成"
+        syncToServer()
+    }
+
+    /// 凭据变化(配对成功/退出)→ 先以旧身份清掉本机数据,再以新身份重连。
+    func restart() {
+        sendReset()   // 旧账号的手机立刻看到本机会话消失(+ presence 离线)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)   // 给 reset 帧出门的时间
+            self.task?.cancel(with: .goingAway, reason: nil)
+            self.task = nil
+            self.connect()
+        }
     }
 
     // MARK: - 上行:会话 → 协议组件
@@ -97,11 +219,23 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 每个会话 → **多条独立消息**(prompt / 每句 AI 文本 / 每个文件 / 每条命令 / 待批准),
     /// 各自一条 `ui` 帧。手机端据此渲染成真正的对话:每条消息独立一行、各带头像。
     private func syncToServer() {
+        // 先消费新的审批决定事件:把结果写进对应记录(该会话最早一条未决定的)。
+        for ev in pending.decisionEvents where ev.seq > appliedDecisionSeq {
+            if var recs = permRecords[ev.sid],
+               let i = recs.firstIndex(where: { $0.decision == nil }) {
+                recs[i].decision = ev.decision
+                permRecords[ev.sid] = recs
+            }
+            appliedDecisionSeq = max(appliedDecisionSeq, ev.seq)
+        }
+
         let activeSids = Set(store.sessions.map(\.id))
         // 整会话消失 → 删除该会话所有消息
         for sid in knownSids where !activeSids.contains(sid) {
             sendSessionRemove(sid: sid)
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
+            for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
+            permRecords[sid] = nil
         }
         knownSids = activeSids
 
@@ -125,7 +259,8 @@ final class RelayAgent: NSObject, ObservableObject {
             }
             // 变化的消息才推
             for m in msgs {
-                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root]
+                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
+                                           "time": stamp(for: m.id)]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
@@ -152,12 +287,27 @@ final class RelayAgent: NSObject, ObservableObject {
                          "from": "agent", "body": ["op": "remove"]]))
     }
 
-    /// 任务元信息 —— 手机首页任务行用(title/副标题/状态/是否需处理)。
+    /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
     private func sessionMeta(_ e: SessionEntry) -> [String: Any] {
-        let isPending = pending.pendingIDs.contains(e.id)
+        let isPerm = pending.pendingIDs.contains(e.id)
+        let isPending = isPerm || e.pendingQuestion != nil
+        // 待办类型与摘要:手机「通知」页据此聚合跨会话待办(审批可批量,选择题逐个)
+        let pendingKind = isPerm ? "perm" : (e.pendingQuestion != nil ? "question" : "")
+        let pendingDetail = isPerm ? (e.toolDetail ?? "")
+            : (e.pendingQuestion?.questions.first?.question
+               ?? (e.pendingQuestion?.tool == "ExitPlanMode" ? "计划待确认" : ""))
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
+        let cwd = e.cwd
+        let base = (cwd as NSString).lastPathComponent
+        // 标题优先用项目名(cwd 末段);取不到再退回终端名。
+        let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
         return [
-            "title": e.terminal.displayName,
+            "pendingKind": pendingKind,            // perm=待审批(可批量) question=待选择(逐个)
+            "pendingDetail": cap(pendingDetail, 160),
+            "agent": Self.deviceId,                // 来自哪台电脑
+            "title": project,                     // 项目名(主标题)
+            "terminal": e.terminal.displayName,    // 终端 / IDE
+            "cwd": cwd,                            // 项目工作目录
             "subtitle": subtitle,
             "status": isPending ? "waiting" : statusKey(e.state),
             "needsAction": isPending
@@ -186,21 +336,41 @@ final class RelayAgent: NSObject, ObservableObject {
         let diffs = e.transcriptPath.map { TranscriptReader.fileEditDiffs(transcriptPath: $0) } ?? [:]
         var out: [Msg] = []
 
-        // 用户 prompt:先把粘贴的图片渲染成缩略图消息,再发去掉图片引用后的文本气泡。
+        // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(文件信息栏 + 图 + 说明,同一张卡片)。
         if let p = e.promptSummary, !p.isEmpty {
-            let imgs = extractImagePaths(p)
-            var shownImage = false
-            for (k, path) in imgs.enumerated() {
-                if let data = thumbnailBase64(path: path) {
-                    shownImage = true
-                    out.append(Msg(id: "\(pfx)img\(k)", role: "user",
-                                   root: imageComp(data: data, source: path), fallback: "图片"))
+            var imageItems: [[String: Any]] = []
+            let imgPaths = extractImagePaths(p, sessionId: sid)
+            for path in imgPaths {
+                guard let data = thumbnailBase64(path: path) else { continue }
+                var item: [String: Any] = ["data": data]
+                let url = URL(fileURLWithPath: path)
+                item["name"] = "image_" + Self.fileStamp.string(from: Date()) + "." + url.pathExtension.lowercased()
+                item["kind"] = url.pathExtension.uppercased()
+                if let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int {
+                    item["size"] = Self.humanSize(bytes)
+                }
+                imageItems.append(item)
+            }
+            let hasImage = !imageItems.isEmpty
+            var textOnly = (hasImage ? stripImages(p) : cleanPrompt(p))
+            if hasImage {
+                // 路径已经以缩略图展示,从文字里清掉裸路径和注入时加的「图片:」标记
+                for path in imgPaths { textOnly = textOnly.replacingOccurrences(of: path, with: "") }
+                for marker in ["请查看这张图片:", "图片:"] {
+                    textOnly = textOnly.replacingOccurrences(of: marker, with: "")
                 }
             }
-            let textOnly = (shownImage ? stripImages(p) : cleanPrompt(p))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !textOnly.isEmpty {
-                out.append(Msg(id: "\(pfx)prompt", role: "user",
+            textOnly = textOnly.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if hasImage {
+                var props: [String: Any] = ["images": imageItems,
+                                            "time": stamp(for: "\(pfx)user")]
+                if !textOnly.isEmpty { props["text"] = cap(textOnly, 1000) }
+                out.append(Msg(id: "\(pfx)user", role: "user",
+                               root: ["type": "photomsg", "props": props],
+                               fallback: cap(textOnly.isEmpty ? "图片" : textOnly, 120)))
+            } else if !textOnly.isEmpty {
+                out.append(Msg(id: "\(pfx)user", role: "user",
                                root: bubble(role: "user", cap(textOnly, 1000)), fallback: cap(textOnly, 120)))
             }
         }
@@ -247,9 +417,58 @@ final class RelayAgent: NSObject, ObservableObject {
             out.append(Msg(id: "\(pfx)g\(gi)", role: "agent", root: root, fallback: g.fallback))
         }
 
-        // 待批准命令
+        // 审批:每次请求 = 一条独立记录 = 一张独立卡(id 带轮内序号)。
+        // 决定后卡片原地变「已允许/已拒绝」;同轮再次审批 → 追加新卡,不复用旧卡。
+        var recs = permRecords[sid] ?? []
         if pending.pendingIDs.contains(sid) {
-            out.append(Msg(id: "\(pfx)pending", role: "agent", root: permCard(e), fallback: "需要批准"))
+            if let i = recs.indices.last, recs[i].decision == nil, recs[i].pfx == pfx {
+                // 同一请求仍在挂起:刷新命令详情即可
+                if let td = e.toolDetail { recs[i].detail = td }
+            } else {
+                let idx = recs.filter { $0.pfx == pfx }.count
+                recs.append(PermRecord(pfx: pfx, idx: idx, detail: e.toolDetail, decision: nil))
+            }
+        } else if let i = recs.indices.last, recs[i].decision == nil {
+            // 不再挂起且没有决定事件(连接被丢弃,如会话结束)→ 标记失效
+            recs[i].decision = "expired"
+        }
+        permRecords[sid] = recs
+        for r in recs where r.pfx == pfx {
+            if let d = r.decision {
+                out.append(Msg(id: "\(pfx)perm\(r.idx)", role: "agent",
+                               root: permResolvedCard(detail: r.detail, decision: d),
+                               fallback: d == "allow" ? "已允许" : "已拒绝"))
+            } else {
+                out.append(Msg(id: "\(pfx)perm\(r.idx)", role: "agent",
+                               root: permCard(detail: r.detail, sid: sid), fallback: "需要批准"))
+            }
+        }
+        // TUI 选择题(AskUserQuestion / ExitPlanMode):待答 → 交互卡;答完原地变已答。
+        var qrecs = questionRecords[sid] ?? []
+        if let pq = e.pendingQuestion {
+            if let i = qrecs.indices.last, !qrecs[i].answered, qrecs[i].pfx == pfx {
+                // 同一道题仍在等(或同轮换了内容则更新)
+                if qrecs[i].payload != pq {
+                    qrecs[i] = QuestionRecord(pfx: pfx, idx: qrecs[i].idx, payload: pq)
+                }
+            } else {
+                let idx = qrecs.filter { $0.pfx == pfx }.count
+                qrecs.append(QuestionRecord(pfx: pfx, idx: idx, payload: pq))
+            }
+        } else if let i = qrecs.indices.last, !qrecs[i].answered {
+            qrecs[i].answered = true
+            qrecs[i].choiceLabel = phoneChoice.removeValue(forKey: sid) ?? "已在电脑上选择"
+            answerFeedback[sid] = nil
+        }
+        questionRecords[sid] = qrecs
+        for r in qrecs where r.pfx == pfx {
+            out.append(Msg(id: "\(pfx)ask\(r.idx)", role: "agent",
+                           root: questionCard(r, sid: sid),
+                           fallback: r.answered ? "已选择" : "等待你选择"))
+        }
+
+        if recs.contains(where: { $0.pfx == pfx }) || !qrecs.isEmpty {
+            // 有审批/选择卡时不再追加 waiting 提示
         } else if out.isEmpty, case .waiting(let msg) = e.state {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
@@ -258,32 +477,115 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     /// 待批准卡(允许/拒绝)。
-    private func permCard(_ e: SessionEntry) -> [String: Any] {
+    private func permCard(detail: String?, sid: String) -> [String: Any] {
         var kids: [[String: Any]] = [text("请求执行以下命令:", color: "secondary", style: "caption")]
-        if let td = e.toolDetail { kids.append(code(td)) }
+        if let detail { kids.append(code(detail)) }
         kids.append([
             "type": "button_group",
             "props": ["buttons": [
-                button(label: "拒绝", style: "default", actionId: "perm_deny", value: e.id),
-                button(label: "允许", style: "danger", actionId: "perm_allow", value: e.id)
+                button(label: "拒绝", style: "default", actionId: "perm_deny", value: sid),
+                button(label: "允许", style: "danger", actionId: "perm_allow", value: sid)
             ]]
         ])
         return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
     }
 
-    /// 读不到图时:把 [Image: …] 换成简洁标记。
+    /// 已处理的审批卡:按钮换成结果徽标,卡片留在历史里。
+    private func permResolvedCard(detail: String?, decision: String) -> [String: Any] {
+        let (label, color, icon, style): (String, String, String, String)
+        switch decision {
+        case "allow":   (label, color, icon, style) = ("✓ 已允许", "success", "checkmark.circle.fill", "default")
+        case "deny":    (label, color, icon, style) = ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
+        case "timeout": (label, color, icon, style) = ("已超时,按默认流程处理", "secondary", "clock.fill", "default")
+        default:        (label, color, icon, style) = ("已失效", "secondary", "minus.circle.fill", "default")
+        }
+        var kids: [[String: Any]] = [text("请求执行以下命令:", color: "secondary", style: "caption")]
+        if let detail { kids.append(code(detail)) }
+        kids.append(badge(label, color: color))
+        return card(title: "审批请求", icon: icon, style: style, children: kids)
+    }
+
+    /// TUI 选择题卡:AskUserQuestion → 题目+选项按钮;ExitPlanMode → 计划+编号按钮。
+    /// 已回答 → 按钮换成结果徽标,卡片留存历史。
+    private func questionCard(_ r: QuestionRecord, sid: String) -> [String: Any] {
+        var kids: [[String: Any]] = []
+        if r.payload.tool == "ExitPlanMode" {
+            if let plan = r.payload.plan, !plan.isEmpty {
+                kids.append(text(cap(plan, 1500), markdown: true))
+            }
+            if r.answered {
+                kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
+            } else {
+                kids.append(text("请选择(编号与电脑终端中列出的选项一一对应):", color: "secondary", style: "caption"))
+                kids.append(["type": "button_group", "props": ["buttons": [
+                    button(label: "1 · 同意执行", style: "danger", actionId: "question_answer", value: "1"),
+                    button(label: "2 · 继续讨论", style: "default", actionId: "question_answer", value: "2")
+                ]]])
+            }
+            return card(title: "计划待确认", icon: "list.bullet.clipboard.fill",
+                        style: r.answered ? "default" : "warning", children: kids)
+        }
+        // AskUserQuestion(先支持第一题,多题引导回电脑)
+        let q = r.payload.questions.first
+        let title = q?.header?.isEmpty == false ? q!.header! : "请选择"
+        if let qt = q?.question, !qt.isEmpty { kids.append(text(qt, bold: true)) }
+        let opts = q?.options ?? []
+        if r.payload.questions.count > 1 {
+            kids.append(text("(共 \(r.payload.questions.count) 题,其余请在电脑上作答)", color: "secondary", style: "caption"))
+        }
+        if r.answered {
+            kids.append(badge("✓ \(r.choiceLabel ?? "已选择")", color: "success"))
+        } else if let fb = answerFeedback[sid] {
+            kids.append(badge(fb, color: "gold"))   // 已收到选择,正在注入按键(防重复)
+        } else {
+            // choices 组件:客户端本地管理选择状态(多选勾选可见),提交时一次性回传
+            kids.append([
+                "type": "choices",
+                "props": [
+                    "multi": q?.multiSelect == true,
+                    "options": opts.map { ["label": $0.label, "description": $0.description ?? ""] }
+                ],
+                "action": ["id": "question_answer", "value": ""]
+            ])
+            kids.append(button(label: "改在电脑上回答", style: "default",
+                               actionId: "question_local", value: sid))
+        }
+        return card(title: title, icon: "questionmark.circle.fill",
+                    style: r.answered ? "default" : "warning", children: kids)
+    }
+
+    /// 读不到图时:把 [Image …] 换成简洁标记。
     private func cleanPrompt(_ p: String) -> String {
-        cap(p.replacingOccurrences(of: #"\[Image:[^\]]*\]"#, with: "📷 [图片]", options: .regularExpression), 1000)
+        cap(p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "📷 [图片]", options: .regularExpression), 1000)
     }
 
-    /// 把 [Image: …] 整段去掉(已用缩略图展示时)。
+    /// 把 [Image …] 整段去掉(已用缩略图展示时)。
     private func stripImages(_ p: String) -> String {
-        p.replacingOccurrences(of: #"\[Image:[^\]]*\]"#, with: "", options: .regularExpression)
+        p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "", options: .regularExpression)
     }
 
-    /// 从 prompt 抽出粘贴图片的本地路径(`[Image: source: /path]` 或 image-cache 路径)。
-    private func extractImagePaths(_ p: String) -> [String] {
+    /// 从 prompt 抽出粘贴图片的本地路径。Claude Code 真实格式是 `[Image #N]`(只有编号),
+    /// 图片实际在 `~/.claude/image-cache/<sessionId>/<N>.<ext>`,据此构造路径。
+    /// 兼容带显式路径的 `[Image: source: /path]` 与裸路径。
+    private func extractImagePaths(_ p: String, sessionId: String) -> [String] {
         var paths: [String] = []
+        let fm = FileManager.default
+        let cacheDir = NSString(string: "~/.claude/image-cache").expandingTildeInPath + "/" + sessionId
+
+        // 1) [Image #N] → image-cache/<sid>/N.<ext>
+        if let re = try? NSRegularExpression(pattern: #"\[Image\s*#(\d+)\]"#) {
+            let ns = p as NSString
+            for m in re.matches(in: p, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
+                let n = ns.substring(with: m.range(at: 1))
+                for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
+                    let path = "\(cacheDir)/\(n).\(ext)"
+                    if fm.fileExists(atPath: path) { if !paths.contains(path) { paths.append(path) }; break }
+                }
+            }
+        }
+        if !paths.isEmpty { return paths }
+
+        // 2) 兜底:显式路径
         let patterns = [#"\[Image:[^\]]*?source:\s*([^\]\s]+)\]"#,
                         #"(/[^\s\]]+?\.(?:png|jpe?g|gif|webp|heic))"#]
         for pat in patterns {
@@ -293,7 +595,7 @@ final class RelayAgent: NSObject, ObservableObject {
                 let path = ns.substring(with: m.range(at: 1))
                 if !paths.contains(path) { paths.append(path) }
             }
-            if !paths.isEmpty { break }   // 优先用 [Image:] 格式,命中就不再用宽松匹配
+            if !paths.isEmpty { break }
         }
         return paths
     }
@@ -303,6 +605,18 @@ final class RelayAgent: NSObject, ObservableObject {
             "data": data, "mime": "image/jpeg",
             "source": source, "name": (source as NSString).lastPathComponent
         ]]
+    }
+
+    static let hhmm: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
+    static let fileStamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd_HHmm"; return f
+    }()
+    static func humanSize(_ bytes: Int) -> String {
+        if bytes >= 1_000_000 { return String(format: "%.1f MB", Double(bytes) / 1_000_000) }
+        if bytes >= 1_000 { return "\(bytes / 1_000) KB" }
+        return "\(bytes) B"
     }
 
     /// 读图 → 缩略图(最长边 640)→ JPEG → base64。结果缓存,避免重复编码。
@@ -335,19 +649,110 @@ final class RelayAgent: NSObject, ObservableObject {
     private func ingest(_ text: String) {
         guard let data = text.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        guard (obj["t"] as? String) == "action",
-              let body = obj["body"] as? [String: Any] else { return }
+        let t = obj["t"] as? String
+        if t == "pong" { lastPongAt = Date(); return }
+        if t == "auth_ok" { connState = .online; return }
+        if t == "error", let body = obj["body"] as? [String: Any],
+           (body["fatal"] as? Bool) == true {
+            // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
+            // (手机点「重连」解除后,下一次探测即恢复上线)
+            let code = body["code"] as? String ?? "?"
+            coolDownUntil = Date().addingTimeInterval(10)
+            connState = code == "suspended" ? .suspendedByPhone : .rejected(code)
+            vlog("relay: 服务器拒绝(\(code)),10s 后再试")
+            return
+        }
+        guard t == "input" || t == "action" else { return }
+
+        // 可靠投递:回 delivered 级 ack;按帧 id 去重(重发的帧只 ack 不重复执行,
+        // 杜绝重复注入终端/重复审批)。
+        if let fid = obj["id"] as? String, !fid.isEmpty {
+            sendJSON(["v": 1, "t": "ack", "id": "ack_\(fid)", "from": "agent",
+                      "body": ["ack_id": fid, "stage": "delivered"]])
+            if seenFrameIds.contains(fid) { return }
+            seenFrameIds.insert(fid)
+            seenFrameOrder.append(fid)
+            if seenFrameOrder.count > 500 {
+                seenFrameIds.remove(seenFrameOrder.removeFirst())
+            }
+        }
+
+        if t == "input" {
+            ingestInput(obj)
+            return
+        }
+        guard let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
+        // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)
+        if actionId == "question_answer" {
+            guard let sid = obj["sid"] as? String,
+                  let value = body["value"] as? String, !value.isEmpty else { return }
+            // value = "2"(单选)或 "1,3"(多选,完成后一次性回传)
+            let digits = value.split(separator: ",").map(String.init).filter { Int($0) != nil }
+            guard !digits.isEmpty else { return }
+            var isMulti = false
+            if let e = store.sessions.first(where: { $0.id == sid }), let pq = e.pendingQuestion {
+                isMulti = pq.questions.first?.multiSelect == true
+                if pq.tool == "ExitPlanMode" {
+                    phoneChoice[sid] = digits.first == "1" ? "同意执行" : "继续讨论"
+                } else if let opts = pq.questions.first?.options {
+                    let labels = digits.compactMap { d -> String? in
+                        guard let i = Int(d), i >= 1, i <= opts.count else { return nil }
+                        return opts[i - 1].label
+                    }
+                    phoneChoice[sid] = labels.joined(separator: "、")
+                }
+                answerFeedback[sid] = "已收到选择: \(phoneChoice[sid] ?? value),已回传给 Claude…"
+            }
+            vlog("question_answer sid=\(sid.prefix(8)) digits=\(digits) multi=\(isMulti)")
+            onRemoteAnswer?(sid, digits, isMulti, phoneChoice[sid] ?? digits.joined(separator: ","))
+            syncToServer()   // 卡片即时重渲染(反馈可见)
+            return
+        }
+        if actionId == "question_local" {
+            if let sid = obj["sid"] as? String { onRemoteAnswerLocal?(sid) }
+            return
+        }
+        if actionId == "launch_command" {
+            // 新建会话:value 是要在新终端里跑的命令(默认 claude)
+            let cmd = (body["value"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cmd.isEmpty { onRemoteLaunch?(cmd) }
+            return
+        }
         // sid 优先取 value;回退用 msg_id("sess:<sid>")
         let sid = (body["value"] as? String)
             ?? (body["msg_id"] as? String).map { $0.replacingOccurrences(of: "msg:", with: "") }
             ?? ""
         guard !sid.isEmpty else { return }
         switch actionId {
-        case "perm_allow": onRemoteDecision?(sid, .allow)
-        case "perm_deny":  onRemoteDecision?(sid, .deny)
+        case "perm_allow":    onRemoteDecision?(sid, .allow)
+        case "perm_deny":     onRemoteDecision?(sid, .deny)
+        case "session_close": onRemoteClose?(sid)
         default: break
         }
+    }
+
+    /// 手机输入帧:{kind:"text"|"image", text, images:[{data,ext}]}。
+    /// 图片落盘到 ~/.vibenotch/inbox/<sid>/,路径交给 AppDelegate 一并注入终端。
+    private func ingestInput(_ obj: [String: Any]) {
+        guard let sid = obj["sid"] as? String,
+              let body = obj["body"] as? [String: Any] else { return }
+        let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var paths: [String] = []
+        if let images = body["images"] as? [[String: Any]] {
+            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            for (i, img) in images.enumerated() {
+                guard let b64 = img["data"] as? String,
+                      let data = Data(base64Encoded: b64) else { continue }
+                let ext = (img["ext"] as? String ?? "jpg").lowercased()
+                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
+                guard FileManager.default.createFile(atPath: path, contents: data) else { continue }
+                paths.append(path)
+            }
+        }
+        guard !text.isEmpty || !paths.isEmpty else { return }
+        onRemoteInput?(sid, text, paths)
     }
 
     // MARK: - 收发底层
@@ -368,11 +773,37 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     private func scheduleReconnect() {
+        heartbeatTimer?.invalidate(); heartbeatTimer = nil
+        switch connState {
+        case .suspendedByPhone, .rejected, .unpaired: break   // 保留具体原因
+        default: connState = .offline
+        }
         retry += 1
-        let delay = min(pow(2.0, Double(retry)), 30)
+        let delay = max(min(pow(2.0, Double(retry)), 30),
+                        coolDownUntil.timeIntervalSinceNow)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             self.connect()
+        }
+    }
+
+    /// 应用层心跳:25s 一次 ping;70s 没收到 pong 视为僵死连接,强制重建。
+    /// (半开连接下 TCP 发送不报错,只有靠心跳能发现。)
+    private func startHeartbeat() {
+        lastPongAt = Date()
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                if Date().timeIntervalSince(self.lastPongAt) > 70 {
+                    vlog("relay heartbeat: pong 超时,重建连接")
+                    self.task?.cancel(with: .goingAway, reason: nil)
+                    self.scheduleReconnect()
+                    return
+                }
+                self.sendJSON(["v": 1, "t": "ping", "id": "p_agent",
+                               "ts": Int(Date().timeIntervalSince1970 * 1000)])
+            }
         }
     }
 

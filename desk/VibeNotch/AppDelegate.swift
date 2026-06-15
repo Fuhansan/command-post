@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var idleSweepTimer: Timer?
     private var livenessSweepTimer: Timer?
     private var replyRefreshTasks: [String: Task<Void, Never>] = [:]
+    /// 被扣住的 AskUserQuestion hook 连接(sid → conn):手机经 hook 直接回答,
+    /// 超时或用户选「改在电脑上回答」才放行到终端 TUI。
+    private var questionGates: [String: HookConnection] = [:]
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
     private static let waitingAutoExpandSeconds: TimeInterval = 8
@@ -84,6 +87,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 刘海上点了选项 → 与手机同一条 hook 通道回答(先答先得)。
+    func answerQuestionFromNotch(sessionId sid: String, picks: [Int]) {
+        guard let entry = store.sessions.first(where: { $0.id == sid }),
+              let pq = entry.pendingQuestion else { return }
+        let opts = pq.questions.first?.options ?? []
+        let labels = picks.compactMap { $0 >= 0 && $0 < opts.count ? opts[$0].label : nil }
+            .joined(separator: "、")
+        if answerQuestionViaGate(sid: sid, question: pq.questions.first?.question ?? "", labels: labels) {
+            vlog("notch answer ok sid=\(sid.prefix(8)) labels=\(labels)")
+        } else {
+            vlog("notch answer: gate 已死,请在终端作答 sid=\(sid.prefix(8))")
+        }
+    }
+
+    /// 放行被扣住的问题 → 终端 TUI 正常弹题。
+    private func releaseQuestionGate(sid: String) {
+        questionGates.removeValue(forKey: sid)?.dismiss()
+    }
+
+    /// 经 hook 把手机的选择精确回传给 Claude(deny + 明确说明这是用户的回答)。
+    /// 返回 false = hook 已放行,调用方走按键回退。
+    private func answerQuestionViaGate(sid: String, question: String, labels: String) -> Bool {
+        guard let conn = questionGates.removeValue(forKey: sid) else { return false }
+        let reason = "📱 用户已在手机上作答 → \(labels)。(此行非错误:这是经 VibeNotch 回传的用户答案,请以此继续,不要重新提问)"
+        let payload: [String: Any] = ["hookSpecificOutput": [
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        ]]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8), conn.respond(json: json) else {
+            // 连接已死(hook 被 claude 超时杀掉,TUI 已弹题)→ 让调用方走回退
+            vlog("question gate respond failed(连接已死) sid=\(sid.prefix(8))")
+            return false
+        }
+        store.clearPendingQuestion(sessionId: sid)   // 不会再有 PostToolUse,这里直接收尾
+        return true
+    }
+
     /// 接入 AI Coding Remote 中转：把会话推给手机,并把手机的 Allow/Deny 接到 decide()。
     private func setupRelayAgent() {
         let agent = RelayAgent(store: store, pending: pendingStore)
@@ -97,8 +139,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay remote \(decision == .allow ? "allow" : "deny") sid=\(sid.prefix(8))")
             self.decide(sessionId: sid, decision: decision)
         }
+        agent.onRemoteClose = { [weak self] sid in
+            guard let self else { return }
+            guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
+                vlog("relay close ignored: sid=\(sid.prefix(8)) unknown")
+                return
+            }
+            vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
+            self.pendingStore.cancel(sid: sid)   // 丢弃挂起的审批连接(若有)
+            if let pid = entry.ownerPID {
+                kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
+            } else {
+                // 不知道进程号(罕见)→ 直接移除会话,保证手机端也消失
+                self.store.removeSession(sessionId: sid)
+            }
+        }
+        agent.onRemoteInput = { [weak self] sid, text, imagePaths in
+            guard let self else { return }
+            guard self.store.sessions.contains(where: { $0.id == sid }) else {
+                vlog("relay input ignored: sid=\(sid.prefix(8)) unknown")
+                return
+            }
+            if !WindowActivator.isAccessibilityTrusted {
+                WindowActivator.requestAccessibilityIfNeeded()
+                vlog("relay input: AX not trusted — prompted, dropping input")
+                return
+            }
+            // 组装注入文本:用户文字 + 图片路径(claude 会自己读路径里的图)
+            var parts: [String] = []
+            if !text.isEmpty { parts.append(text) }
+            if !imagePaths.isEmpty {
+                parts.append(imagePaths.count == 1 && text.isEmpty
+                             ? "请查看这张图片: \(imagePaths[0])"
+                             : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
+            }
+            let message = parts.joined(separator: " ")
+            vlog("relay input sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
+            // 必须确认激活了目标终端窗口才打字,否则会敲进用户当前聚焦的任意应用
+            guard self.jumpToTerminal(sessionId: sid) else {
+                vlog("relay input dropped: terminal activation failed sid=\(sid.prefix(8))")
+                return
+            }
+            // 等窗口激活、输入焦点就位后再打字
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(message)
+            }
+        }
+        agent.onRemoteAnswer = { [weak self] sid, digits, isMulti, labels in
+            guard let self else { return }
+            guard let entry = self.store.sessions.first(where: { $0.id == sid }),
+                  let pq = entry.pendingQuestion else {
+                vlog("relay answer ignored: sid=\(sid.prefix(8)) 没有待答问题")
+                return
+            }
+            // 路径一(首选):hook 还扣着 → 把答案精确回传给 Claude,零按键注入
+            if self.answerQuestionViaGate(sid: sid, question: pq.questions.first?.question ?? "", labels: labels) {
+                vlog("relay answer via hook: sid=\(sid.prefix(8)) labels=\(labels)")
+                return
+            }
+            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选注入数字键;
+            // 多选按键时序不可靠,不注入,提示在电脑完成
+            guard !isMulti else {
+                vlog("relay answer dropped: 多选已放行到终端,不做按键注入 sid=\(sid.prefix(8))")
+                self.relayAgent?.questionAnswerFailed(sid: sid)   // 卡片提示改在电脑作答
+                return
+            }
+            if !WindowActivator.isAccessibilityTrusted {
+                WindowActivator.requestAccessibilityIfNeeded()
+                return
+            }
+            guard self.jumpToTerminal(sessionId: sid) else { return }
+            if let d = digits.first {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    TerminalTyper.type(d, thenReturn: false)
+                }
+            }
+        }
+        agent.onRemoteAnswerLocal = { [weak self] sid in
+            guard let self else { return }
+            vlog("question → 用户选择在电脑上回答 sid=\(sid.prefix(8))")
+            self.releaseQuestionGate(sid: sid)
+            self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
+        }
+        agent.onRemoteLaunch = { command in
+            vlog("relay launch: \(command)")
+            TerminalLauncher.run(command: command)
+        }
         agent.start()
         relayAgent = agent
+        SettingsWindowController.shared.relayAgent = agent
+
+        // 手机配对成功 / 退出登录 → 以新账号身份重连中转
+        NotificationCenter.default.addObserver(forName: .relayCredentialsChanged,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                vlog("relay credentials changed → reconnect as \(RelayAgent.account)")
+                self?.relayAgent?.restart()
+            }
+        }
     }
 
     /// Periodically drop sessions whose hook stream has gone silent (e.g. the
@@ -203,6 +341,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let sid = event.sessionId {
             vlog("pending permission: sid=\(sid.prefix(8)) tool=\(tool)")
             pendingStore.add(sid: sid, conn: conn)
+        } else if event.hookEventName == "PreToolUse",
+                  event.toolName == "AskUserQuestion",
+                  let sid = event.sessionId {
+            // 扣住问题:手机可经 hook 字节级精确回答(不模拟按键);
+            // 超时 / 用户选「改在电脑上回答」→ 放行,终端正常弹题。
+            vlog("question gate hold: sid=\(sid.prefix(8)) (不限时,等手机或转电脑)")
+            questionGates[sid]?.dismiss()
+            questionGates[sid] = conn
         } else {
             conn.dismiss()
         }
@@ -276,15 +422,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// `app.activate` brings the app forward but not the *right* window.
     /// We first try the Accessibility path to raise the window whose title
     /// matches the session's cwd; whole-app activate is the fallback.
-    func jumpToTerminal(sessionId: String) {
-        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return }
+    @discardableResult
+    func jumpToTerminal(sessionId: String) -> Bool {
+        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return false }
         guard let pid = entry.terminalPID else {
             vlog("jump: no terminalPID for sid=\(sessionId.prefix(8))")
-            return
+            return false
         }
         guard let app = NSRunningApplication(processIdentifier: pid) else {
             vlog("jump: NSRunningApplication(pid=\(pid)) not found — terminal may have quit")
-            return
+            return false
         }
 
         if Self.ideTerminalKinds.contains(entry.terminal) {
@@ -293,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("jump: AX not trusted — prompting; falling back to whole-app activate")
             } else if WindowActivator.activateWindow(pid: pid, cwd: entry.cwd) {
                 vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) AX-window-match cwd=\(entry.cwd)")
-                return
+                return true
             } else {
                 vlog("jump: sid=\(sessionId.prefix(8)) AX no window match for cwd=\(entry.cwd) — falling back")
             }
@@ -301,6 +448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let ok = app.activate(options: [.activateAllWindows])
         vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) ok=\(ok)")
+        return ok
     }
 
     /// 45-second watchdog tripped without an Allow/Deny click. Connection is
@@ -493,6 +641,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     },
                     onOpenFile: { sid, path in
                         self?.openFile(sessionId: sid, path: path)
+                    },
+                    onAnswerQuestion: { sid, picks in
+                        self?.answerQuestionFromNotch(sessionId: sid, picks: picks)
                     }
                 )
             },

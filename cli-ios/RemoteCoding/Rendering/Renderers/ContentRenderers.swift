@@ -174,9 +174,10 @@ struct ImageRenderer: View {
         if let dataStr = p["data"]?.stringValue,
            let data = Data(base64Encoded: dataStr), let ui = UIImage(data: data) {
             Image(uiImage: ui).resizable().scaledToFit()
-                .frame(maxWidth: 220, maxHeight: 280)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
-                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.stroke, lineWidth: 1))
+                .frame(maxWidth: 240, maxHeight: 300)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.stroke.opacity(0.5), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
         } else if let urlString = p["url"]?.stringValue ?? p["thumbUrl"]?.stringValue,
                   let url = URL(string: urlString) {
             AsyncImage(url: url) { phase in

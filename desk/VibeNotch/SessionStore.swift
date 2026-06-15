@@ -18,6 +18,20 @@ final class SessionStore: ObservableObject {
     /// were quit without firing a SessionEnd hook.
     static let idleRemovalSeconds: TimeInterval = 2 * 60 * 60
 
+    /// 手机经 hook 直接回答了问题 → 清除等待态(不会有 PostToolUse)。
+    func clearPendingQuestion(sessionId: String) {
+        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        sessions[idx].pendingQuestion = nil
+        if case .waiting = sessions[idx].state {
+            sessions[idx].state = .working(currentTool: nil, since: Date())
+        }
+    }
+
+    /// 主动移除一个会话(手机端结束任务且进程号未知时的兜底)。
+    func removeSession(sessionId: String) {
+        sessions.removeAll { $0.id == sessionId }
+    }
+
     func apply(_ event: HookEvent) {
         guard let sid = event.sessionId else { return }
         let cwd = event.cwd ?? "?"
@@ -74,6 +88,7 @@ final class SessionStore: ObservableObject {
                 entry?.state = .working(currentTool: nil, since: Date())
                 entry?.promptSummary = summary
                 entry?.toolDetail = nil
+                entry?.pendingQuestion = nil
                 entry?.turnSteps = []  // new turn — discard last turn's reply
             }
 
@@ -87,13 +102,30 @@ final class SessionStore: ObservableObject {
                 entry?.toolDetail = formatToolDetail(name: event.toolName, input: event.toolInput)
                 if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool) {
                     entry?.state = .waiting(message: "Run \(tool)?")
+                } else if event.toolName == "AskUserQuestion" {
+                    // TUI 选择题:进入等待 + 保留题目结构(刘海/手机渲染交互卡)
+                    let qs = event.toolInput?.questions ?? []
+                    entry?.pendingQuestion = PendingQuestion(tool: "AskUserQuestion", questions: qs, plan: nil)
+                    entry?.state = .waiting(message: qs.first?.question ?? "等待你选择")
+                } else if event.toolName == "ExitPlanMode" {
+                    entry?.pendingQuestion = PendingQuestion(tool: "ExitPlanMode", questions: [],
+                                                             plan: event.toolInput?.plan)
+                    entry?.state = .waiting(message: "计划待确认")
                 } else {
                     entry?.state = .working(currentTool: event.toolName, since: since)
                 }
             }
 
         case "PostToolUse":
-            break
+            // 选择题被回答(电脑或手机)→ 清除等待,恢复运行
+            if event.toolName == "AskUserQuestion" || event.toolName == "ExitPlanMode" {
+                upsert(id: sid) { entry in
+                    entry?.pendingQuestion = nil
+                    if case .waiting = entry?.state {
+                        entry?.state = .working(currentTool: nil, since: Date())
+                    }
+                }
+            }
 
         case "Notification":
             upsert(id: sid) { entry in
@@ -110,6 +142,7 @@ final class SessionStore: ObservableObject {
                 entry = ensure(entry, sid: sid, cwd: cwd, terminal: terminal, terminalPID: terminalPID)
                 entry?.state = .done(summary: "Done", finishedAt: Date())
                 entry?.toolDetail = nil
+                entry?.pendingQuestion = nil   // 回合结束/被打断 → 问题不再等待
             }
 
         case "SessionEnd":

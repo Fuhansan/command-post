@@ -6,28 +6,31 @@ final class AppState: ObservableObject {
     @Published var isLoggedIn: Bool
     @Published var userEmail: String?
 
-    private let tokenKey = "auth_token"
+    static let tokenKey = "auth_token"
     private let accountKey = "relay_account"
 
     /// 中转配对账号(= 登录邮箱)。RelayClient 据此与 Agent 配对,冷启动也能恢复。
     var account: String { userEmail ?? "demo" }
 
+    /// 当前会话令牌(WS auth 时携带,服务器据此解析账号)。
+    static var sessionToken: String? { KeychainStore.load(tokenKey) }
+
     init() {
-        let token = KeychainStore.load(tokenKey)
+        let token = KeychainStore.load(Self.tokenKey)
         self.isLoggedIn = token != nil
         self.userEmail = UserDefaults.standard.string(forKey: accountKey)
     }
 
-    /// 登录(脚手架版:本地置位 + 存假 token;真实实现走 PROTOCOL §8.1 auth)。
-    func login(email: String) {
-        userEmail = email
-        UserDefaults.standard.set(email, forKey: accountKey)
-        KeychainStore.save("dev-token-\(UUID().uuidString)", for: tokenKey)
+    /// 登录成功(Google 等外部登录换到本系统 token 后调用)。
+    func login(account: String, token: String) {
+        userEmail = account
+        UserDefaults.standard.set(account, forKey: accountKey)
+        KeychainStore.save(token, for: Self.tokenKey)
         isLoggedIn = true
     }
 
     func logout() {
-        KeychainStore.delete(tokenKey)
+        KeychainStore.delete(Self.tokenKey)
         UserDefaults.standard.removeObject(forKey: accountKey)
         userEmail = nil
         isLoggedIn = false
@@ -39,4 +42,6 @@ struct AgentInfo: Identifiable, Hashable {
     let id: String
     let name: String
     let online: Bool
+    var suspended: Bool = false   // 被手机端「断开」挂起,可点重连恢复
+    var resuming: Bool = false    // 已点「重连」,等待电脑回连(≤10s 探测周期)
 }

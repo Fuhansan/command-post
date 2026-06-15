@@ -106,6 +106,7 @@ struct NotchExpandedView: View {
     var onDecide: (String, PermissionDecision) -> Void
     var onJump: (String) -> Void
     var onOpenFile: (String, String) -> Void
+    var onAnswerQuestion: (String, [Int]) -> Void = { _, _ in }
     @State private var expandedID: String? = nil
     @State private var lastClickAt: Date? = nil
     @State private var lastClickedID: String? = nil
@@ -189,6 +190,11 @@ struct NotchExpandedView: View {
                                     onAllow: { onDecide(entry.id, .allow) },
                                     onDeny: { onDecide(entry.id, .deny) }
                                 )
+                            }
+                            if let pq = entry.pendingQuestion, pq.tool == "AskUserQuestion" {
+                                NotchQuestionCard(question: pq) { picks in
+                                    onAnswerQuestion(entry.id, picks)
+                                }
                             }
                         }
                     }
@@ -796,5 +802,77 @@ extension Color {
         let g = Double((hex >> 8) & 0xFF) / 255.0
         let b = Double(hex & 0xFF) / 255.0
         self.init(.sRGB, red: r, green: g, blue: b, opacity: alpha)
+    }
+}
+
+
+/// 刘海上的选择题卡:与手机同走 hook 回答通道,先答先得。
+/// 单选点即提交;多选点选项切换勾选,再点「提交」。
+struct NotchQuestionCard: View {
+    let question: PendingQuestion
+    var onSubmit: ([Int]) -> Void
+    @State private var picked: Set<Int> = []
+    @State private var submitted = false
+
+    private var q: QuestionItem? { question.questions.first }
+    private var multi: Bool { q?.multiSelect == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let text = q?.question {
+                Text(text)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(3)
+            }
+            ForEach(Array((q?.options ?? []).enumerated()), id: \.offset) { i, opt in
+                Button {
+                    guard !submitted else { return }
+                    if multi {
+                        if picked.contains(i) { picked.remove(i) } else { picked.insert(i) }
+                    } else {
+                        picked = [i]; submitted = true
+                        onSubmit([i])
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: picked.contains(i)
+                              ? (multi ? "checkmark.square.fill" : "checkmark.circle.fill")
+                              : (multi ? "square" : "circle"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(picked.contains(i) ? Color.orange : .white.opacity(0.4))
+                        Text("\(i + 1). \(opt.label)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color.white.opacity(picked.contains(i) ? 0.12 : 0.05))
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            if multi {
+                Button {
+                    guard !submitted, !picked.isEmpty else { return }
+                    submitted = true
+                    onSubmit(picked.sorted())
+                } label: {
+                    Text(submitted ? "已提交" : "提交(已选 \(picked.count) 项)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(picked.isEmpty ? Color.white.opacity(0.08) : Color.orange.opacity(0.7))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(submitted || picked.isEmpty)
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.10))
+        .cornerRadius(8)
     }
 }

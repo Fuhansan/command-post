@@ -30,6 +30,23 @@ struct Component: Identifiable {
     }
 }
 
+/// 暂存待发送的一张图片(已编码,可直接入帧/回显)。
+struct StagedImagePayload {
+    let data: String   // base64 JPEG
+    let ext: String    // "jpg"
+    let name: String   // 展示文件名
+    let kind: String   // "JPEG"
+    let size: String   // "1.2 MB"
+}
+
+/// 上行消息的投递状态(两段式 ack:服务器 → 代理端)。
+enum DeliveryStatus {
+    case sending     // 已发出,未收到任何 ack
+    case sent        // 服务器已确认(单勾)
+    case delivered   // 电脑端已确认(双勾)
+    case failed      // 重试耗尽,可手动重发
+}
+
 /// PROTOCOL §5 —— 一条渲染用的富消息。由 `t: "ui"` 的 Frame 构造。
 struct UIMessage: Identifiable {
     let id: String
@@ -37,6 +54,9 @@ struct UIMessage: Identifiable {
     var role: String          // agent | user | system
     var root: Component
     var fallbackText: String?
+    var time: String?         // 消息时间(HH:mm,首次出现时刻,由 agent 下发)
+    var status: DeliveryStatus? = nil   // 仅本地发出的消息有;agent 下发的为 nil
+    var upstreamId: String? = nil       // 对应的上行帧 id(重发/对账用)
 
     init?(frame: Frame) {
         guard case .ui = frame.t, let id = frame.id, let body = frame.body else { return nil }
@@ -45,6 +65,7 @@ struct UIMessage: Identifiable {
         self.role = body["role"]?.stringValue ?? "agent"
         self.root = Component(json: body["root"] ?? .object([:]))
         self.fallbackText = frame.fallbackText
+        self.time = body["time"]?.stringValue
     }
 
     /// 本地构造一条用户文本消息(用户在输入框发送时)。
@@ -57,5 +78,28 @@ struct UIMessage: Identifiable {
             "props": .object(["text": .string(text)])
         ]))
         self.fallbackText = text
+        self.time = Self.hhmm.string(from: Date())
     }
+
+    /// 本地构造一条图文消息(手机发送图片时的即时回显,与 agent 的 photomsg 同构)。
+    init(localUserImages images: [StagedImagePayload], text: String) {
+        self.id = UUID().uuidString
+        self.seq = .max
+        self.role = "user"
+        var props: [String: JSONValue] = [
+            "images": .array(images.map { .object([
+                "data": .string($0.data), "name": .string($0.name),
+                "kind": .string($0.kind), "size": .string($0.size)
+            ]) }),
+            "time": .string(Self.hhmm.string(from: Date()))
+        ]
+        if !text.isEmpty { props["text"] = .string(text) }
+        self.root = Component(json: .object(["type": .string("photomsg"), "props": .object(props)]))
+        self.fallbackText = text.isEmpty ? "图片" : text
+        self.time = Self.hhmm.string(from: Date())
+    }
+
+    private static let hhmm: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    }()
 }
