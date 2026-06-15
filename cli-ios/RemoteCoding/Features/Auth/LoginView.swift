@@ -27,10 +27,26 @@ struct LoginView: View {
     @State private var showSetPassword = false
     @State private var setPwError: String?
 
+    // 忘记密码(邮箱验证码重置)
+    @State private var showReset = false
+    @State private var resetAccount = ""
+    @State private var resetCode = ""
+    @State private var resetNewPassword = ""
+    @State private var resetCodeSent = false
+    @State private var resetSending = false
+    @State private var resetInfo: String?
+    @State private var resetError: String?
+
     private var port: Int { Int(portText) ?? 0 }
     private var serverValid: Bool { !RelayClient.sanitizeHost(host).isEmpty && (1...65535).contains(port) }
     private var canLogin: Bool {
         reachable && !account.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 4
+    }
+    private var canSendReset: Bool {
+        reachable && resetAccount.trimmingCharacters(in: .whitespaces).contains("@")
+    }
+    private var canReset: Bool {
+        resetCodeSent && resetCode.trimmingCharacters(in: .whitespaces).count >= 4 && resetNewPassword.count >= 4
     }
 
     var body: some View {
@@ -62,6 +78,7 @@ struct LoginView: View {
         }
         .onAppear { host = serverHost; portText = String(serverPort) }
         .sheet(isPresented: $showSetPassword) { setPasswordSheet }
+        .sheet(isPresented: $showReset) { resetSheet }
     }
 
     private var serverCard: some View {
@@ -119,6 +136,17 @@ struct LoginView: View {
                     .font(.system(size: 12)).foregroundStyle(Theme.textTer)
             }
 
+            Button {
+                resetAccount = account.trimmingCharacters(in: .whitespaces)
+                resetCode = ""; resetNewPassword = ""
+                resetCodeSent = false; resetInfo = nil; resetError = nil
+                showReset = true
+            } label: {
+                Text("忘记密码?").font(.system(size: 13)).foregroundStyle(Theme.blue)
+            }
+            .buttonStyle(.plain).disabled(!reachable)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+
             HStack {
                 Rectangle().fill(Theme.stroke).frame(height: 1)
                 Text("首次使用").font(.system(size: 12)).foregroundStyle(Theme.textTer)
@@ -170,6 +198,66 @@ struct LoginView: View {
             .padding(24)
         }
         .interactiveDismissDisabled(true)
+    }
+
+    private var resetSheet: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("重置密码").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
+                    Text("输入注册邮箱,把验证码发到该邮箱,再用验证码设置新密码。")
+                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+
+                    field($resetAccount, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
+                        .textContentType(.username)
+
+                    Button(action: sendResetCode) {
+                        HStack(spacing: 8) {
+                            if resetSending { ProgressView().tint(.white) }
+                            Text(resetCodeSent ? "重新发送验证码" : "发送验证码")
+                                .font(.system(size: 15, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity).padding(.vertical, 12)
+                        .background(canSendReset ? Theme.blueBtn : Theme.cardHi)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain).disabled(!canSendReset || resetSending)
+
+                    if resetCodeSent {
+                        field($resetCode, prompt: "6 位验证码", keyboard: .numberPad, width: nil, secure: false)
+                        field($resetNewPassword, prompt: "新密码(至少 4 位)", keyboard: .default, width: nil, secure: true)
+                        Button(action: doResetPassword) {
+                            HStack(spacing: 8) {
+                                if loading { ProgressView().tint(.white) }
+                                Text("重置密码").font(.system(size: 16, weight: .semibold))
+                            }
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 13)
+                            .background(canReset ? Theme.blueBtn : Theme.cardHi)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain).disabled(!canReset || loading)
+                    }
+
+                    if let resetInfo {
+                        Text(resetInfo).font(.system(size: 13)).foregroundStyle(Theme.green)
+                    }
+                    if let resetError {
+                        Text(resetError).font(.system(size: 13)).foregroundStyle(Theme.coral)
+                    }
+
+                    Button("取消") { showReset = false }
+                        .font(.system(size: 14)).foregroundStyle(Theme.textSec)
+                        .frame(maxWidth: .infinity)
+                    Spacer(minLength: 8)
+                }
+                .padding(24)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .presentationDetents([.medium, .large])
     }
 
     @ViewBuilder
@@ -250,6 +338,35 @@ struct LoginView: View {
                 } catch { errorMessage = error.localizedDescription }
                 loading = false
             }
+        }
+    }
+
+    private func sendResetCode() {
+        resetError = nil; resetInfo = nil; resetSending = true
+        let acc = resetAccount.trimmingCharacters(in: .whitespaces)
+        Task {
+            do {
+                try await AuthAPI.forgotPassword(account: acc)
+                resetCodeSent = true
+                resetInfo = "验证码已发送到 \(acc),请查收(可能在垃圾箱)。"
+            } catch { resetError = error.localizedDescription }
+            resetSending = false
+        }
+    }
+
+    private func doResetPassword() {
+        resetError = nil; resetInfo = nil; loading = true
+        let acc = resetAccount.trimmingCharacters(in: .whitespaces)
+        let code = resetCode.trimmingCharacters(in: .whitespaces)
+        let pwd = resetNewPassword
+        Task {
+            do {
+                try await AuthAPI.resetPassword(account: acc, code: code, password: pwd)
+                showReset = false
+                account = acc; password = ""       // 回登录页,预填邮箱,让用户用新密码登录
+                errorMessage = "密码已重置,请用新密码登录"
+            } catch { resetError = error.localizedDescription }
+            loading = false
         }
     }
 
