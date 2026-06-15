@@ -14,6 +14,13 @@ enum TerminalLauncher {
         let dir = (workdir as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let cdPart = dir.isEmpty ? "" : "cd \(shellQuote(dir)); "
 
+        // 预置信任:避免新会话卡在「Do you trust the files in this folder?」
+        // (该提示早于 hook,手机接不到)。信任默认目录 + 命令里 cd 的目标。
+        var trustDirs: [String] = []
+        if !dir.isEmpty { trustDirs.append(dir) }
+        if let cdTarget = leadingCdPath(in: cmd) { trustDirs.append(cdTarget) }
+        ClaudeTrust.trust(directories: trustDirs)
+
         // 干净的新终端 PATH 可能指不到装 claude/codex 的那个 nvm node 版本
         // (用户的工具常装在某个特定 node 版本里)→ 把所有 nvm 版本的 bin
         // 与常用工具目录都补进 PATH,保证 claude/codex 等能被找到。
@@ -37,6 +44,23 @@ enum TerminalLauncher {
                 vlog("launch terminal failed: \(error)")   // 多半是「自动化」权限未授予
             }
         }
+    }
+
+    /// 从命令里抽出开头的 `cd <path>`(支持 `cd x &&` / `cd x;` / 单双引号包裹),
+    /// 用于预置信任。抽不到返回 nil。
+    private static func leadingCdPath(in command: String) -> String? {
+        let c = command.trimmingCharacters(in: .whitespaces)
+        guard c.hasPrefix("cd ") else { return nil }
+        var rest = String(c.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+        // 取到第一个 && / ; / | 之前
+        for sep in ["&&", ";", "|"] {
+            if let r = rest.range(of: sep) { rest = String(rest[..<r.lowerBound]) }
+        }
+        rest = rest.trimmingCharacters(in: .whitespaces)
+        if (rest.hasPrefix("\"") && rest.hasSuffix("\"")) || (rest.hasPrefix("'") && rest.hasSuffix("'")) {
+            rest = String(rest.dropFirst().dropLast())
+        }
+        return rest.isEmpty ? nil : rest
     }
 
     /// 单引号包裹路径,内部单引号转义,安全用于 shell。
