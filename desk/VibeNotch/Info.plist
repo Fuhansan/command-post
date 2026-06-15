@@ -26,8 +26,6 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>VibeNotch 需要控制终端来从手机端新建会话(打开终端运行命令)。</string>

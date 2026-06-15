@@ -110,6 +110,7 @@ final class PairingController: ObservableObject {
                     }
                 }
             } catch {
+                vlog("pair 失败: \(error)  (api=\(Self.api))")
                 self.state = .failed("配对失败: \(error.localizedDescription)")
             }
         }
