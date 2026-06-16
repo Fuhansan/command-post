@@ -54,6 +54,13 @@ struct SettingsView: View {
                 Toggle(L10n.t(.settingsMuteSounds, locale: locale), isOn: $settings.muted)
             }
 
+            // 透明 tmux 包装:让手动起的 claude/codex 也跑在 tmux,手机锁屏可控
+            Section("锁屏遥控") {
+                Toggle("终端自动用 tmux(锁屏也能从手机控)", isOn: $settings.tmuxWrap)
+                Text("开启后在 ~/.zshrc / ~/.bashrc 注入 claude/codex 包装:你照常敲 `claude`,它自动跑在 tmux 里 → 电脑锁屏后手机仍能给它发消息。对【新开的终端】生效;关掉会移除该配置。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+
             // 手机「新建会话」用的默认工作目录 + 代理
             Section("新建会话") {
                 VStack(alignment: .leading, spacing: 4) {

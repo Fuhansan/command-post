@@ -16,6 +16,9 @@ final class AppSettings: ObservableObject {
     @Published var defaultWorkdir: String { didSet { persist() } }
     /// 新建会话时在命令前自动执行的代理设置(大陆用户跑 claude 需要;空=不设)。
     @Published var launchProxy: String { didSet { persist() } }
+    /// 让手动起的 claude/codex 自动跑在 tmux 里(手机锁屏也能遥控)。
+    /// 开=往 shell rc 注入包装函数;关=卸载。
+    @Published var tmuxWrap: Bool { didSet { persist(); ShellWrapper.apply(enabled: tmuxWrap) } }
 
     /// Mirrors `SMAppService.mainApp.status`; the setter actually
     /// (un)registers the login item, so the UI's binding is one-shot truth.
@@ -44,7 +47,9 @@ final class AppSettings: ObservableObject {
         self.muted    = loaded?.muted    ?? false
         self.defaultWorkdir = loaded?.defaultWorkdir ?? ""
         self.launchProxy = loaded?.launchProxy ?? ""
+        self.tmuxWrap = loaded?.tmuxWrap ?? true   // 默认开:用户要的「锁屏可控」靠它
         SoundPlayer.shared.muted = self.muted
+        ShellWrapper.apply(enabled: self.tmuxWrap)  // 启动时对齐(幂等)
     }
 
     // MARK: - Persistence
@@ -57,10 +62,12 @@ final class AppSettings: ObservableObject {
         var muted: Bool
         var defaultWorkdir: String?
         var launchProxy: String?
+        var tmuxWrap: Bool?
     }
 
     private func persist() {
-        let snap = Stored(language: language, muted: muted, defaultWorkdir: defaultWorkdir, launchProxy: launchProxy)
+        let snap = Stored(language: language, muted: muted, defaultWorkdir: defaultWorkdir,
+                          launchProxy: launchProxy, tmuxWrap: tmuxWrap)
         do {
             try FileManager.default.createDirectory(
                 atPath: Self.configDir,
