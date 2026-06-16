@@ -19,7 +19,8 @@ enum ShellWrapper {
       fi
       local _vn_cmd="$tool" _vn_a
       for _vn_a in "$@"; do _vn_cmd="$_vn_cmd $(printf '%q' "$_vn_a")"; done
-      tmux new-session -A -s "vn_$(date +%s)" "$_vn_cmd"
+      # -c "$PWD":pane 严格在当前目录起,保证 claude --continue / 项目识别找对目录
+      tmux new-session -A -s "vn_$(date +%s)" -c "$PWD" "$_vn_cmd"
     }
     claude() { _vn_wrap claude "$@"; }
     codex()  { _vn_wrap codex "$@"; }
