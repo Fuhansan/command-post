@@ -202,7 +202,7 @@ struct TaskDetailView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
-            quickCommandBar
+            commandPopup
             if !stagedImages.isEmpty { stagingStrip }
             HStack(spacing: 10) {
                 Menu {
@@ -257,26 +257,42 @@ struct TaskDetailView: View {
     }
 
     /// 暂存框:已选图片缩略图横排,可单张移除;发送时与文字合并为一条消息。
-    /// 快捷指令栏:按会话的 CLI 类型显示「直接执行型」斜杠指令,点一下直接发送。
+    /// 输入「/」时,在输入框上方弹出匹配的快捷指令气泡(命令+说明);点一个直接发送。
+    /// 不输「/」就不显示,不占地方。指令集按会话的 CLI 类型(claude/codex)取。
     @ViewBuilder
-    private var quickCommandBar: some View {
-        if let cmds = session.flatMap({ CLIKind.by(id: $0.cli) })?.quickCommands, !cmds.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(cmds, id: \.self) { cmd in
-                        Button { relay.sendInput(text: cmd, sessionId: sessionId) } label: {
-                            Text(cmd)
-                                .font(.system(size: 13, weight: .medium, design: .monospaced))
-                                .foregroundStyle(Theme.text)
-                                .padding(.horizontal, 12).padding(.vertical, 7)
-                                .background(Theme.cardHi)
-                                .overlay(Capsule().stroke(Theme.stroke))
-                                .clipShape(Capsule())
+    private var commandPopup: some View {
+        let q = draft.trimmingCharacters(in: .whitespaces)
+        if q.hasPrefix("/"),
+           let cmds = session.flatMap({ CLIKind.by(id: $0.cli) })?.quickCommands {
+            let matches = cmds.filter { $0.cmd.hasPrefix(q) }
+            if !matches.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(matches) { c in
+                        Button {
+                            relay.sendInput(text: c.cmd, sessionId: sessionId)
+                            draft = ""
+                        } label: {
+                            HStack(spacing: 10) {
+                                Text(c.cmd)
+                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(Theme.text)
+                                Text(c.desc)
+                                    .font(.system(size: 12)).foregroundStyle(Theme.textSec)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 14).padding(.vertical, 11)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        if c.id != matches.last?.id { Divider().overlay(Theme.stroke) }
                     }
                 }
-                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Theme.field)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 3)
+                .padding(.horizontal, 12).padding(.bottom, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
         }
     }
