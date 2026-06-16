@@ -4,21 +4,23 @@ import SwiftUI
 enum SessionStatusUI {
     static func label(_ s: String) -> String {
         switch s {
-        case "idle":    return "空闲"
-        case "working": return "运行中"
-        case "waiting": return "等待确认"
-        case "done":    return "完成"
-        case "ended":   return "已结束"
-        default:        return s
+        case "idle":      return "空闲"
+        case "working":   return "运行中"
+        case "waiting":   return "等待确认"   // 真有审批/选择待你处理(needsAction)
+        case "suspended": return "会话挂起"   // 空闲等你输入,无待办 —— 不催你
+        case "done":      return "完成"
+        case "ended":     return "已结束"
+        default:          return s
         }
     }
     static func color(_ s: String) -> Color {
         switch s {
-        case "working": return Theme.blue
-        case "waiting": return Theme.gold
-        case "done":    return Theme.green
-        case "ended":   return Theme.textTer
-        default:        return Theme.textSec
+        case "working":   return Theme.blue
+        case "waiting":   return Theme.gold    // 黄:需要你处理
+        case "suspended": return Theme.textSec // 灰:仅挂起,不需处理
+        case "done":      return Theme.green
+        case "ended":     return Theme.textTer
+        default:          return Theme.textSec
         }
     }
 }

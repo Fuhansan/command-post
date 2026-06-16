@@ -9,7 +9,11 @@ typealias VibeNotch = DynamicNotch<NotchExpandedView, NotchCompactSummary, Notch
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func menuWillOpen(_ menu: NSMenu) {
-        Task { @MainActor in self.rebuildDisplaySubmenu() }
+        Task { @MainActor in
+            self.rebuildDisplaySubmenu()
+            // 勾选可能被设置窗口改过,每次打开菜单对齐一次
+            self.tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
+        }
     }
 
     private var notch: VibeNotch?
@@ -154,7 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agent.onRemoteClose = { [weak self] sid in
             guard let self else { return }
             guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
-                vlog("relay close ignored: sid=\(sid.prefix(8)) unknown")
+                // 本地查无 = 鬼会话(电脑终端早没了、服务端旧快照残留)→ 不再忽略,
+                // 主动让服务端+手机清掉它,否则手机永远删不动这条。
+                vlog("relay close: sid=\(sid.prefix(8)) 本地查无 → 作为鬼会话清除")
+                self.relayAgent?.purgeGhostSession(sid: sid)
                 return
             }
             vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
@@ -547,6 +554,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return mi
         }())
 
+        // 锁屏遥控开关:勾上=新开终端自动进 tmux(锁屏也能从手机控);
+        // 关掉=纯原生终端(滚轮/选字原生,但只有不锁屏才能遥控)。一键切换,免翻设置。
+        let tmux = NSMenuItem(
+            title: L10n.t(.menuTmuxWrap, locale: locale),
+            action: #selector(toggleTmuxWrap),
+            keyEquivalent: ""
+        )
+        tmux.state = AppSettings.shared.tmuxWrap ? .on : .off
+        menu.addItem(tmux)
+        tmuxItem = tmux
+
         menu.addItem(.separator())
 
         let displayParent = NSMenuItem(
@@ -573,6 +591,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusMenu: NSMenu?
     private var displaySubmenu: NSMenu?
+    private var tmuxItem: NSMenuItem?
 
     /// Rebuild the "Display on" submenu from the current screen list.
     /// Called on menu open + when screens change so unplugged monitors vanish.
@@ -608,6 +627,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    /// 菜单栏一键切换锁屏遥控(tmux 包装)。tmuxWrap 的 didSet 会自动
+    /// persist + ShellWrapper.apply(写/删 ~/.zshrc 的包装函数,对新开终端生效)。
+    @objc private func toggleTmuxWrap() {
+        AppSettings.shared.tmuxWrap.toggle()
+        tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
     }
 
     @objc private func quit() {

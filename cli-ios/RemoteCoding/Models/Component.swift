@@ -55,6 +55,7 @@ struct UIMessage: Identifiable {
     var root: Component
     var fallbackText: String?
     var time: String?         // 消息时间(HH:mm,首次出现时刻,由 agent 下发)
+    var ord: Int = .max       // 逻辑顺序号(agent 下发,轮次×1000+轮内位置);本地消息=.max 排末尾
     var status: DeliveryStatus? = nil   // 仅本地发出的消息有;agent 下发的为 nil
     var upstreamId: String? = nil       // 对应的上行帧 id(重发/对账用)
 
@@ -66,6 +67,7 @@ struct UIMessage: Identifiable {
         self.root = Component(json: body["root"] ?? .object([:]))
         self.fallbackText = frame.fallbackText
         self.time = body["time"]?.stringValue
+        self.ord = body["ord"]?.intValue ?? .max
     }
 
     /// 本地构造一条用户文本消息(用户在输入框发送时)。
@@ -73,9 +75,11 @@ struct UIMessage: Identifiable {
         self.id = UUID().uuidString
         self.seq = .max
         self.role = "user"
+        // 用 bubble(role:user) 而非裸 text:发出去立刻就是右侧蓝气泡,与 agent 回传的
+        // 用户消息同构(BubbleRenderer 读 text/role)。否则裸 text 左对齐无气泡,看着像"在左边"。
         self.root = Component(json: .object([
-            "type": .string("text"),
-            "props": .object(["text": .string(text)])
+            "type": .string("bubble"),
+            "props": .object(["text": .string(text), "role": .string("user")])
         ]))
         self.fallbackText = text
         self.time = Self.hhmm.string(from: Date())

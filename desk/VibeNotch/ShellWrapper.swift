@@ -19,8 +19,11 @@ enum ShellWrapper {
       fi
       local _vn_cmd="$tool" _vn_a
       for _vn_a in "$@"; do _vn_cmd="$_vn_cmd $(printf '%q' "$_vn_a")"; done
+      local _vn_s="vn_$(date +%s)"
       # -c "$PWD":pane 严格在当前目录起,保证 claude --continue / 项目识别找对目录
-      tmux new-session -A -s "vn_$(date +%s)" -c "$PWD" "$_vn_cmd"
+      # status off:只对本会话关掉底部绿条,让 tmux 视觉上接近普通终端(锁屏遥控仍在底层生效;
+      #   不动 mouse —— 实测 claude 不申请鼠标上报也不用 alt-screen,开 mouse 反而会进复制模式)
+      tmux new-session -A -s "$_vn_s" -c "$PWD" "$_vn_cmd" \\; set -t "$_vn_s" status off
     }
     claude() { _vn_wrap claude "$@"; }
     codex()  { _vn_wrap codex "$@"; }

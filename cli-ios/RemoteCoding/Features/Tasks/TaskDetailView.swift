@@ -16,6 +16,15 @@ struct TaskDetailView: View {
 
     private var session: RelaySession? { relay.session(id: sessionId) }
 
+    /// 渲染顺序:按 agent 下发的逻辑序号 ord 排(同 ord 保持到达顺序,本地刚发的 .max 排末尾)。
+    /// ForEach 与「滚到底」都用它 —— 否则滚到到达顺序的 last 会与视觉 last 错位,底部被盖。
+    private var orderedMessages: [UIMessage] {
+        guard let msgs = session?.messages else { return [] }
+        return msgs.enumerated().sorted {
+            $0.element.ord != $1.element.ord ? $0.element.ord < $1.element.ord : $0.offset < $1.offset
+        }.map { $0.element }
+    }
+
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
@@ -26,8 +35,8 @@ struct TaskDetailView: View {
                         ScrollView {
                             VStack(spacing: 14) {
                                 sessionHeader
-                                if let msgs = session?.messages, !msgs.isEmpty {
-                                    ForEach(msgs) { msg in
+                                if !orderedMessages.isEmpty {
+                                    ForEach(orderedMessages) { msg in
                                         messageRow(msg).id(msg.id)
                                     }
                                 } else if session?.status != "working" {
@@ -44,16 +53,18 @@ struct TaskDetailView: View {
                         .scrollDismissesKeyboard(.interactively)   // 下拉消息区即收键盘
                         .dismissKeyboardOnTap()                    // 点击消息区空白也收键盘
                         .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
+                        // 瞬时定位到底部(不用 withAnimation):发消息/收消息直接落底,
+                        // 不再「动画地从上往下扫一遍」。滚到**视觉**最后一条(ord 排序后)。
                         .onChange(of: session?.messages.count ?? 0) { _, _ in
                             if session?.status == "working" {
-                                withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
-                            } else if let last = session?.messages.last {
-                                withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                                proxy.scrollTo("typing", anchor: .bottom)
+                            } else if let last = orderedMessages.last {
+                                proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
                         .onChange(of: session?.status ?? "") { _, st in
                             if st == "working" {
-                                withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
+                                proxy.scrollTo("typing", anchor: .bottom)
                             }
                         }
                     }

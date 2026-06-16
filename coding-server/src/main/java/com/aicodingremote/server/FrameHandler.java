@@ -112,6 +112,10 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         } else {
             // Client 上线 → 补发该账号现有所有会话的最后一帧,使其立刻看到全部任务
             for (String snap : hub.snapshotsOf(account)) send(ctx.channel(), snap);
+            // 并通知同账号的 Agent「手机上线了」→ Agent 主动全量重推,补齐服务端快照缺漏
+            // (服务端重启丢内存 / Agent 早期断网漏同步且之后无变化的场景)。
+            String clientUp = Frames.clientPresence(true);
+            for (Connection a : hub.agentsOf(account)) send(a.channel, clientUp);
         }
     }
 

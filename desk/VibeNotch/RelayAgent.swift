@@ -105,6 +105,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var retry = 0
     private var started = false
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
+    private var lastClientResyncAt = Date.distantPast   // 手机上线触发全量重推的防抖
 
     init(store: SessionStore, pending: PendingDecisionStore) {
         self.store = store
@@ -164,11 +165,22 @@ final class RelayAgent: NSObject, ObservableObject {
         knownSids.removeAll()
         // 进程刚启动(非网络重连)→ 让服务器+手机清掉上个进程实例的残留消息,
         // 避免重启后轮次重置导致旧 id(如 t2:img0/prompt)与新 id 并存的孤儿气泡。
+        // 注意:firstConnect 的翻转推迟到收到 auth_ok 之后(见 ingest),保证首连若没连稳
+        // 时下次重连会重发 reset —— 否则进程重启撞上网络抖动会漏 reset,服务端鬼快照永久残留。
         if firstConnect {
-            firstConnect = false
             sendReset()
         }
         syncToServer()   // 连上后补发当前所有会话
+    }
+
+    /// 手机上线 → 把当前所有会话**全量重推**(清 lastSent 让 syncToServer 不走去重、整体重发一遍),
+    /// 补齐服务端快照缺漏。带 3s 防抖:手机频繁重连/多设备时不至于反复全量重推。
+    private func forceResyncForClient() {
+        guard Date().timeIntervalSince(lastClientResyncAt) > 3 else { return }
+        lastClientResyncAt = Date()
+        vlog("relay: 手机上线,全量重推当前会话")
+        lastSent.removeAll()
+        syncToServer()
     }
 
     /// 清空本账号在服务器与手机端的全部会话(agent 进程重启时调用)。
@@ -258,10 +270,11 @@ final class RelayAgent: NSObject, ObservableObject {
                 sendMessageRemove(sid: e.id, msgId: k)
                 lastSent[k] = nil
             }
-            // 变化的消息才推
-            for m in msgs {
+            // 变化的消息才推。ord = 逻辑顺序号(轮次×1000+轮内位置),手机据此排序渲染,
+            // 不受推送到达时序影响 —— 修复审批卡比它前面的文本先到达而排到文本上面的问题。
+            for (i, m) in msgs.enumerated() {
                 let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
-                                           "time": stamp(for: m.id)]
+                                           "time": stamp(for: m.id), "ord": turn * 1000 + i]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
@@ -272,6 +285,14 @@ final class RelayAgent: NSObject, ObservableObject {
                 ]))
             }
         }
+    }
+
+    /// 清除一个本机已不存在、但仍残留在服务端/手机上的「鬼会话」。
+    /// 用于:手机点结束一个本地 store 查无的 sid(多由 agent 进程重启、服务端旧快照造成)。
+    func purgeGhostSession(sid: String) {
+        sendSessionRemove(sid: sid)
+        for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
+        knownSids.remove(sid)
     }
 
     /// 删除整个会话(及其所有消息)。
@@ -322,7 +343,9 @@ final class RelayAgent: NSObject, ObservableObject {
         switch s {
         case .idle: return "idle"
         case .working: return "working"
-        case .waiting: return "waiting"
+        // 这里的 .waiting 是「非审批/非选择」的空闲等输入(Notification hook),映射成 suspended
+        // =「会话挂起」。真正需要你处理的审批/选择由 sessionMeta 的 isPending 单独覆盖成 "waiting"。
+        case .waiting: return "suspended"
         case .done: return "done"
         }
     }
@@ -662,7 +685,19 @@ final class RelayAgent: NSObject, ObservableObject {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let t = obj["t"] as? String
         if t == "pong" { lastPongAt = Date(); return }
-        if t == "auth_ok" { connState = .online; return }
+        if t == "auth_ok" {
+            connState = .online
+            // 确认成功上线 → 本次首连的 reset 已送达,以后网络重连不再 reset(保留历史)。
+            firstConnect = false
+            return
+        }
+        // 手机上线 → 服务端会向本机转发一条 client presence。电脑主动把当前所有任务
+        // **全量重推**一遍,补齐服务端快照可能的缺漏(服务端重启丢内存 / 早期断网漏同步)。
+        if t == "presence", let body = obj["body"] as? [String: Any],
+           (body["role"] as? String) == "client", (body["online"] as? Bool) == true {
+            forceResyncForClient()
+            return
+        }
         if t == "error", let body = obj["body"] as? [String: Any],
            (body["fatal"] as? Bool) == true {
             // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
