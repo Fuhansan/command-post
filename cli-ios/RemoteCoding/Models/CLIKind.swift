@@ -16,7 +16,7 @@ struct CLIKind: Identifiable {
         CLIKind(id: "claude", displayName: "Claude Code", launchCommand: "claude",
                 quickCommands: ["/clear", "/compact", "/cost", "/status", "/help", "/init", "/exit"]),
         CLIKind(id: "codex", displayName: "Codex", launchCommand: "codex",
-                quickCommands: ["/clear", "/compact", "/diff", "/status", "/quit"]),
+                quickCommands: ["/new", "/init", "/compact", "/diff", "/status", "/mcp"]),
     ]
 
     static func by(id: String) -> CLIKind? { all.first { $0.id == id } }
