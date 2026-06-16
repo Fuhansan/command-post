@@ -37,8 +37,12 @@ enum TerminalLauncher {
         // 关键:只补**装了该命令的那一个** node 版本的 bin(不是所有版本)——
         // 否则 PATH 里 node 版本错配,会让交互式 claude 的插件/LSP 子进程跑在
         // 错误 node 版本上而初始化失败、不写转录(手动启动时是单版本,所以正常)。
-        // 顺序:代理 → PATH → cd → 命令
-        let full = "\(proxyPart)export PATH=\"\(pathPrefix(forCommand: cmd))$PATH\"; \(cdPart)\(cmd)"
+        // 命令跑在 **tmux** 会话里(关键):VibeNotch 下发指令靠 `tmux send-keys` 直写 pty,
+        // 不再模拟键盘,所以锁屏 / 显示休眠也能注入。会话名 vn_<时间戳> 唯一;
+        // -A=没有则建。cd 在 tmux 之前执行,pane 即在该目录起。
+        // 顺序:代理 → PATH → cd → tmux 跑命令
+        let session = "vn_\(Int(Date().timeIntervalSince1970))"
+        let full = "\(proxyPart)export PATH=\"\(pathPrefix(forCommand: cmd))$PATH\"; \(cdPart)tmux new-session -A -s \(session) \(shellQuote(cmd))"
 
         let escaped = full
             .replacingOccurrences(of: "\\", with: "\\\\")

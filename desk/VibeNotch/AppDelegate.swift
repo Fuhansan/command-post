@@ -64,6 +64,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startIdleSweep()
         startLivenessSweep()
         setupRelayAgent()
+        startCaffeinate()
+    }
+
+    /// 防系统深度休眠 —— 否则锁屏后系统休眠会断 WS、停掉 tmux,远程就失联。
+    /// `caffeinate -i` 阻止「闲置导致的系统休眠」,`-w <pid>` 让它随 VibeNotch 一起退出。
+    private var caffeinate: Process?
+    private func startCaffeinate() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        p.arguments = ["-i", "-w", String(ProcessInfo.processInfo.processIdentifier)]
+        do { try p.run(); caffeinate = p; vlog("caffeinate 已启动(防系统休眠)") }
+        catch { vlog("caffeinate 启动失败: \(error.localizedDescription)") }
     }
 
     /// 快速清扫:每 5 秒检查各会话的 owner 进程是否还活着,移除已死的(终端被关/强杀、
@@ -148,7 +160,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
             self.pendingStore.cancel(sid: sid)   // 丢弃挂起的审批连接(若有)
             if let pid = entry.ownerPID {
-                kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
+                // 优先杀整个 tmux session(连同 pane 一起退);非 tmux 会话则 SIGTERM 进程
+                if TmuxBridge.killSession(forPid: pid) {
+                    vlog("relay close via tmux kill-session sid=\(sid.prefix(8))")
+                } else {
+                    kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
+                }
             } else {
                 // 不知道进程号(罕见)→ 直接移除会话,保证手机端也消失
                 self.store.removeSession(sessionId: sid)
@@ -156,13 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onRemoteInput = { [weak self] sid, text, imagePaths in
             guard let self else { return }
-            guard self.store.sessions.contains(where: { $0.id == sid }) else {
+            guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
                 vlog("relay input ignored: sid=\(sid.prefix(8)) unknown")
-                return
-            }
-            if !WindowActivator.isAccessibilityTrusted {
-                WindowActivator.requestAccessibilityIfNeeded()
-                vlog("relay input: AX not trusted — prompted, dropping input")
                 return
             }
             // 组装注入文本:用户文字 + 图片路径(claude 会自己读路径里的图)
@@ -174,15 +186,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
             }
             let message = parts.joined(separator: " ")
-            vlog("relay input sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
-            // 必须确认激活了目标终端窗口才打字,否则会敲进用户当前聚焦的任意应用
-            guard self.jumpToTerminal(sessionId: sid) else {
-                vlog("relay input dropped: terminal activation failed sid=\(sid.prefix(8))")
+            // tmux 注入:直写 pty,锁屏/显示休眠都能进(不再模拟键盘、不需激活窗口)
+            guard let pid = entry.ownerPID else {
+                vlog("relay input dropped: 无 ownerPID sid=\(sid.prefix(8))")
                 return
             }
-            // 等窗口激活、输入焦点就位后再打字
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                TerminalTyper.type(message)
+            if TmuxBridge.sendText(message, toPid: pid) {
+                vlog("relay input via tmux sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
+            } else {
+                vlog("relay input FAILED:会话不在 tmux 里(需用 tmux 跑)sid=\(sid.prefix(8)) pid=\(pid) tmux=\(TmuxBridge.isAvailable)")
             }
         }
         agent.onRemoteAnswer = { [weak self] sid, digits, isMulti, labels in
@@ -197,22 +209,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("relay answer via hook: sid=\(sid.prefix(8)) labels=\(labels)")
                 return
             }
-            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选注入数字键;
+            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选经 tmux 注入数字键;
             // 多选按键时序不可靠,不注入,提示在电脑完成
             guard !isMulti else {
                 vlog("relay answer dropped: 多选已放行到终端,不做按键注入 sid=\(sid.prefix(8))")
                 self.relayAgent?.questionAnswerFailed(sid: sid)   // 卡片提示改在电脑作答
                 return
             }
-            if !WindowActivator.isAccessibilityTrusted {
-                WindowActivator.requestAccessibilityIfNeeded()
-                return
-            }
-            guard self.jumpToTerminal(sessionId: sid) else { return }
-            if let d = digits.first {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    TerminalTyper.type(d, thenReturn: false)
-                }
+            guard let pid = entry.ownerPID, let d = digits.first else { return }
+            if TmuxBridge.sendDigit(d, toPid: pid) {
+                vlog("relay answer via tmux: sid=\(sid.prefix(8)) digit=\(d)")
+            } else {
+                vlog("relay answer FAILED:会话不在 tmux sid=\(sid.prefix(8))")
+                self.relayAgent?.questionAnswerFailed(sid: sid)
             }
         }
         agent.onRemoteAnswerLocal = { [weak self] sid in
