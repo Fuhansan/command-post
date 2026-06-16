@@ -6,6 +6,7 @@ struct RelaySession: Identifiable {
     let id: String              // sid
     var title: String           // 项目名(cwd 末段)
     var terminal: String        // 终端/IDE 名
+    var cli: String = ""        // CLI 类型 claude|codex|""(决定快捷指令集)
     var cwd: String             // 项目工作目录
     var subtitle: String        // prompt 摘要 / 当前活动
     var status: String          // idle | working | waiting | done | ended
@@ -259,6 +260,7 @@ final class RelayClient: ObservableObject {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
+            s.cli = meta["cli"]?.stringValue ?? s.cli
             s.cwd = meta["cwd"]?.stringValue ?? s.cwd
             s.subtitle = meta["subtitle"]?.stringValue ?? s.subtitle
             s.status = meta["status"]?.stringValue ?? s.status

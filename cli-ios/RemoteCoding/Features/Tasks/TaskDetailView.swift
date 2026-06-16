@@ -202,6 +202,7 @@ struct TaskDetailView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
+            quickCommandBar
             if !stagedImages.isEmpty { stagingStrip }
             HStack(spacing: 10) {
                 Menu {
@@ -256,6 +257,30 @@ struct TaskDetailView: View {
     }
 
     /// 暂存框:已选图片缩略图横排,可单张移除;发送时与文字合并为一条消息。
+    /// 快捷指令栏:按会话的 CLI 类型显示「直接执行型」斜杠指令,点一下直接发送。
+    @ViewBuilder
+    private var quickCommandBar: some View {
+        if let cmds = session.flatMap({ CLIKind.by(id: $0.cli) })?.quickCommands, !cmds.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(cmds, id: \.self) { cmd in
+                        Button { relay.sendInput(text: cmd, sessionId: sessionId) } label: {
+                            Text(cmd)
+                                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                .foregroundStyle(Theme.text)
+                                .padding(.horizontal, 12).padding(.vertical, 7)
+                                .background(Theme.cardHi)
+                                .overlay(Capsule().stroke(Theme.stroke))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+            }
+        }
+    }
+
     private var stagingStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {

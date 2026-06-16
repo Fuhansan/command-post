@@ -27,8 +27,7 @@ enum SessionStatusUI {
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
     @State private var showLaunch = false
-    @State private var launchCmd = "claude"
-    @State private var launched = false
+    @State private var launchedId: String? = nil   // 已点击启动的 CLI id(展示「已发送」)
 
     var body: some View {
         NavigationStack {
@@ -77,7 +76,7 @@ struct TasksView: View {
             Spacer()
             // 新建会话:电脑端开一个终端跑命令
             Button {
-                launchCmd = "claude"; launched = false; showLaunch = true
+                launchedId = nil; showLaunch = true
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
@@ -88,38 +87,39 @@ struct TasksView: View {
         }
     }
 
-    /// 新建会话弹层:在电脑上开一个 Terminal.app 跑命令(默认 claude)。
+    /// 新建会话弹层:选一个 coding 工具,电脑端在默认目录起一个会话(选项而非手输命令)。
     private var launchSheet: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             VStack(alignment: .leading, spacing: 14) {
-                Text("在电脑上新建会话").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
-                Text("电脑会打开一个终端窗口运行下面的命令。想进某个项目就带上 cd,例如:\ncd ~/proj && claude")
+                Text("新建会话").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
+                Text("选择要启动的工具,电脑端会打开一个会话(工作目录 / 代理在 VibeNotch 设置里配置)。")
                     .font(.system(size: 13)).foregroundStyle(Theme.textSec)
-                TextField("", text: $launchCmd, prompt: Text("要运行的命令").foregroundColor(Theme.textTer), axis: .vertical)
-                    .font(.system(size: 15, design: .monospaced)).foregroundStyle(Theme.text)
-                    .autocorrectionDisabled().textInputAutocapitalization(.never)
-                    .lineLimit(1...4)
-                    .padding(12).background(Theme.field)
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                Button {
-                    relay.launchCommand(launchCmd)
-                    launched = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { showLaunch = false }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: launched ? "checkmark.circle.fill" : "play.fill")
-                        Text(launched ? "已发送,等终端启动…" : "在电脑上运行")
-                            .font(.system(size: 16, weight: .semibold))
+                ForEach(CLIKind.all) { cli in
+                    Button {
+                        relay.launchCommand(cli.launchCommand)
+                        launchedId = cli.id
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { showLaunch = false }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: launchedId == cli.id ? "checkmark.circle.fill" : "terminal")
+                                .font(.system(size: 18))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(cli.displayName).font(.system(size: 16, weight: .semibold))
+                                Text(cli.launchCommand).font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.7))
+                            }
+                            Spacer()
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.vertical, 13).padding(.horizontal, 16)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(launchedId == cli.id ? Theme.green : Theme.blueBtn)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
-                    .foregroundStyle(.white).frame(maxWidth: .infinity).padding(.vertical, 13)
-                    .background(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty ? Theme.cardHi
-                                : (launched ? Theme.green : Theme.blueBtn))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .buttonStyle(.plain)
+                    .disabled(launchedId != nil)
                 }
-                .buttonStyle(.plain)
-                .disabled(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty || launched)
                 Spacer()
             }
             .padding(24)

@@ -302,12 +302,15 @@ final class RelayAgent: NSObject, ObservableObject {
         let base = (cwd as NSString).lastPathComponent
         // 标题优先用项目名(cwd 末段);取不到再退回终端名。
         let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
+        // CLI 类型(claude/codex…),由转录路径判定 —— 手机据此显示对应的快捷指令。
+        let cli = e.transcriptPath.flatMap { CodingAgents.forTranscript($0)?.id } ?? ""
         return [
             "pendingKind": pendingKind,            // perm=待审批(可批量) question=待选择(逐个)
             "pendingDetail": cap(pendingDetail, 160),
             "agent": Self.deviceId,                // 来自哪台电脑
             "title": project,                     // 项目名(主标题)
             "terminal": e.terminal.displayName,    // 终端 / IDE
+            "cli": cli,                            // claude | codex |(空=未知)
             "cwd": cwd,                            // 项目工作目录
             "subtitle": subtitle,
             "status": isPending ? "waiting" : statusKey(e.state),
