@@ -186,16 +186,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
             }
             let message = parts.joined(separator: " ")
-            // tmux 注入:直写 pty,锁屏/显示休眠都能进(不再模拟键盘、不需激活窗口)
-            guard let pid = entry.ownerPID else {
-                vlog("relay input dropped: 无 ownerPID sid=\(sid.prefix(8))")
+            // ① tmux 优先:直写 pty,锁屏/显示休眠都能进
+            if let pid = entry.ownerPID, TmuxBridge.sendText(message, toPid: pid) {
+                vlog("relay input via tmux sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
                 return
             }
-            if TmuxBridge.sendText(message, toPid: pid) {
-                vlog("relay input via tmux sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
-            } else {
-                vlog("relay input FAILED:会话不在 tmux 里(需用 tmux 跑)sid=\(sid.prefix(8)) pid=\(pid) tmux=\(TmuxBridge.isAvailable)")
+            // ② GUI 回退:模拟键盘(非 tmux 会话用;**仅未锁屏可用,锁屏无效**)
+            guard WindowActivator.isAccessibilityTrusted else {
+                WindowActivator.requestAccessibilityIfNeeded()
+                vlog("relay input: AX 未授权,丢弃 sid=\(sid.prefix(8))")
+                return
             }
+            guard self.jumpToTerminal(sessionId: sid) else {
+                vlog("relay input GUI 回退失败:终端激活失败(可能锁屏)sid=\(sid.prefix(8))")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(message)
+            }
+            vlog("relay input via GUI 回退 sid=\(sid.prefix(8)) len=\(message.count)")
         }
         agent.onRemoteAnswer = { [weak self] sid, digits, isMulti, labels in
             guard let self else { return }
@@ -216,13 +225,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.relayAgent?.questionAnswerFailed(sid: sid)   // 卡片提示改在电脑作答
                 return
             }
-            guard let pid = entry.ownerPID, let d = digits.first else { return }
-            if TmuxBridge.sendDigit(d, toPid: pid) {
+            guard let d = digits.first else { return }
+            // ① tmux 优先
+            if let pid = entry.ownerPID, TmuxBridge.sendDigit(d, toPid: pid) {
                 vlog("relay answer via tmux: sid=\(sid.prefix(8)) digit=\(d)")
-            } else {
-                vlog("relay answer FAILED:会话不在 tmux sid=\(sid.prefix(8))")
-                self.relayAgent?.questionAnswerFailed(sid: sid)
+                return
             }
+            // ② GUI 回退(模拟数字键,仅未锁屏)
+            guard WindowActivator.isAccessibilityTrusted else {
+                WindowActivator.requestAccessibilityIfNeeded(); return
+            }
+            guard self.jumpToTerminal(sessionId: sid) else {
+                self.relayAgent?.questionAnswerFailed(sid: sid); return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(d, thenReturn: false)
+            }
+            vlog("relay answer via GUI 回退: sid=\(sid.prefix(8)) digit=\(d)")
         }
         agent.onRemoteAnswerLocal = { [weak self] sid in
             guard let self else { return }
