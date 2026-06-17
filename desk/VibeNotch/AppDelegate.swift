@@ -256,6 +256,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay launch → stream-json 控制台会话: \(command) workdir=\(dir)")
             self.agentManager.newSession(agent: kind, workdir: dir)
         }
+        agent.onRemoteConsoleOpen = { [weak self] workdir, resumeId, continueLast in
+            guard let self else { return }
+            vlog("relay console open: \(workdir) resume=\(resumeId?.prefix(8) ?? "-") cont=\(continueLast)")
+            self.agentManager.newSession(agent: .claude, workdir: workdir,
+                                         resume: resumeId, continueLast: continueLast)
+        }
         agent.agentManager = agentManager   // 控制台(stream-json)会话也桥接到手机(start 内订阅)
         agent.start()
         relayAgent = agent

@@ -134,16 +134,11 @@ final class AgentSessionManager: ObservableObject {
     }
 
     /// VibeNotch 启动时调:读落盘,用 --resume 把上次的控制台会话重建回来。
+    /// 启动只恢复**项目列表**(左侧)。会话**不自动 spawn** —— 由用户点项目选「继续最近(--continue)
+    /// / 从历史恢复(--resume)」再开。否则一启动就把上次所有会话拉起、手机也立刻收到,与「项目
+    /// 为中心」的设计冲突(用户反馈:没点开始就创建了会话)。
     func restoreSessions() {
-        loadProjects()   // 先恢复左侧项目列表
-        guard let data = try? Data(contentsOf: Self.persistURL),
-              let items = try? JSONDecoder().decode([Persisted].self, from: data) else { return }
-        for p in items where !sessions.contains(where: { $0.id == p.id }) {
-            let kind = AgentKind(rawValue: p.agent) ?? .claude
-            vlog("console restore: 恢复会话 \(p.title) (--resume \(p.resumeId?.prefix(8) ?? "-"))")
-            newSession(agent: kind, workdir: p.workdir, resume: p.resumeId, restoreId: p.id)
-            // 历史在拿到 session_id 时统一加载(见 apply(.sessionId))。
-        }
+        loadProjects()
     }
 
     /// 后台读 claude 转录(~/.claude/projects/<目录>/<id>.jsonl)重建历史消息,回主线程填入。

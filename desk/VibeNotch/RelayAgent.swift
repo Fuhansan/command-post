@@ -52,6 +52,9 @@ final class RelayAgent: NSObject, ObservableObject {
     var onRemoteAnswerLocal: ((String) -> Void)?
     /// 手机请求新建会话:打开 Terminal.app 运行命令(如 `claude`)。
     var onRemoteLaunch: ((String) -> Void)?
+    /// 手机从「打开项目」选了某项目的会话方式 → 电脑在该目录开 stream-json 会话。
+    /// (workdir, resumeId?, continueLast)
+    var onRemoteConsoleOpen: ((String, String?, Bool) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -139,6 +142,9 @@ final class RelayAgent: NSObject, ObservableObject {
             mgr.$sessions
                 .sink { [weak self] _ in Task { @MainActor in self?.syncConsole() } }
                 .store(in: &cancellables)
+            mgr.$projects
+                .sink { [weak self] _ in Task { @MainActor in self?.syncProjects() } }
+                .store(in: &cancellables)
         }
         connect()
     }
@@ -180,7 +186,10 @@ final class RelayAgent: NSObject, ObservableObject {
         if firstConnect {
             sendReset()
         }
+        lastSentConsole.removeAll()
         syncToServer()   // 连上后补发当前所有会话
+        syncConsole()    // 控制台会话
+        syncProjects()   // 「打开项目」列表
     }
 
     /// 手机上线 → 把当前所有会话**全量重推**(清 lastSent 让 syncToServer 不走去重、整体重发一遍),
@@ -353,6 +362,51 @@ final class RelayAgent: NSObject, ObservableObject {
                                  "from": "agent", "fallbackText": m.fallback, "body": body]))
             }
         }
+    }
+
+    /// 把电脑已打开的项目列表翻成一个「打开项目」ui 消息推手机:每项目一张卡(继续最近/全新/
+    /// 历史恢复按钮)。手机点按钮 → console_* action 回电脑开会话。手机端不用改,复用现有协议。
+    private func syncProjects() {
+        guard let mgr = agentManager else { return }
+        let sid = "console:projects"
+        let mid = "m:\(sid):list"
+        var cards: [[String: Any]] = []
+        for proj in mgr.projects {
+            let name = (proj as NSString).lastPathComponent
+            var kids: [[String: Any]] = [text(proj, color: "secondary", style: "caption")]
+            kids.append(["type": "button_group", "props": ["buttons": [
+                button(label: "继续最近", style: "danger", actionId: "console_continue", value: proj),
+                button(label: "全新", style: "default", actionId: "console_new", value: proj)
+            ]]])
+            let hist = AgentSessionManager.listHistory(workdir: proj, limit: 5)
+            if !hist.isEmpty {
+                kids.append(text("从历史恢复:", color: "secondary", style: "caption"))
+                for h in hist {
+                    kids.append(["type": "button_group", "props": ["buttons": [
+                        button(label: "↩︎ \(h.label)", style: "default",
+                               actionId: "console_resume", value: "\(proj)\u{1}\(h.id)")
+                    ]]])
+                }
+            }
+            cards.append(card(title: name, icon: "folder.fill", style: "default", children: kids))
+        }
+        let root: [String: Any] = cards.isEmpty
+            ? bubble(role: "agent", "电脑端还没打开项目。在电脑 VibeNotch「打开项目」后,这里就能选项目开会话。")
+            : ["type": "stack", "props": ["spacing": 10], "children": cards]
+        let meta: [String: Any] = [
+            "title": "📁 打开项目", "terminal": "控制台", "cli": "claude", "cwd": "",
+            "subtitle": "选项目开会话", "status": "idle", "needsAction": false,
+            "pendingKind": "", "pendingDetail": "", "agent": Self.deviceId
+        ]
+        let body: [String: Any] = ["role": "agent", "session": meta, "root": root,
+                                   "time": stamp(for: mid), "ord": 0]
+        let sig = jsonString(body)
+        guard lastSentConsole[mid] != sig else { return }
+        lastSentConsole[mid] = sig
+        knownConsoleSids.insert(sid)
+        seq += 1
+        send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": sid, "seq": seq,
+                         "from": "agent", "fallbackText": "打开项目", "body": body]))
     }
 
     private func consoleMessages(_ s: AgentSession)
@@ -876,6 +930,17 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         guard let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
+        // 手机从「打开项目」卡片选了会话方式 → 电脑在该目录开 stream-json 会话。
+        if actionId == "console_continue" || actionId == "console_new" || actionId == "console_resume" {
+            let value = body["value"] as? String ?? ""
+            if actionId == "console_resume" {
+                let parts = value.components(separatedBy: "\u{1}")
+                if parts.count == 2 { onRemoteConsoleOpen?(parts[0], parts[1], false) }
+            } else {
+                onRemoteConsoleOpen?(value, nil, actionId == "console_continue")
+            }
+            return
+        }
         // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)
         if actionId == "question_answer" {
             guard let sid = obj["sid"] as? String,
