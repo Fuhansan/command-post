@@ -33,7 +33,8 @@ struct TaskDetailView: View {
                 GeometryReader { geo in
                     ScrollViewReader { proxy in
                         ScrollView {
-                            VStack(spacing: 14) {
+                            // LazyVStack:长会话只构建/渲染可见消息行,避免一次性建出全部气泡导致卡顿。
+                            LazyVStack(spacing: 14) {
                                 sessionHeader
                                 if !orderedMessages.isEmpty {
                                     ForEach(orderedMessages) { msg in
