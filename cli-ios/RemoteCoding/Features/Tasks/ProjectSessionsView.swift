@@ -3,15 +3,17 @@ import SwiftUI
 /// 项目导航路由(与「会话 id = String」区分,避免 NavigationStack 目标类型冲突)。
 struct ProjectRoute: Hashable { let workdir: String }
 
-/// 首页「项目区」一行:项目名 + 目录 + 进行中会话数 / 待处理。
+/// 会话导航(项目内点历史卡片 → resume 后程序化进入用)。
+struct SessionRoute: Hashable, Identifiable { var id: String { sid }; let sid: String }
+
+/// 首页「项目」一行:项目名 + 目录 + 会话数 / 待处理。
 struct ProjectRow: View {
     let project: ProjectInfo
     let sessions: [RelaySession]
 
-    private var active: [RelaySession] {
-        sessions.filter { $0.source == "console" && $0.cwd == project.workdir }
-    }
-    private var needsAction: Bool { active.contains { $0.needsAction } }
+    // 该目录下的会话(console + 折叠进来的手动会话,都算)。
+    private var inProject: [RelaySession] { sessions.filter { $0.cwd == project.workdir } }
+    private var needsAction: Bool { inProject.contains { $0.needsAction } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -35,7 +37,7 @@ struct ProjectRow: View {
                 Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textTer)
             }
             HStack(spacing: 8) {
-                Label("\(active.count) 个会话", systemImage: "bubble.left.and.bubble.right")
+                Label("\(inProject.count) 进行中", systemImage: "bubble.left.and.bubble.right")
                     .font(.system(size: 12)).foregroundStyle(Theme.textSec)
                 if !project.history.isEmpty {
                     Text("·").foregroundStyle(Theme.textTer)
@@ -48,70 +50,64 @@ struct ProjectRow: View {
     }
 }
 
-/// 屏:项目内会话列表。上=进行中的会话(点开进对话);下=新建(继续最近 / 全新 / 从历史恢复)。
+/// 屏:项目内会话列表。统一卡片:进行中的会话 + 可恢复的历史会话。点卡片即进入(历史先 resume 再进)。
 struct ProjectSessionsView: View {
     let workdir: String
     @EnvironmentObject private var relay: RelayClient
     @Environment(\.dismiss) private var dismiss
-    @State private var requested = false   // 已请求开会话 → 给个反馈
+    @State private var awaitingSids: Set<String>? = nil   // 开会话时快照已有 sid,等新会话出现再进入
+    @State private var route: SessionRoute? = nil
 
     private var project: ProjectInfo? { relay.projects.first { $0.workdir == workdir } }
-    private var active: [RelaySession] {
-        relay.sessions.filter { $0.source == "console" && $0.cwd == workdir }
-    }
     private var name: String { project?.name ?? (workdir as NSString).lastPathComponent }
+
+    /// 进行中的会话(该目录下,console + 折叠进来的手动会话)。
+    private var active: [RelaySession] { relay.sessions.filter { $0.cwd == workdir } }
+    /// 可恢复的历史(排除当前已在跑的 claude 会话,避免和「进行中」重复)。
+    private var dormant: [ProjectHistory] {
+        let liveIds = Set(active.map { $0.agentSessionId }.filter { !$0.isEmpty })
+        return (project?.history ?? []).filter { !liveIds.contains($0.id) }
+    }
+    /// onChange 监听键:进行中会话集合变化时用它判断新会话是否到位。
+    private var activeKey: String { active.map { $0.id }.sorted().joined(separator: ",") }
 
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 12) {
                     navBar
-                    if !active.isEmpty {
-                        sectionTitle("进行中")
-                        ForEach(active) { s in
-                            NavigationLink(value: s.id) { SessionCard(session: s) }.buttonStyle(.plain)
-                        }
+                    if awaitingSids != nil {
+                        Label("正在打开会话…", systemImage: "hourglass")
+                            .font(.system(size: 13)).foregroundStyle(Theme.textSec)
                     }
-                    sectionTitle("新建会话")
-                    if requested {
-                        Text("已请求,新会话会出现在上面「进行中」。")
-                            .font(.system(size: 13)).foregroundStyle(Theme.green)
+                    if active.isEmpty && dormant.isEmpty {
+                        Text("这个项目还没有会话。点右上角「+」开一个全新会话。")
+                            .font(.system(size: 13)).foregroundStyle(Theme.textSec)
+                            .padding(.vertical, 24).frame(maxWidth: .infinity)
                     }
-                    HStack(spacing: 10) {
-                        startButton("继续最近", icon: "clock.arrow.circlepath", primary: true) {
-                            relay.consoleContinue(workdir: workdir); requested = true
-                        }
-                        startButton("全新会话", icon: "plus.bubble", primary: false) {
-                            relay.consoleNewSession(workdir: workdir); requested = true
-                        }
+                    // 进行中:点开即进对话
+                    ForEach(active) { s in
+                        NavigationLink(value: s.id) { SessionCard(session: s) }.buttonStyle(.plain)
                     }
-                    if let history = project?.history, !history.isEmpty {
-                        sectionTitle("从历史恢复")
-                        ForEach(history) { h in
-                            Button {
-                                relay.consoleResume(workdir: workdir, historyId: h.id); requested = true
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "arrow.uturn.backward").font(.system(size: 12))
-                                    Text(h.label).font(.system(size: 13)).lineLimit(1)
-                                    Spacer()
-                                }
-                                .foregroundStyle(Theme.text)
-                                .padding(.vertical, 12).padding(.horizontal, 14)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .cardStyle(stroke: Theme.stroke)
-                            }
-                            .buttonStyle(.plain)
-                        }
+                    // 历史:点卡片 → resume → 程序化进入
+                    ForEach(dormant) { h in
+                        Button { openHistory(h) } label: { HistoryCard(history: h) }.buttonStyle(.plain)
                     }
-                    Spacer(minLength: 12)
+                    Spacer(minLength: 8)
                 }
                 .padding(16)
             }
         }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
+        // 历史 resume / 全新:等新会话出现后程序化进入。
+        .navigationDestination(item: $route) { TaskDetailView(sessionId: $0.sid) }
+        .onChange(of: activeKey) { _, _ in
+            guard let snap = awaitingSids, let fresh = active.first(where: { !snap.contains($0.id) }) else { return }
+            awaitingSids = nil
+            route = SessionRoute(sid: fresh.id)
+        }
     }
 
     private var navBar: some View {
@@ -125,25 +121,40 @@ struct ProjectSessionsView: View {
                     .foregroundStyle(Theme.textSec).lineLimit(1).truncationMode(.head)
             }
             Spacer()
-        }
-    }
-
-    private func sectionTitle(_ t: String) -> some View {
-        Text(t).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textSec)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func startButton(_ title: String, icon: String, primary: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 14))
-                Text(title).font(.system(size: 14, weight: .semibold))
+            Button { startFresh() } label: {
+                Image(systemName: "plus").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
+                    .frame(width: 36, height: 36).background(Theme.blueBtn).clipShape(Circle())
             }
-            .foregroundStyle(.white)
-            .padding(.vertical, 12).frame(maxWidth: .infinity)
-            .background(primary ? Theme.blueBtn : Theme.purple)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
         }
-        .buttonStyle(.plain)
+    }
+
+    // MARK: - 动作
+
+    private func startFresh() {
+        awaitingSids = Set(active.map { $0.id })
+        relay.consoleNewSession(workdir: workdir)
+    }
+    private func openHistory(_ h: ProjectHistory) {
+        awaitingSids = Set(active.map { $0.id })
+        relay.consoleResume(workdir: workdir, historyId: h.id)
+    }
+}
+
+/// 历史会话卡片:与首页/进行中卡片同款框样式,点按恢复。
+struct HistoryCard: View {
+    let history: ProjectHistory
+    var body: some View {
+        HStack(spacing: 12) {
+            Avatar(letter: "↩", color: Theme.textTer)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(history.label).font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Theme.text).lineLimit(1)
+                Text("历史会话 · 点按恢复").font(.system(size: 12)).foregroundStyle(Theme.textSec)
+            }
+            Spacer()
+            Image(systemName: "arrow.uturn.backward").font(.system(size: 13)).foregroundStyle(Theme.textTer)
+        }
+        .padding(16)
+        .cardStyle(stroke: Theme.stroke)
     }
 }

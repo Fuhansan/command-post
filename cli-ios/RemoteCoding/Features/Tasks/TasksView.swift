@@ -29,34 +29,32 @@ enum SessionStatusUI {
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
 
-    /// 手动会话(用户自己敲的 claude):平铺首页,带「锁屏不可控」标签。
-    private var manualSessions: [RelaySession] { relay.sessions.filter { $0.isManual } }
+    /// 单任务 = 手动敲的 claude 且 cwd 不属于任何已打开项目。属于项目的折叠进项目卡片,不重复。
+    private var singleTasks: [RelaySession] {
+        let projectDirs = Set(relay.projects.map { $0.workdir })
+        return relay.sessions.filter { $0.isManual && !projectDirs.contains($0.cwd) }
+    }
 
     var body: some View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
                 ScrollView {
-                    VStack(spacing: 16) {
+                    // 一个统一列表:项目卡片(可下钻)+ 单任务卡片(手动会话),不分区。
+                    VStack(spacing: 12) {
                         header
-                        if relay.projects.isEmpty && manualSessions.isEmpty {
+                        if relay.projects.isEmpty && singleTasks.isEmpty {
                             emptyState
                         } else {
-                            if !relay.projects.isEmpty {
-                                sectionTitle("项目", count: relay.projects.count)
-                                ForEach(relay.projects) { proj in
-                                    NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
-                                        ProjectRow(project: proj, sessions: relay.sessions)
-                                    }
-                                    .buttonStyle(.plain)
+                            ForEach(relay.projects) { proj in
+                                NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
+                                    ProjectRow(project: proj, sessions: relay.sessions)
                                 }
+                                .buttonStyle(.plain)
                             }
-                            if !manualSessions.isEmpty {
-                                sectionTitle("手动会话", count: manualSessions.count)
-                                ForEach(manualSessions) { s in
-                                    NavigationLink(value: s.id) { SessionCard(session: s) }
-                                        .buttonStyle(.plain)
-                                }
+                            ForEach(singleTasks) { s in
+                                NavigationLink(value: s.id) { SessionCard(session: s) }
+                                    .buttonStyle(.plain)
                             }
                         }
                     }
@@ -75,14 +73,6 @@ struct TasksView: View {
                 ProjectSessionsView(workdir: route.workdir)
             }
             .toolbar(.hidden, for: .navigationBar)
-        }
-    }
-
-    private func sectionTitle(_ t: String, count: Int) -> some View {
-        HStack(spacing: 6) {
-            Text(t).font(.system(size: 14, weight: .bold)).foregroundStyle(Theme.text)
-            Text("\(count)").font(.system(size: 13)).foregroundStyle(Theme.textSec)
-            Spacer()
         }
     }
 

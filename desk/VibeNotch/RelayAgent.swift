@@ -476,6 +476,7 @@ final class RelayAgent: NSObject, ObservableObject {
             "agent": Self.deviceId,
             "source": "console",          // VibeNotch 起的项目会话 → 手机按项目归类
             "project": s.workdir,         // 所属项目(工作目录)
+            "claudeId": s.agentSessionId ?? "",   // claude session_id:项目内去重历史/定位进入
             "title": s.title,
             "terminal": "控制台",
             "cli": s.agent.rawValue,

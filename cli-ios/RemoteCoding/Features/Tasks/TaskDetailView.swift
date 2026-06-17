@@ -68,6 +68,17 @@ struct TaskDetailView: View {
                                 proxy.scrollTo("typing", anchor: .bottom)
                             }
                         }
+                        // 进入即「瞬间」落底:延到布局完成后无动画跳到最后一条,
+                        // 不再肉眼可见地从顶部滚到底部(长会话尤其明显)。
+                        .onAppear {
+                            DispatchQueue.main.async {
+                                if session?.status == "working" {
+                                    proxy.scrollTo("typing", anchor: .bottom)
+                                } else if let last = orderedMessages.last {
+                                    proxy.scrollTo(last.id, anchor: .bottom)
+                                }
+                            }
+                        }
                     }
                 }
                 inputBar

@@ -15,6 +15,7 @@ struct RelaySession: Identifiable {
     var pendingDetail: String   // 待办摘要(命令 / 题目)
     var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
     var source: String = ""     // console=VibeNotch 项目会话 | hook=用户手动敲的(锁屏不可控)
+    var agentSessionId: String = ""   // claude session_id(项目内去重历史 / 定位进入)
     var messages: [UIMessage]   // 该会话的下行富消息
 
     var isManual: Bool { source == "hook" }   // 手动会话:平铺首页 + 打「锁屏不可控」标签
@@ -271,6 +272,7 @@ final class RelayClient: ObservableObject {
         if let meta {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
             s.source = meta["source"]?.stringValue ?? s.source
+            s.agentSessionId = meta["claudeId"]?.stringValue ?? s.agentSessionId
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
             s.cli = meta["cli"]?.stringValue ?? s.cli
