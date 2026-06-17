@@ -13,6 +13,7 @@ struct TaskDetailView: View {
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showLibrary = false
     @State private var showCamera = false
+    @State private var loadingMore = false   // 顶部滚动加载更早:防重复触发
 
     private var session: RelaySession? { relay.session(id: sessionId) }
 
@@ -37,11 +38,17 @@ struct TaskDetailView: View {
                             LazyVStack(spacing: 14) {
                                 sessionHeader
                                 if session?.hasMore == true {
-                                    Button { relay.loadMoreMessages(sessionId: sessionId) } label: {
-                                        Label("加载更早消息", systemImage: "arrow.up.circle")
-                                            .font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.blue)
+                                    // 微信式:滚到顶部这一行自动出现 → 触发加载更早 + 转圈,不用点按钮。
+                                    HStack(spacing: 8) {
+                                        ProgressView().scaleEffect(0.8)
+                                        Text("加载更早消息…").font(.system(size: 12)).foregroundStyle(Theme.textSec)
                                     }
-                                    .padding(.vertical, 4)
+                                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+                                    .onAppear {
+                                        guard !loadingMore else { return }
+                                        loadingMore = true
+                                        relay.loadMoreMessages(sessionId: sessionId)
+                                    }
                                 }
                                 if !orderedMessages.isEmpty {
                                     ForEach(orderedMessages) { msg in
@@ -72,6 +79,8 @@ struct TaskDetailView: View {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
+                        // 更早的一批到了(顶部消息变了)→ 解锁,可再次滚顶加载下一批。
+                        .onChange(of: orderedMessages.first?.id) { _, _ in loadingMore = false }
                         .onChange(of: session?.status ?? "") { _, st in
                             if st == "working" {
                                 proxy.scrollTo("typing", anchor: .bottom)

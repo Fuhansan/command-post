@@ -393,6 +393,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let tool = event.toolName,
            PolicyConstants.dangerousTools.contains(tool),
            let sid = event.sessionId {
+            // 安全只读命令(cd/ls/pwd/cat/grep…)全局自动放行,不打扰用户。
+            if tool == "Bash", PolicyConstants.isSafeBashCommand(event.toolInput?.command ?? "") {
+                vlog("auto-allow safe bash: sid=\(sid.prefix(8))")
+                _ = conn.respond(json: PermissionDecision.allow.hookOutput)
+                return
+            }
             vlog("pending permission: sid=\(sid.prefix(8)) tool=\(tool)")
             pendingStore.add(sid: sid, conn: conn)
         } else if event.hookEventName == "PreToolUse",

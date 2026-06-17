@@ -343,6 +343,8 @@ final class AgentSessionManager: ObservableObject {
             decide(.allow)   // 放行,让 stream 里的 tool_use→tool_result 处理交互
         } else if PolicyConstants.readOnlyTools.contains(toolName) {
             decide(.allow)   // 只读/安全工具直接放行,不弹审批(Read/Grep 等不打断)
+        } else if toolName == "Bash", PolicyConstants.isSafeBashCommand(detail) {
+            decide(.allow)   // 安全只读命令(cd/ls/pwd/cat/grep…)全局自动放行
         } else {
             driver.injectPermission(toolName: toolName, detail: detail, decide: decide)
         }

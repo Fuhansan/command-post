@@ -100,7 +100,10 @@ final class SessionStore: ObservableObject {
                     return Date()
                 }()
                 entry?.toolDetail = formatToolDetail(name: event.toolName, input: event.toolInput)
-                if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool) {
+                // 安全只读 Bash(cd/ls…)自动放行,不进等待态(否则会误标「需处理」)。
+                let safeBash = event.toolName == "Bash"
+                    && PolicyConstants.isSafeBashCommand(event.toolInput?.command ?? "")
+                if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool), !safeBash {
                     entry?.state = .waiting(message: "Run \(tool)?")
                 } else if event.toolName == "AskUserQuestion" {
                     // TUI 选择题:进入等待 + 保留题目结构(刘海/手机渲染交互卡)
