@@ -107,9 +107,10 @@ struct CodeRenderer: View {
                     }
                 }
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(code).font(.system(.footnote, design: .monospaced)).foregroundStyle(Theme.text)
-            }
+            // 自动换行显示完整命令(不再横向滚动只露开头)—— 审批时能一眼看清整条命令。
+            Text(code).font(.system(.footnote, design: .monospaced)).foregroundStyle(Theme.text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
