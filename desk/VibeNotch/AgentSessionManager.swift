@@ -33,6 +33,12 @@ struct AgentSession: Identifiable, Equatable {
     }
 }
 
+/// 历史会话条目(供「从历史恢复」列表)。
+struct HistoryEntry: Identifiable, Equatable {
+    let id: String       // claude session_id(= 转录文件名)
+    let label: String    // 首句,做标签
+}
+
 // MARK: - 会话管理器
 
 /// 多会话宿主:每会话一个 `AgentDriver` 子进程,消费其事件流更新统一模型。
@@ -48,6 +54,26 @@ final class AgentSessionManager: ObservableObject {
     }
     private var managed: [String: Managed] = [:]
     private var ordCounter = 0
+
+    /// 历史列表缓存(按项目)。解析转录较重,缓存避免每次切项目/重渲染都重算。
+    @Published private(set) var historyByProject: [String: [HistoryEntry]] = [:]
+    private var historyLoading: Set<String> = []
+
+    /// 异步加载某项目历史(off-main 解析,回主线程填缓存)。已缓存且非强制则跳过,保证切项目秒开。
+    func loadHistoryList(for workdir: String, force: Bool = false) {
+        if !force && historyByProject[workdir] != nil { return }
+        if historyLoading.contains(workdir) { return }
+        historyLoading.insert(workdir)
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let items = Self.listHistory(workdir: workdir)
+            await MainActor.run {
+                self?.historyByProject[workdir] = items
+                self?.historyLoading.remove(workdir)
+            }
+        }
+    }
+    /// 让某项目历史失效(会话结束/新建会改变转录),下次访问重算。
+    private func invalidateHistory(_ workdir: String) { historyByProject[workdir] = nil }
 
     /// 已打开的项目(工作目录)列表,新→旧,持久化。左侧以项目为中心。
     @Published private(set) var projects: [String] = []
@@ -97,6 +123,7 @@ final class AgentSessionManager: ObservableObject {
     func newSession(agent: AgentKind, workdir: String, resume: String? = nil,
                     continueLast: Bool = false, restoreId: String? = nil) -> String {
         let sid = restoreId ?? "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
+        vlog("console new: workdir=\((workdir as NSString).lastPathComponent) resume=\(resume ?? "-") cont=\(continueLast) sid=\(sid)")
         if !projects.contains(workdir) { projects.append(workdir); persistProjects() }
         let driver = makeDriver(agent)
         let title = (workdir as NSString).lastPathComponent
@@ -113,47 +140,47 @@ final class AgentSessionManager: ObservableObject {
             do { try await driver.start(workdir: workdir, resume: resume, continueLast: continueLast) }
             catch { await self.apply(.error("启动失败: \(error)"), to: sid) }
         }
-        persist()
+        // 历史回填:不依赖 init —— claude 在 stream-json 下要等首条输入才吐 init,
+        // 但恢复/继续时我们已知 id(resume),或可取本目录最近转录(continue),直接读历史显示。
+        let historyId = resume ?? (continueLast ? Self.listHistory(workdir: workdir, limit: 1).first?.id : nil)
+        if let historyId { loadHistory(sessionId: historyId, into: sid) }
         return sid
     }
 
-    // MARK: - 崩溃/重启恢复(B):落盘会话 + 启动时 --resume 重建
+    // MARK: - 恢复:启动只恢复项目列表;会话由用户在项目里选 continue/resume 再开
 
-    private struct Persisted: Codable { let id, agent, workdir, title: String; var resumeId: String? }
-    private static let persistURL = URL(fileURLWithPath:
-        NSString(string: "~/.vibenotch/console-sessions.json").expandingTildeInPath)
-
-    /// 把当前**已拿到 claude session_id**(可 --resume)的控制台会话落盘。
-    private func persist() {
-        let items = sessions.compactMap { s -> Persisted? in
-            guard let rid = s.agentSessionId, !rid.isEmpty else { return nil }
-            return Persisted(id: s.id, agent: s.agent.rawValue, workdir: s.workdir, title: s.title, resumeId: rid)
-        }
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: Self.persistURL, options: .atomic)
-    }
-
-    /// VibeNotch 启动时调:读落盘,用 --resume 把上次的控制台会话重建回来。
-    /// 启动只恢复**项目列表**(左侧)。会话**不自动 spawn** —— 由用户点项目选「继续最近(--continue)
-    /// / 从历史恢复(--resume)」再开。否则一启动就把上次所有会话拉起、手机也立刻收到,与「项目
-    /// 为中心」的设计冲突(用户反馈:没点开始就创建了会话)。
     func restoreSessions() {
         loadProjects()
     }
 
     /// 后台读 claude 转录(~/.claude/projects/<目录>/<id>.jsonl)重建历史消息,回主线程填入。
-    /// --resume 不重放历史,所以恢复后靠这个把之前的对话显示回来。
-    private func loadHistory(sessionId: String, into sid: String) {
+    /// resume/continue 不重放历史,所以靠这个把之前的对话显示回来。
+    private func loadHistory(sessionId: String, into sid: String, attempt: Int = 0) {
         Task.detached(priority: .utility) { [weak self] in
+            let found = Self.findTranscript(sessionId: sessionId)
             let items = Self.parseTranscript(sessionId: sessionId)
-            guard !items.isEmpty else { return }
-            await MainActor.run { self?.injectHistory(items, into: sid) }
+            let shouldRetry: Bool = await MainActor.run {
+                guard let self else { return false }
+                // 会话已被关 / 已注入过历史 → 停。
+                guard let s = self.sessions.first(where: { $0.id == sid }), s.messages.isEmpty else { return false }
+                if !items.isEmpty {
+                    vlog("console history: sid=\(sid) id=\(sessionId.prefix(8)) 注入 \(items.count) 条")
+                    self.injectHistory(items, into: sid)
+                    return false
+                }
+                // 读到 0 条:转录可能还没写完/还没出现(claude 边聊边写)→ 重试几次。
+                vlog("console history: sid=\(sid) id=\(sessionId.prefix(8)) 转录=\(found ?? "无") 条数=0 attempt=\(attempt)")
+                return attempt < 6
+            }
+            guard shouldRetry else { return }
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            await self?.loadHistory(sessionId: sessionId, into: sid, attempt: attempt + 1)
         }
     }
 
     private func injectHistory(_ items: [(role: String, kind: AgentMessage.Kind, text: String)], into sid: String) {
         mutate(sid) { s in
-            guard s.messages.isEmpty else { return }   // 用户已开始聊 → 不覆盖
+            guard s.messages.isEmpty else { vlog("console history: sid=\(sid) 已有消息,跳过注入"); return }
             s.messages = items.enumerated().map { i, it in
                 AgentMessage(id: "h\(i)", role: it.role, kind: it.kind, text: it.text, ord: i)
             }
@@ -200,25 +227,29 @@ final class AgentSessionManager: ObservableObject {
     }
 
     /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。
-    nonisolated static func listHistory(workdir: String, limit: Int = 30) -> [(id: String, label: String)] {
+    nonisolated static func listHistory(workdir: String, limit: Int = 30) -> [HistoryEntry] {
         let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
         let dir = NSString(string: "~/.claude/projects/\(enc)").expandingTildeInPath
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
-        var items: [(id: String, label: String, mtime: Date)] = []
+        // 先按 mtime 排序、截断,再只对前 limit 个解析首句(避免解析全部转录)。
+        var metas: [(id: String, full: String, mtime: Date)] = []
         for f in files where f.hasSuffix(".jsonl") {
-            let id = String(f.dropLast(6))
             let full = "\(dir)/\(f)"
             let mtime = (try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date ?? .distantPast
-            let prompt = firstUserPrompt(path: full).map { String($0.prefix(48)) } ?? id
-            items.append((id, prompt, mtime))
+            metas.append((String(f.dropLast(6)), full, mtime))
         }
-        return items.sorted { $0.mtime > $1.mtime }.prefix(limit).map { (id: $0.id, label: $0.label) }
+        return metas.sorted { $0.mtime > $1.mtime }.prefix(limit).map {
+            HistoryEntry(id: $0.id, label: firstUserPrompt(path: $0.full).map { String($0.prefix(48)) } ?? $0.id)
+        }
     }
 
-    /// 读转录里第一条用户文本(历史列表的标签)。
+    /// 读转录里第一条用户文本(历史列表的标签)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。
     nonisolated private static func firstUserPrompt(path: String) -> String? {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let data = (try? fh.read(upToCount: 256 * 1024)) ?? Data()
+        guard let content = String(data: data, encoding: .utf8) else { return nil }
         for line in content.split(separator: "\n") {
             guard let d = line.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -327,11 +358,13 @@ final class AgentSessionManager: ObservableObject {
     }
 
     func closeSession(_ sid: String) {
+        let wd = sessions.first { $0.id == sid }?.workdir
         managed[sid]?.consumeTask?.cancel()
         managed[sid]?.driver.stop()
         managed[sid] = nil
         sessions.removeAll { $0.id == sid }
-        persist()   // 用户主动结束 → 从落盘移除,重启不再恢复
+        // 结束的会话会成为/更新历史条目 → 让该项目历史缓存失效,下次进开始面板重算。
+        if let wd { invalidateHistory(wd) }
     }
 
     // MARK: - 事件 → 模型
@@ -342,8 +375,7 @@ final class AgentSessionManager: ObservableObject {
             mutate(sid) { $0.status = st }
         case .sessionId(let aid):
             mutate(sid) { $0.agentSessionId = aid }
-            persist()   // 拿到 claude session_id → 落盘,供崩溃后 --resume 恢复
-            loadHistory(sessionId: aid, into: sid)   // resume/continue/restore 时把历史读回来(空会话无害)
+            loadHistory(sessionId: aid, into: sid)   // resume/continue 时把历史读回来(空会话无害)
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {

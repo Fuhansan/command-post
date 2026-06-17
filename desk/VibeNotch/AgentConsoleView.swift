@@ -80,8 +80,9 @@ struct AgentConsoleRootView: View {
     }
 
     /// 项目无活跃会话 → 选择:继续最近(--continue)/ 全新 / 从历史恢复(--resume)。
+    /// 历史列表走 manager 的项目级缓存,异步加载,切项目秒开不卡。
     private func startPanel(_ proj: String) -> some View {
-        let history = AgentSessionManager.listHistory(workdir: proj)
+        let history = manager.historyByProject[proj] ?? []
         return VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 2) {
                 Text((proj as NSString).lastPathComponent).font(.system(size: 15, weight: .semibold))
@@ -116,11 +117,34 @@ struct AgentConsoleRootView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .task(id: proj) { manager.loadHistoryList(for: proj) }
     }
 
     private func start(_ proj: String, resume: String? = nil, continueLast: Bool = false) {
         manager.newSession(agent: .claude, workdir: proj, resume: resume, continueLast: continueLast)
         // 活跃会话出现后 console 自动切到对话(由 manager.activeSession 驱动)
+    }
+
+    /// 顶栏 session_id 徽标:显示短 id,点一下复制完整 id(方便排查时直接发出来)。
+    @ViewBuilder
+    private func sessionIdBadge(_ s: AgentSession) -> some View {
+        if let sid = s.agentSessionId, !sid.isEmpty {
+            Button {
+                let pb = NSPasteboard.general; pb.clearContents(); pb.setString(sid, forType: .string)
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "number").font(.system(size: 9))
+                    Text(sid.prefix(8)).font(.system(size: 11, design: .monospaced))
+                    Image(systemName: "doc.on.doc").font(.system(size: 9))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Color.gray.opacity(0.12)).clipShape(Capsule())
+            }
+            .buttonStyle(.plain).help("点击复制完整 session id:\(sid)")
+        } else {
+            Text("id 待生成").font(.system(size: 10)).foregroundStyle(.tertiary)
+        }
     }
 
     private func conversation(_ s: AgentSession) -> some View {
@@ -129,6 +153,7 @@ struct AgentConsoleRootView: View {
                 Text(s.title).font(.system(size: 13, weight: .semibold))
                 Text(s.workdir).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
+                sessionIdBadge(s)
                 Button("结束会话") { manager.closeSession(s.id) }.controlSize(.small)
             }
             .padding(8)
