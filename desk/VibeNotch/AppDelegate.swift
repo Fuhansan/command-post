@@ -11,8 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func menuWillOpen(_ menu: NSMenu) {
         Task { @MainActor in
             self.rebuildDisplaySubmenu()
-            // 勾选可能被设置窗口改过,每次打开菜单对齐一次
-            self.tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
         }
     }
 
@@ -56,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Touch AppSettings.shared so it loads ~/.vibenotch/settings.json and
         // syncs `muted` into SoundPlayer before any transition can fire.
         _ = AppSettings.shared
+        // 不再用 tmux 包装(遥控会话走 stream-json 控制台)。清理 ~/.zshrc/.bashrc 旧包装段。
+        ShellWrapper.uninstall()
         vlog("launched")
         vlog("screens count=\(NSScreen.screens.count)")
         for (i, s) in NSScreen.screens.enumerated() {
@@ -170,12 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
             self.pendingStore.cancel(sid: sid)   // 丢弃挂起的审批连接(若有)
             if let pid = entry.ownerPID {
-                // 优先杀整个 tmux session(连同 pane 一起退);非 tmux 会话则 SIGTERM 进程
-                if TmuxBridge.killSession(forPid: pid) {
-                    vlog("relay close via tmux kill-session sid=\(sid.prefix(8))")
-                } else {
-                    kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
-                }
+                kill(pid, SIGTERM)   // 结束 claude 进程 → SessionEnd hook → 会话移除并同步到手机
             } else {
                 // 不知道进程号(罕见)→ 直接移除会话,保证手机端也消失
                 self.store.removeSession(sessionId: sid)
@@ -183,7 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onRemoteInput = { [weak self] sid, text, imagePaths in
             guard let self else { return }
-            guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
+            guard self.store.sessions.contains(where: { $0.id == sid }) else {
                 vlog("relay input ignored: sid=\(sid.prefix(8)) unknown")
                 return
             }
@@ -196,12 +191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
             }
             let message = parts.joined(separator: " ")
-            // ① tmux 优先:直写 pty,锁屏/显示休眠都能进
-            if let pid = entry.ownerPID, TmuxBridge.sendText(message, toPid: pid) {
-                vlog("relay input via tmux sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
-                return
-            }
-            // ② GUI 回退:模拟键盘(非 tmux 会话用;**仅未锁屏可用,锁屏无效**)
+            // 手敲会话(旧 hook 路径)用 GUI 模拟键盘注入 —— 仅未锁屏可用;锁屏遥控请走
+            // VibeNotch 控制台会话(stream-json)。
             guard WindowActivator.isAccessibilityTrusted else {
                 WindowActivator.requestAccessibilityIfNeeded()
                 vlog("relay input: AX 未授权,丢弃 sid=\(sid.prefix(8))")
@@ -236,12 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             guard let d = digits.first else { return }
-            // ① tmux 优先
-            if let pid = entry.ownerPID, TmuxBridge.sendDigit(d, toPid: pid) {
-                vlog("relay answer via tmux: sid=\(sid.prefix(8)) digit=\(d)")
-                return
-            }
-            // ② GUI 回退(模拟数字键,仅未锁屏)
+            // GUI 模拟数字键(仅未锁屏)
             guard WindowActivator.isAccessibilityTrusted else {
                 WindowActivator.requestAccessibilityIfNeeded(); return
             }
@@ -259,11 +245,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.releaseQuestionGate(sid: sid)
             self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
         }
-        agent.onRemoteLaunch = { command in
-            let dir = AppSettings.shared.defaultWorkdir
-            let proxy = AppSettings.shared.launchProxy
-            vlog("relay launch: \(command) (workdir=\(dir.isEmpty ? "~" : dir)) proxy=\(proxy.isEmpty ? "无" : "有")")
-            TerminalLauncher.run(command: command, workdir: dir, proxy: proxy)
+        agent.onRemoteLaunch = { [weak self] command in
+            guard let self else { return }
+            // 手机「+」新建会话:走 VibeNotch 后台 spawn(stream-json 控制台会话),
+            // 不再开新终端 + tmux。会话经 syncConsole 回推手机(sid 带 "c:"),锁屏可控。
+            let dir = AppSettings.shared.defaultWorkdir.isEmpty
+                ? NSHomeDirectory() : AppSettings.shared.defaultWorkdir
+            let kind: AgentKind = command.lowercased().contains("codex") ? .codex : .claude
+            vlog("relay launch → stream-json 控制台会话: \(command) workdir=\(dir)")
+            self.agentManager.newSession(agent: kind, workdir: dir)
         }
         agent.agentManager = agentManager   // 控制台(stream-json)会话也桥接到手机(start 内订阅)
         agent.start()
@@ -574,17 +564,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return mi
         }())
 
-        // 锁屏遥控开关:勾上=新开终端自动进 tmux(锁屏也能从手机控);
-        // 关掉=纯原生终端(滚轮/选字原生,但只有不锁屏才能遥控)。一键切换,免翻设置。
-        let tmux = NSMenuItem(
-            title: L10n.t(.menuTmuxWrap, locale: locale),
-            action: #selector(toggleTmuxWrap),
-            keyEquivalent: ""
-        )
-        tmux.state = AppSettings.shared.tmuxWrap ? .on : .off
-        menu.addItem(tmux)
-        tmuxItem = tmux
-
         // stream-json 新架构的桌面入口(实验):点开类终端窗口,自己 spawn 会话对话。
         menu.addItem({
             let mi = NSMenuItem(title: "Agent 控制台(实验)",
@@ -618,7 +597,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusMenu: NSMenu?
     private var displaySubmenu: NSMenu?
-    private var tmuxItem: NSMenuItem?
 
     /// Rebuild the "Display on" submenu from the current screen list.
     /// Called on menu open + when screens change so unplugged monitors vanish.
@@ -658,13 +636,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
-    }
-
-    /// 菜单栏一键切换锁屏遥控(tmux 包装)。tmuxWrap 的 didSet 会自动
-    /// persist + ShellWrapper.apply(写/删 ~/.zshrc 的包装函数,对新开终端生效)。
-    @objc private func toggleTmuxWrap() {
-        AppSettings.shared.tmuxWrap.toggle()
-        tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
     }
 
     @objc private func quit() {
