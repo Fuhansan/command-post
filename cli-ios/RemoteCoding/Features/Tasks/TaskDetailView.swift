@@ -172,10 +172,12 @@ struct TaskDetailView: View {
     }
 
     private var navBar: some View {
-        HStack {
+        HStack(spacing: 10) {
             Button { dismiss() } label: {
                 Image(systemName: "chevron.left").font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.text)
             }
+            Text(session?.title ?? "会话").font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(Theme.text).lineLimit(1)
             Spacer()
             Menu {
                 Button(role: .destructive) {
@@ -191,36 +193,24 @@ struct TaskDetailView: View {
         .padding(.horizontal, 16).padding(.vertical, 12)
     }
 
+    /// 顶部只放一个可复制的 session id(点一下复制完整 id),不再占一大块会话卡。
     private var sessionHeader: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 14)
-                .fill(LinearGradient(colors: [Color(hex: 0x7C5CD6), Color(hex: 0xC061E0)],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing))
-                .frame(width: 52, height: 52)
-                .overlay(Text(String((session?.title ?? "会").prefix(1)))
-                    .font(.system(size: 22, weight: .bold)).foregroundStyle(.white))
-            VStack(alignment: .leading, spacing: 4) {
-                Text(session?.title ?? "会话").font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.text)
-                let status = session?.status ?? "working"
-                HStack(spacing: 6) {
-                    Circle().fill(SessionStatusUI.color(status)).frame(width: 7, height: 7)
-                    Text(SessionStatusUI.label(status))
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(SessionStatusUI.color(status))
-                    if let term = session?.terminal, !term.isEmpty, term != "?" {
-                        Text("· \(term)").font(.system(size: 14)).foregroundStyle(Theme.textSec)
-                    }
-                }
-                if let cwd = session?.cwd, !cwd.isEmpty, cwd != "?" {
-                    HStack(spacing: 5) {
-                        Image(systemName: "folder").font(.system(size: 11)).foregroundStyle(Theme.textTer)
-                        Text(shortMacPath(cwd)).font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Theme.textSec).lineLimit(1).truncationMode(.head)
-                    }
-                }
+        let sid = (session?.agentSessionId.isEmpty == false) ? (session?.agentSessionId ?? "") : (session?.id ?? "")
+        return Button {
+            UIPasteboard.general.string = sid
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "number").font(.system(size: 10))
+                Text(sid.isEmpty ? "无 id" : sid)
+                    .font(.system(size: 12, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                Image(systemName: "doc.on.doc").font(.system(size: 10))
             }
-            Spacer()
+            .foregroundStyle(Theme.textSec)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(Theme.textTer.opacity(0.14)).clipShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
         .padding(.bottom, 4)
     }
 

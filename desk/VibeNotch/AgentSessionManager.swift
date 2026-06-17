@@ -244,8 +244,8 @@ final class AgentSessionManager: ObservableObject {
         }
     }
 
-    /// 读转录里第一条用户文本(历史列表的标签)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。
-    nonisolated private static func firstUserPrompt(path: String) -> String? {
+    /// 读转录里第一条用户文本(历史列表的标签 / 会话标题)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。
+    nonisolated static func firstUserPrompt(path: String) -> String? {
         guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? fh.close() }
         let data = (try? fh.read(upToCount: 256 * 1024)) ?? Data()

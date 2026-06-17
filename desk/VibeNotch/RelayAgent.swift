@@ -201,9 +201,13 @@ final class RelayAgent: NSObject, ObservableObject {
     private func forceResyncForClient() {
         guard Date().timeIntervalSince(lastClientResyncAt) > 3 else { return }
         lastClientResyncAt = Date()
-        vlog("relay: 手机上线,全量重推当前会话")
+        vlog("relay: 手机上线,全量重推当前会话/控制台/项目")
         lastSent.removeAll()
+        lastSentConsole.removeAll()   // 否则新连/重连的手机拿不到 console 会话与项目(被去重缓存挡住)
+        consoleWindow.removeAll()
         syncToServer()
+        syncConsole()
+        syncProjects()
     }
 
     /// 清空本账号在服务器与手机端的全部会话(agent 进程重启时调用)。
@@ -485,7 +489,8 @@ final class RelayAgent: NSObject, ObservableObject {
             "source": "console",          // VibeNotch 起的项目会话 → 手机按项目归类
             "project": s.workdir,         // 所属项目(工作目录)
             "claudeId": s.agentSessionId ?? "",   // claude session_id:项目内去重历史/定位进入
-            "title": s.title,
+            // 标题用首句(项目内同目录,不能再用目录名当标题,否则都一样);没有则「新会话」。
+            "title": s.messages.first { $0.kind == .text && $0.role == "user" }.map { cap($0.text, 40) } ?? "新会话",
             "terminal": "控制台",
             "cli": s.agent.rawValue,
             "cwd": s.workdir,
@@ -538,9 +543,9 @@ final class RelayAgent: NSObject, ObservableObject {
                ?? (e.pendingQuestion?.tool == "ExitPlanMode" ? "计划待确认" : ""))
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
         let cwd = e.cwd
-        let base = (cwd as NSString).lastPathComponent
-        // 标题优先用项目名(cwd 末段);取不到再退回终端名。
-        let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
+        // 手动会话标题用首句(转录第一条用户消息),没有则「新会话」—— 不再用目录名当标题。
+        let firstPrompt = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
+        let title = firstPrompt.map { cap($0, 40) } ?? "新会话"
         // CLI 类型(claude/codex…),由转录路径判定 —— 手机据此显示对应的快捷指令。
         let cli = e.transcriptPath.flatMap { CodingAgents.forTranscript($0)?.id } ?? ""
         return [
@@ -550,7 +555,7 @@ final class RelayAgent: NSObject, ObservableObject {
             "source": "hook",                      // 用户手动敲的 claude → 手机平铺成独立卡片(锁屏不可控)
             "project": "",                         // 手动会话不归项目
             "claudeId": e.id,                      // claude session_id(卡片展示,排查重复用)
-            "title": project,                     // 项目名(主标题)
+            "title": title,                       // 首句(没有则「新会话」)
             "terminal": e.terminal.displayName,    // 终端 / IDE
             "cli": cli,                            // claude | codex |(空=未知)
             "cwd": cwd,                            // 项目工作目录
