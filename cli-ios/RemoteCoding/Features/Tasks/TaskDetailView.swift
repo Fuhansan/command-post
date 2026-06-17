@@ -36,6 +36,13 @@ struct TaskDetailView: View {
                             // LazyVStack:长会话只构建/渲染可见消息行,避免一次性建出全部气泡导致卡顿。
                             LazyVStack(spacing: 14) {
                                 sessionHeader
+                                if session?.hasMore == true {
+                                    Button { relay.loadMoreMessages(sessionId: sessionId) } label: {
+                                        Label("加载更早消息", systemImage: "arrow.up.circle")
+                                            .font(.system(size: 13, weight: .medium)).foregroundStyle(Theme.blue)
+                                    }
+                                    .padding(.vertical, 4)
+                                }
                                 if !orderedMessages.isEmpty {
                                     ForEach(orderedMessages) { msg in
                                         messageRow(msg).id(msg.id)
@@ -56,7 +63,9 @@ struct TaskDetailView: View {
                         .defaultScrollAnchor(.bottom)   // 进入页面即定位到最新消息(聊天惯例)
                         // 瞬时定位到底部(不用 withAnimation):发消息/收消息直接落底,
                         // 不再「动画地从上往下扫一遍」。滚到**视觉**最后一条(ord 排序后)。
-                        .onChange(of: session?.messages.count ?? 0) { _, _ in
+                        // 只在「底部新增消息」时跟随落底;「加载更早」是往上插入(末条 id 不变)
+                        // → 不触发,避免把用户从正在看的位置弹回底部。
+                        .onChange(of: orderedMessages.last?.id) { _, _ in
                             if session?.status == "working" {
                                 proxy.scrollTo("typing", anchor: .bottom)
                             } else if let last = orderedMessages.last {

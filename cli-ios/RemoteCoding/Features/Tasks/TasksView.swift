@@ -29,10 +29,9 @@ enum SessionStatusUI {
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
 
-    /// 单任务 = 手动敲的 claude 且 cwd 不属于任何已打开项目。属于项目的折叠进项目卡片,不重复。
+    /// 单任务 = 手动敲的 claude 且 cwd 不属于任何已打开项目(含子目录)。属于项目的折叠进项目,不重复。
     private var singleTasks: [RelaySession] {
-        let projectDirs = Set(relay.projects.map { $0.workdir })
-        return relay.sessions.filter { $0.isManual && !projectDirs.contains($0.cwd) }
+        relay.sessions.filter { $0.isManual && relay.project(forCwd: $0.cwd) == nil }
     }
 
     var body: some View {
@@ -48,7 +47,8 @@ struct TasksView: View {
                         } else {
                             ForEach(relay.projects) { proj in
                                 NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
-                                    ProjectRow(project: proj, sessions: relay.sessions)
+                                    ProjectRow(project: proj,
+                                               sessions: relay.sessions.filter { relay.project(forCwd: $0.cwd)?.workdir == proj.workdir })
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -154,6 +154,11 @@ struct SessionCard: View {
                         Text(SessionStatusUI.label(session.status))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(SessionStatusUI.color(session.status))
+                        if !session.agentSessionId.isEmpty {
+                            Text("·").font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                            Text("id \(session.agentSessionId.prefix(8))")
+                                .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.textTer)
+                        }
                     }
                 }
                 Spacer()

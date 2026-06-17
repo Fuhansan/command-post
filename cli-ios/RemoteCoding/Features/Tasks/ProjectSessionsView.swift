@@ -11,8 +11,8 @@ struct ProjectRow: View {
     let project: ProjectInfo
     let sessions: [RelaySession]
 
-    // 该目录下的会话(console + 折叠进来的手动会话,都算)。
-    private var inProject: [RelaySession] { sessions.filter { $0.cwd == project.workdir } }
+    // 调用方已按「最长前缀」筛好该项目的会话(console + 折叠进来的手动会话)。
+    private var inProject: [RelaySession] { sessions }
     private var needsAction: Bool { inProject.contains { $0.needsAction } }
 
     var body: some View {
@@ -61,8 +61,10 @@ struct ProjectSessionsView: View {
     private var project: ProjectInfo? { relay.projects.first { $0.workdir == workdir } }
     private var name: String { project?.name ?? (workdir as NSString).lastPathComponent }
 
-    /// 进行中的会话(该目录下,console + 折叠进来的手动会话)。
-    private var active: [RelaySession] { relay.sessions.filter { $0.cwd == workdir } }
+    /// 进行中的会话(归属本项目:cwd 等于或在 workdir 子目录下,最长前缀匹配)。
+    private var active: [RelaySession] {
+        relay.sessions.filter { relay.project(forCwd: $0.cwd)?.workdir == workdir }
+    }
     /// 可恢复的历史(排除当前已在跑的 claude 会话,避免和「进行中」重复)。
     private var dormant: [ProjectHistory] {
         let liveIds = Set(active.map { $0.agentSessionId }.filter { !$0.isEmpty })
@@ -140,19 +142,22 @@ struct ProjectSessionsView: View {
     }
 }
 
-/// 历史会话卡片:与首页/进行中卡片同款框样式,点按恢复。
+/// 历史会话卡片:和普通任务卡片同款框样式,只用一个「可恢复」标签标识类型 + 展示 id。
 struct HistoryCard: View {
     let history: ProjectHistory
     var body: some View {
         HStack(spacing: 12) {
-            Avatar(letter: "↩", color: Theme.textTer)
+            Avatar(letter: String(history.label.prefix(1)), color: Theme.textTer)
             VStack(alignment: .leading, spacing: 3) {
                 Text(history.label).font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(Theme.text).lineLimit(1)
-                Text("历史会话 · 点按恢复").font(.system(size: 12)).foregroundStyle(Theme.textSec)
+                Text("id \(history.id.prefix(8))")
+                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.textTer)
             }
             Spacer()
-            Image(systemName: "arrow.uturn.backward").font(.system(size: 13)).foregroundStyle(Theme.textTer)
+            Text("可恢复").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.gold)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Theme.gold.opacity(0.15)).clipShape(Capsule())
         }
         .padding(16)
         .cardStyle(stroke: Theme.stroke)

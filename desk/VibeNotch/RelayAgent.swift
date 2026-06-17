@@ -69,6 +69,9 @@ final class RelayAgent: NSObject, ObservableObject {
     weak var agentManager: AgentSessionManager?
     private var lastSentConsole: [String: String] = [:]
     private var knownConsoleSids: Set<String> = []
+    private var consoleWindow: [String: Int] = [:]   // csid → 当前推送的消息窗口大小(懒加载)
+    private static let defaultConsoleWindow = 25
+    private static let consoleWindowStep = 25
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
     private var knownSids: Set<String> = []         // 已推送过的会话,用于检测会话整体消失
@@ -187,6 +190,7 @@ final class RelayAgent: NSObject, ObservableObject {
             sendReset()
         }
         lastSentConsole.removeAll()
+        consoleWindow.removeAll()   // 重连从默认窗口(最后 25 条)起,避免一次性重推超长历史
         syncToServer()   // 连上后补发当前所有会话
         syncConsole()    // 控制台会话
         syncProjects()   // 「打开项目」列表
@@ -338,13 +342,16 @@ final class RelayAgent: NSObject, ObservableObject {
         for csid in knownConsoleSids where !active.contains(csid) {
             sendSessionRemove(sid: csid)
             for k in Array(lastSentConsole.keys) where k.hasPrefix("m:\(csid):") { lastSentConsole[k] = nil }
+            consoleWindow[csid] = nil
         }
         knownConsoleSids = active
 
         for s in mgr.sessions {
             let csid = "c:\(s.id)"
-            let meta = consoleMeta(s)
-            let msgs = consoleMessages(s)
+            let window = consoleWindow[csid] ?? Self.defaultConsoleWindow
+            var meta = consoleMeta(s)
+            meta["hasMore"] = s.messages.count > window   // 还有更早的没推 → 手机显示「加载更早」
+            let msgs = consoleMessages(s, limit: window)
             let prefix = "m:\(csid):"
             let curIds = Set(msgs.map { prefix + $0.id })
             for k in Array(lastSentConsole.keys) where k.hasPrefix(prefix) && !curIds.contains(k) {
@@ -415,10 +422,11 @@ final class RelayAgent: NSObject, ObservableObject {
                          "from": "agent", "fallbackText": "打开项目", "body": body]))
     }
 
-    private func consoleMessages(_ s: AgentSession)
+    private func consoleMessages(_ s: AgentSession, limit: Int)
         -> [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] {
         var out: [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] = []
-        for m in s.messages {
+        // 懒加载:默认只推最后 limit 条消息;手机「加载更早」会扩大窗口再要更老的。
+        for m in s.messages.suffix(limit) {
             switch m.kind {
             case .text where m.role == "user":
                 out.append(("msg:\(m.id)", "user", bubble(role: "user", m.text), m.text, m.ord))
@@ -541,6 +549,7 @@ final class RelayAgent: NSObject, ObservableObject {
             "agent": Self.deviceId,                // 来自哪台电脑
             "source": "hook",                      // 用户手动敲的 claude → 手机平铺成独立卡片(锁屏不可控)
             "project": "",                         // 手动会话不归项目
+            "claudeId": e.id,                      // claude session_id(卡片展示,排查重复用)
             "title": project,                     // 项目名(主标题)
             "terminal": e.terminal.displayName,    // 终端 / IDE
             "cli": cli,                            // claude | codex |(空=未知)
@@ -950,6 +959,15 @@ final class RelayAgent: NSObject, ObservableObject {
             } else {
                 onRemoteConsoleOpen?(value, nil, actionId == "console_continue")
             }
+            return
+        }
+        // 懒加载:手机「加载更早」→ 扩大该会话窗口,重推更老的一批。
+        if actionId == "console_load_more" {
+            let csid = body["value"] as? String ?? ""
+            guard !csid.isEmpty else { return }
+            let cur = consoleWindow[csid] ?? Self.defaultConsoleWindow
+            consoleWindow[csid] = cur + Self.consoleWindowStep
+            Task { @MainActor in self.syncConsole() }
             return
         }
         // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)

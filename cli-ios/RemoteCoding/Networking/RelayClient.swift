@@ -16,6 +16,7 @@ struct RelaySession: Identifiable {
     var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
     var source: String = ""     // console=VibeNotch 项目会话 | hook=用户手动敲的(锁屏不可控)
     var agentSessionId: String = ""   // claude session_id(项目内去重历史 / 定位进入)
+    var hasMore: Bool = false   // 还有更早的消息没加载(顶部显示「加载更早」)
     var messages: [UIMessage]   // 该会话的下行富消息
 
     var isManual: Bool { source == "hook" }   // 手动会话:平铺首页 + 打「锁屏不可控」标签
@@ -273,6 +274,7 @@ final class RelayClient: ObservableObject {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
             s.source = meta["source"]?.stringValue ?? s.source
             s.agentSessionId = meta["claudeId"]?.stringValue ?? s.agentSessionId
+            s.hasMore = meta["hasMore"]?.boolValue ?? s.hasMore
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
             s.cli = meta["cli"]?.stringValue ?? s.cli
@@ -410,9 +412,20 @@ final class RelayClient: ObservableObject {
     func consoleResume(workdir: String, historyId: String) {
         sendConsoleOpen("console_resume", value: "\(workdir)\u{1}\(historyId)")
     }
+    /// 懒加载:请求该会话更早的一批消息(电脑端扩大窗口重推)。
+    func loadMoreMessages(sessionId: String) {
+        sendConsoleOpen("console_load_more", value: sessionId)
+    }
     private func sendConsoleOpen(_ actionId: String, value: String) {
         sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: "system", localMsgId: nil,
                      body: .object(["action_id": .string(actionId), "value": .string(value)]))
+    }
+
+    /// 某 cwd 属于哪个项目(最长前缀匹配)——把项目子目录里的手动会话也折叠进该项目。
+    func project(forCwd cwd: String) -> ProjectInfo? {
+        projects
+            .filter { cwd == $0.workdir || cwd.hasPrefix($0.workdir + "/") }
+            .max(by: { $0.workdir.count < $1.workdir.count })
     }
 
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
