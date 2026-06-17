@@ -160,7 +160,8 @@ struct AgentConsoleRootView: View {
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
+                    // LazyVStack:超长会话只构建/渲染可见的消息行,进入秒开、滚动流畅。
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(s.messages) { m in messageRow(m, sid: s.id) }
                         ForEach(s.pending) { req in pendingCard(sid: s.id, req: req) }
                         Color.clear.frame(height: 1).id("BOTTOM")
@@ -168,6 +169,8 @@ struct AgentConsoleRootView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(10)
                 }
+                // 底部锚定管「拉宽/切回」稳定;onChange 补一刀管「历史异步灌入 + 新消息」精确到底。
+                .defaultScrollAnchor(.bottom)
                 .onChange(of: s.messages.count) { _, _ in proxy.scrollTo("BOTTOM", anchor: .bottom) }
                 .onChange(of: s.pending.count) { _, _ in proxy.scrollTo("BOTTOM", anchor: .bottom) }
             }
