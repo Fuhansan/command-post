@@ -11,8 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func menuWillOpen(_ menu: NSMenu) {
         Task { @MainActor in
             self.rebuildDisplaySubmenu()
-            // 勾选可能被设置窗口改过,每次打开菜单对齐一次
-            self.tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
         }
     }
 
@@ -56,6 +54,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Touch AppSettings.shared so it loads ~/.vibenotch/settings.json and
         // syncs `muted` into SoundPlayer before any transition can fire.
         _ = AppSettings.shared
+        // Phase 5:不再用 tmux 包装(控制台会话走 stream-json stdin)。清理可能残留在
+        // ~/.zshrc/.bashrc 的旧包装段,让用户手敲的终端恢复纯净。幂等。
+        ShellWrapper.uninstall()
         vlog("launched")
         vlog("screens count=\(NSScreen.screens.count)")
         for (i, s) in NSScreen.screens.enumerated() {
@@ -574,17 +575,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return mi
         }())
 
-        // 锁屏遥控开关:勾上=新开终端自动进 tmux(锁屏也能从手机控);
-        // 关掉=纯原生终端(滚轮/选字原生,但只有不锁屏才能遥控)。一键切换,免翻设置。
-        let tmux = NSMenuItem(
-            title: L10n.t(.menuTmuxWrap, locale: locale),
-            action: #selector(toggleTmuxWrap),
-            keyEquivalent: ""
-        )
-        tmux.state = AppSettings.shared.tmuxWrap ? .on : .off
-        menu.addItem(tmux)
-        tmuxItem = tmux
-
         // stream-json 新架构的桌面入口(实验):点开类终端窗口,自己 spawn 会话对话。
         menu.addItem({
             let mi = NSMenuItem(title: "Agent 控制台(实验)",
@@ -618,7 +608,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusMenu: NSMenu?
     private var displaySubmenu: NSMenu?
-    private var tmuxItem: NSMenuItem?
 
     /// Rebuild the "Display on" submenu from the current screen list.
     /// Called on menu open + when screens change so unplugged monitors vanish.
@@ -658,13 +647,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
-    }
-
-    /// 菜单栏一键切换锁屏遥控(tmux 包装)。tmuxWrap 的 didSet 会自动
-    /// persist + ShellWrapper.apply(写/删 ~/.zshrc 的包装函数,对新开终端生效)。
-    @objc private func toggleTmuxWrap() {
-        AppSettings.shared.tmuxWrap.toggle()
-        tmuxItem?.state = AppSettings.shared.tmuxWrap ? .on : .off
     }
 
     @objc private func quit() {
