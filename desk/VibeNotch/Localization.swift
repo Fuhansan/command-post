@@ -23,7 +23,7 @@ enum L10n {
     }
 
     enum Key: String {
-        case menuSettings, menuDisplayOn, menuDisplayAuto, menuDisplayNotchSuffix, menuQuit
+        case menuSettings, menuTmuxWrap, menuDisplayOn, menuDisplayAuto, menuDisplayNotchSuffix, menuQuit
         case settingsTitle, settingsSectionGeneral
         case settingsLanguage, settingsLangSystem, settingsLangEnglish, settingsLangChinese
         case settingsLaunchAtLogin, settingsMuteSounds
@@ -34,6 +34,7 @@ enum L10n {
     /// that open a window (vs. items that perform an action immediately).
     private static let table: [Key: [Locale: String]] = [
         .menuSettings:            [.en: "Settings…",          .zh: "设置…"],
+        .menuTmuxWrap:            [.en: "Lock-screen remote (tmux)", .zh: "锁屏遥控（tmux）"],
         .menuDisplayOn:           [.en: "Display on",         .zh: "显示位置"],
         .menuDisplayAuto:         [.en: "Auto (notch screen)", .zh: "自动（凹口屏）"],
         .menuDisplayNotchSuffix:  [.en: "(notch)",            .zh: "（凹口）"],
