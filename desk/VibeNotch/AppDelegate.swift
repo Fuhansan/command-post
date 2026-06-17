@@ -72,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupRelayAgent()
         startCaffeinate()
         AgentConsoleWindowController.shared.manager = agentManager
+        agentManager.restoreSessions()   // 崩溃/重启恢复:用 --resume 重建上次的控制台会话
     }
 
     /// 防系统深度休眠 —— 否则锁屏后系统休眠会断 WS、停掉 tmux,远程就失联。

@@ -5,12 +5,15 @@ import Combine
 
 /// 一条会话里的一条消息(统一)。Phase 1 先支撑文本/工具/文件三类,渲染细节 Phase 3 再丰富。
 struct AgentMessage: Identifiable, Equatable {
-    enum Kind: String { case text, tool, file }
+    enum Kind: String { case text, tool, file, permission }
     let id: String
     var role: String          // user / assistant / system
     var kind: Kind
-    var text: String
+    var text: String          // permission 时 = 命令/操作详情
     var ord: Int              // 逻辑顺序号(到达递增)
+    /// permission 卡的处理结果:nil=待处理(显示允许/拒绝按钮);"allow"/"deny"=已处理(显示徽标)。
+    var permState: String? = nil
+    var permReqId: String? = nil   // 关联 driver 的权限请求 id,回写时用
 }
 
 /// 一个会话(统一模型)。SessionManager 维护,上层(桌面 UI / RelayAgent / 手机)消费。
@@ -55,13 +58,15 @@ final class AgentSessionManager: ObservableObject {
     }
 
     /// 新建会话:spawn driver 子进程,开始消费事件。返回会话 id。
+    /// resume 非空 → claude --resume <id> 恢复既有会话;restoreId 非空 → 沿用旧的 VibeNotch
+    /// 会话 id(崩溃恢复时保持 id 稳定,手机端不混乱)。
     @discardableResult
-    func newSession(agent: AgentKind, workdir: String, resume: String? = nil) -> String {
-        let sid = "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
+    func newSession(agent: AgentKind, workdir: String, resume: String? = nil, restoreId: String? = nil) -> String {
+        let sid = restoreId ?? "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
         let driver = makeDriver(agent)
         let title = (workdir as NSString).lastPathComponent
         sessions.append(AgentSession(id: sid, agent: agent, workdir: workdir, title: title,
-                                     status: .starting, messages: [], pending: [], agentSessionId: nil))
+                                     status: .starting, messages: [], pending: [], agentSessionId: resume))
         var m = Managed(driver: driver, consumeTask: nil)
         m.consumeTask = Task { [weak self] in
             for await ev in driver.events {
@@ -73,7 +78,104 @@ final class AgentSessionManager: ObservableObject {
             do { try await driver.start(workdir: workdir, resume: resume) }
             catch { await self.apply(.error("启动失败: \(error)"), to: sid) }
         }
+        persist()
         return sid
+    }
+
+    // MARK: - 崩溃/重启恢复(B):落盘会话 + 启动时 --resume 重建
+
+    private struct Persisted: Codable { let id, agent, workdir, title: String; var resumeId: String? }
+    private static let persistURL = URL(fileURLWithPath:
+        NSString(string: "~/.vibenotch/console-sessions.json").expandingTildeInPath)
+
+    /// 把当前**已拿到 claude session_id**(可 --resume)的控制台会话落盘。
+    private func persist() {
+        let items = sessions.compactMap { s -> Persisted? in
+            guard let rid = s.agentSessionId, !rid.isEmpty else { return nil }
+            return Persisted(id: s.id, agent: s.agent.rawValue, workdir: s.workdir, title: s.title, resumeId: rid)
+        }
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        try? data.write(to: Self.persistURL, options: .atomic)
+    }
+
+    /// VibeNotch 启动时调:读落盘,用 --resume 把上次的控制台会话重建回来。
+    func restoreSessions() {
+        guard let data = try? Data(contentsOf: Self.persistURL),
+              let items = try? JSONDecoder().decode([Persisted].self, from: data) else { return }
+        for p in items where !sessions.contains(where: { $0.id == p.id }) {
+            let kind = AgentKind(rawValue: p.agent) ?? .claude
+            vlog("console restore: 恢复会话 \(p.title) (--resume \(p.resumeId?.prefix(8) ?? "-"))")
+            newSession(agent: kind, workdir: p.workdir, resume: p.resumeId, restoreId: p.id)
+            if let rid = p.resumeId { loadHistory(sessionId: rid, into: p.id) }   // 读转录重建历史
+        }
+    }
+
+    /// 后台读 claude 转录(~/.claude/projects/<目录>/<id>.jsonl)重建历史消息,回主线程填入。
+    /// --resume 不重放历史,所以恢复后靠这个把之前的对话显示回来。
+    private func loadHistory(sessionId: String, into sid: String) {
+        Task.detached(priority: .utility) { [weak self] in
+            let items = Self.parseTranscript(sessionId: sessionId)
+            guard !items.isEmpty else { return }
+            await MainActor.run { self?.injectHistory(items, into: sid) }
+        }
+    }
+
+    private func injectHistory(_ items: [(role: String, kind: AgentMessage.Kind, text: String)], into sid: String) {
+        mutate(sid) { s in
+            guard s.messages.isEmpty else { return }   // 用户已开始聊 → 不覆盖
+            s.messages = items.enumerated().map { i, it in
+                AgentMessage(id: "h\(i)", role: it.role, kind: it.kind, text: it.text, ord: i)
+            }
+        }
+        ordCounter = max(ordCounter, items.count + 1)   // 后续新消息排在历史之后
+    }
+
+    /// 解析转录 JSONL → (role, kind, 文本)。user 文本 / assistant 文本 / assistant 工具调用。
+    nonisolated private static func parseTranscript(sessionId: String)
+        -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        guard let path = findTranscript(sessionId: sessionId),
+              let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+        var out: [(String, AgentMessage.Kind, String)] = []
+        for line in content.split(separator: "\n") {
+            guard let d = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let type = o["type"] as? String,
+                  let msg = o["message"] as? [String: Any] else { continue }
+            if type == "user" {
+                if let s = msg["content"] as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
+                    out.append(("user", .text, s))
+                } else if let blocks = msg["content"] as? [[String: Any]] {
+                    for b in blocks where (b["type"] as? String) == "text" {
+                        if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)) }
+                    }
+                }
+            } else if type == "assistant", let blocks = msg["content"] as? [[String: Any]] {
+                for b in blocks {
+                    switch b["type"] as? String {
+                    case "text":
+                        if let t = b["text"] as? String, !t.isEmpty { out.append(("assistant", .text, t)) }
+                    case "tool_use":
+                        let name = b["name"] as? String ?? "?"
+                        let input = b["input"] as? [String: Any] ?? [:]
+                        let sm = (input["command"] ?? input["file_path"] ?? input["path"]
+                                  ?? input["pattern"] ?? input["url"]) as? String ?? ""
+                        out.append(("assistant", .tool, "\(name): \(sm)"))
+                    default: break
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// 按 sessionId 在 ~/.claude/projects 下递归找转录文件(不必算目录编码)。
+    nonisolated private static func findTranscript(sessionId: String) -> String? {
+        let base = NSString(string: "~/.claude/projects").expandingTildeInPath
+        guard let en = FileManager.default.enumerator(atPath: base) else { return nil }
+        for case let f as String in en where f.hasSuffix("\(sessionId).jsonl") {
+            return "\(base)/\(f)"
+        }
+        return nil
     }
 
     func send(_ sid: String, text: String, imagePaths: [String] = []) {
@@ -85,7 +187,21 @@ final class AgentSessionManager: ObservableObject {
 
     func respond(_ sid: String, requestId: String, choose: [String]) {
         guard let d = managed[sid]?.driver else { return }
-        mutate(sid) { s in s.pending.removeAll { $0.id == requestId } }
+        let allow = choose.contains("allow")
+        mutate(sid) { s in
+            // 权限审批卡(消息):就地标记结果(命令+✓已允许/✕已拒绝),不删,留在对话里。
+            if let i = s.messages.firstIndex(where: { $0.kind == .permission && $0.permReqId == requestId }) {
+                s.messages[i].permState = allow ? "allow" : "deny"
+            }
+            // 选择题(pending):留一条「已选择」记录,再移除待决卡。
+            if let req = s.pending.first(where: { $0.id == requestId }),
+               req.kind == .choice || req.kind == .planConfirm {
+                let picked = req.options.filter { choose.contains($0.id) }.map(\.label).joined(separator: "、")
+                s.messages.append(AgentMessage(id: "resolved_\(requestId)", role: "assistant", kind: .text,
+                    text: "✓ 已选择:" + (picked.isEmpty ? choose.joined(separator: ",") : picked), ord: self.nextOrd()))
+            }
+            s.pending.removeAll { $0.id == requestId }
+        }
         d.respond(to: requestId, choose: choose)
     }
 
@@ -93,9 +209,11 @@ final class AgentSessionManager: ObservableObject {
 
     /// 手机回传:批准/拒绝该会话当前的权限待决项。
     func respondPermission(_ sid: String, allow: Bool) {
+        // 权限审批卡是 messages 里一条 .permission 消息(permState==nil 为待处理)。
         guard let s = sessions.first(where: { $0.id == sid }),
-              let req = s.pending.first(where: { $0.kind == .permission }) else { return }
-        respond(sid, requestId: req.id, choose: [allow ? "allow" : "deny"])
+              let m = s.messages.first(where: { $0.kind == .permission && $0.permState == nil }),
+              let reqId = m.permReqId else { return }
+        respond(sid, requestId: reqId, choose: [allow ? "allow" : "deny"])
     }
 
     /// 手机回传:回答该会话当前的选择题待决项(optionIndex 为 1 起的选项序号)。
@@ -117,6 +235,8 @@ final class AgentSessionManager: ObservableObject {
         guard let driver = driver(forOwnerPID: ownerPID) else { return false }
         if toolName == "AskUserQuestion" || toolName == "ExitPlanMode" {
             decide(.allow)   // 放行,让 stream 里的 tool_use→tool_result 处理交互
+        } else if PolicyConstants.readOnlyTools.contains(toolName) {
+            decide(.allow)   // 只读/安全工具直接放行,不弹审批(Read/Grep 等不打断)
         } else {
             driver.injectPermission(toolName: toolName, detail: detail, decide: decide)
         }
@@ -142,6 +262,7 @@ final class AgentSessionManager: ObservableObject {
         managed[sid]?.driver.stop()
         managed[sid] = nil
         sessions.removeAll { $0.id == sid }
+        persist()   // 用户主动结束 → 从落盘移除,重启不再恢复
     }
 
     // MARK: - 事件 → 模型
@@ -152,6 +273,7 @@ final class AgentSessionManager: ObservableObject {
             mutate(sid) { $0.status = st }
         case .sessionId(let aid):
             mutate(sid) { $0.agentSessionId = aid }
+            persist()   // 拿到 claude session_id → 落盘,供崩溃后 --resume 恢复
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {
@@ -175,7 +297,25 @@ final class AgentSessionManager: ObservableObject {
             }
         case .pendingRequest(let req):
             mutate(sid) { s in
-                if !s.pending.contains(where: { $0.id == req.id }) { s.pending.append(req) }
+                if req.kind == .permission {
+                    // 权限:就地把对应的命令消息(Bash: …)变成一张审批卡(命令+按钮);
+                    // 找不到对应命令消息(时序/罕见)则新追加一条。处理后原地变徽标,不消失。
+                    let detail = req.detail ?? ""
+                    let match = s.messages.lastIndex(where: { m in
+                        m.kind == .tool && m.permReqId == nil && (detail.isEmpty || m.text.contains(detail))
+                    }) ?? s.messages.lastIndex(where: { $0.kind == .tool && $0.permReqId == nil })
+                    if let i = match {
+                        s.messages[i].kind = .permission
+                        s.messages[i].permReqId = req.id
+                        if !detail.isEmpty { s.messages[i].text = detail }
+                    } else {
+                        s.messages.append(AgentMessage(id: "perm_\(req.id)", role: "assistant",
+                            kind: .permission, text: detail.isEmpty ? req.title : detail,
+                            ord: self.nextOrd(), permReqId: req.id))
+                    }
+                } else {
+                    if !s.pending.contains(where: { $0.id == req.id }) { s.pending.append(req) }
+                }
                 s.status = .needsResponse
             }
         case .pendingResolved(let id):

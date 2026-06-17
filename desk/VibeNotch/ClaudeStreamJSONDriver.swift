@@ -212,7 +212,9 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         case "Bash":
             emit.yield(.toolCall(ToolCallInfo(id: id, name: "Bash", summary: (input["command"] as? String) ?? "")))
         default:
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: name, summary: "")))
+            let summary = (input["file_path"] ?? input["path"] ?? input["command"]
+                           ?? input["pattern"] ?? input["url"] ?? input["prompt"]) as? String ?? ""
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: name, summary: summary)))
         }
     }
 
@@ -251,26 +253,54 @@ final class ClaudeStreamJSONDriver: AgentDriver {
                 "source": ["type": "base64", "media_type": media, "data": data.base64EncodedString()]]
     }
 
-    /// 解析 claude 可执行路径:GUI App 的 PATH 不含 nvm,用登录 shell 求一次。
-    private static let cachedBinary: String? = {
-        for p in ["/opt/homebrew/bin/claude", "/usr/local/bin/claude"] {
-            if FileManager.default.isExecutableFile(atPath: p) { return p }
+    /// 解析 claude 可执行路径。GUI App 的 PATH 不含 nvm,且启动时非交互 shell 可能没初始化
+    /// nvm → 单靠 `zsh -lc command -v` 不稳。所以:落盘记忆 → 常见路径 → **直接搜 nvm 目录**
+    /// → 交互/登录 shell 兜底。只缓存成功结果(不永久缓存失败)。
+    private static var cachedBinary: String?
+    private static let pathMemo = NSString(string: "~/.vibenotch/claude-path").expandingTildeInPath
+
+    private static func claudeBinary() -> String? {
+        let fm = FileManager.default
+        if let c = cachedBinary, fm.isExecutableFile(atPath: c) { return c }
+        if let found = resolveBinary() {
+            cachedBinary = found
+            try? found.write(toFile: pathMemo, atomically: true, encoding: .utf8)
+            return found
         }
-        // 退回登录 shell 解析(覆盖 nvm 等)
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "command -v claude"]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
-        do {
-            try p.run()
+        return nil
+    }
+
+    private static func resolveBinary() -> String? {
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        // 1. 上次成功落盘的路径
+        if let saved = try? String(contentsOfFile: pathMemo, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !saved.isEmpty, fm.isExecutableFile(atPath: saved) { return saved }
+        // 2. 常见固定路径
+        var candidates = ["/opt/homebrew/bin/claude", "/usr/local/bin/claude",
+                          "\(home)/.local/bin/claude", "\(home)/.claude/local/claude"]
+        // 3. 直接搜 nvm 各 node 版本(新版本优先)
+        let nvmBase = "\(home)/.nvm/versions/node"
+        if let vers = try? fm.contentsOfDirectory(atPath: nvmBase) {
+            for v in vers.sorted().reversed() { candidates.append("\(nvmBase)/\(v)/bin/claude") }
+        }
+        for p in candidates where fm.isExecutableFile(atPath: p) { return p }
+        // 4. 交互/登录 shell 兜底(交互优先,确保 nvm 初始化)
+        for args in [["-ilc", "command -v claude"], ["-lc", "command -v claude"]] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = args
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+            guard (try? p.run()) != nil else { continue }
             let out = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
-            let path = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let path, !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) { return path }
-        } catch {}
+            if let path = String(data: out, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !path.isEmpty, fm.isExecutableFile(atPath: path) { return path }
+        }
         return nil
-    }()
-    private static func claudeBinary() -> String? { cachedBinary }
+    }
 
     enum DriverError: Error { case binaryNotFound }
 }

@@ -68,7 +68,7 @@ struct AgentConsoleRootView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
-                            ForEach(s.messages) { m in messageRow(m) }
+                            ForEach(s.messages) { m in messageRow(m, sid: s.id) }
                             // 待响应:权限/选项合一,渲染成按钮
                             ForEach(s.pending) { req in pendingCard(sid: sid, req: req) }
                             Color.clear.frame(height: 1).id("BOTTOM")
@@ -103,7 +103,7 @@ struct AgentConsoleRootView: View {
     }
 
     @ViewBuilder
-    private func messageRow(_ m: AgentMessage) -> some View {
+    private func messageRow(_ m: AgentMessage, sid: String) -> some View {
         switch m.kind {
         case .text where m.role == "user":
             HStack { Spacer(minLength: 60)
@@ -122,7 +122,36 @@ struct AgentConsoleRootView: View {
         case .file:
             Label(m.text, systemImage: "doc.text").font(.system(size: 12))
                 .foregroundStyle(.green).padding(.leading, 4)
+        case .permission:
+            permissionCard(m, sid: sid)
         }
+    }
+
+    /// 审批卡:就长在命令位置。待处理=命令+允许/拒绝;处理后原地变命令+✓已允许/✕已拒绝。
+    private func permissionCard(_ m: AgentMessage, sid: String) -> some View {
+        let resolved = m.permState
+        let accent: Color = resolved == nil ? .orange : (resolved == "allow" ? .green : .red)
+        return VStack(alignment: .leading, spacing: 8) {
+            Label("需要你处理", systemImage: "exclamationmark.circle.fill")
+                .font(.system(size: 12, weight: .semibold)).foregroundStyle(accent)
+            Text(m.text).font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.primary).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8).background(Color.black.opacity(0.04)).clipShape(RoundedRectangle(cornerRadius: 6))
+            if resolved == nil {
+                HStack(spacing: 8) {
+                    Button("拒绝") { manager.respond(sid, requestId: m.permReqId ?? "", choose: ["deny"]) }
+                    Button("允许") { manager.respond(sid, requestId: m.permReqId ?? "", choose: ["allow"]) }
+                        .buttonStyle(.borderedProminent)
+                }.controlSize(.small)
+            } else {
+                Label(resolved == "allow" ? "✓ 已允许" : "✕ 已拒绝",
+                      systemImage: resolved == "allow" ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(accent)
+            }
+        }
+        .padding(10)
+        .background(accent.opacity(0.10)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private func pendingCard(sid: String, req: PendingRequest) -> some View {

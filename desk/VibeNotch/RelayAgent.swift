@@ -368,6 +368,25 @@ final class RelayAgent: NSObject, ObservableObject {
                 out.append(("msg:\(m.id)", "agent", commandComp(m.text), m.text, m.ord))
             case .file:
                 out.append(("msg:\(m.id)", "agent", fileComp(path: m.text, hunks: []), m.text, m.ord))
+            case .permission:
+                // 审批卡就长在命令位置:待处理=命令+允许/拒绝;处理后原地变命令+✓已允许/✕已拒绝。
+                let root: [String: Any]
+                if let st = m.permState {
+                    let (label, color, icon, style) = st == "allow"
+                        ? ("✓ 已允许", "success", "checkmark.circle.fill", "default")
+                        : ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
+                    root = card(title: "审批请求", icon: icon, style: style, children: [
+                        text("请求执行以下操作:", color: "secondary", style: "caption"),
+                        code(m.text), badge(label, color: color)])
+                } else {
+                    let csid = "c:\(s.id)"
+                    root = card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: [
+                        text("请求执行以下操作:", color: "secondary", style: "caption"), code(m.text),
+                        ["type": "button_group", "props": ["buttons": [
+                            button(label: "拒绝", style: "default", actionId: "perm_deny", value: csid),
+                            button(label: "允许", style: "danger", actionId: "perm_allow", value: csid)]]]])
+                }
+                out.append(("msg:\(m.id)", "agent", root, m.text, m.ord))
             }
         }
         var pord = 1_000_000
@@ -387,12 +406,13 @@ final class RelayAgent: NSObject, ObservableObject {
     }
 
     private func consoleMeta(_ s: AgentSession) -> [String: Any] {
-        let isPending = !s.pending.isEmpty
-        let kind = s.pending.first?.kind
-        let pendingKind = kind == .permission ? "perm" : (kind != nil ? "question" : "")
+        // 待审批的权限现在是 messages 里一条未处理的 .permission 消息;选择题仍在 pending。
+        let permMsg = s.messages.first { $0.kind == .permission && $0.permState == nil }
+        let isPending = !s.pending.isEmpty || permMsg != nil
+        let pendingKind = permMsg != nil ? "perm" : (s.pending.first != nil ? "question" : "")
         return [
             "pendingKind": pendingKind,
-            "pendingDetail": cap(s.pending.first?.detail ?? "", 160),
+            "pendingDetail": cap(permMsg?.text ?? s.pending.first?.detail ?? "", 160),
             "agent": Self.deviceId,
             "title": s.title,
             "terminal": "控制台",
