@@ -49,6 +49,39 @@ final class AgentSessionManager: ObservableObject {
     private var managed: [String: Managed] = [:]
     private var ordCounter = 0
 
+    /// 已打开的项目(工作目录)列表,新→旧,持久化。左侧以项目为中心。
+    @Published private(set) var projects: [String] = []
+    private static let projectsURL = URL(fileURLWithPath:
+        NSString(string: "~/.vibenotch/console-projects.json").expandingTildeInPath)
+
+    /// 打开一个项目(加入左侧列表,置顶)。不自动开会话——点项目时再选 continue/history/fresh。
+    func openProject(_ workdir: String) {
+        projects.removeAll { $0 == workdir }
+        projects.insert(workdir, at: 0)
+        persistProjects()
+    }
+    /// 关闭项目:连同它的活跃会话一起结束,并移出列表。
+    func closeProject(_ workdir: String) {
+        for s in sessions where s.workdir == workdir { closeSession(s.id) }
+        projects.removeAll { $0 == workdir }
+        persistProjects()
+    }
+    /// 某项目当前的活跃会话(若有)。
+    func activeSession(for workdir: String) -> AgentSession? {
+        sessions.first { $0.workdir == workdir }
+    }
+    private func persistProjects() {
+        if let data = try? JSONEncoder().encode(projects) {
+            try? data.write(to: Self.projectsURL, options: .atomic)
+        }
+    }
+    private func loadProjects() {
+        if let data = try? Data(contentsOf: Self.projectsURL),
+           let arr = try? JSONDecoder().decode([String].self, from: data) {
+            projects = arr
+        }
+    }
+
     /// driver 工厂:按 agent 类型造对应适配器(codex 后续加分支)。
     private func makeDriver(_ agent: AgentKind) -> AgentDriver {
         switch agent {
@@ -64,6 +97,7 @@ final class AgentSessionManager: ObservableObject {
     func newSession(agent: AgentKind, workdir: String, resume: String? = nil,
                     continueLast: Bool = false, restoreId: String? = nil) -> String {
         let sid = restoreId ?? "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
+        if !projects.contains(workdir) { projects.append(workdir); persistProjects() }
         let driver = makeDriver(agent)
         let title = (workdir as NSString).lastPathComponent
         sessions.append(AgentSession(id: sid, agent: agent, workdir: workdir, title: title,
@@ -101,6 +135,7 @@ final class AgentSessionManager: ObservableObject {
 
     /// VibeNotch 启动时调:读落盘,用 --resume 把上次的控制台会话重建回来。
     func restoreSessions() {
+        loadProjects()   // 先恢复左侧项目列表
         guard let data = try? Data(contentsOf: Self.persistURL),
               let items = try? JSONDecoder().decode([Persisted].self, from: data) else { return }
         for p in items where !sessions.contains(where: { $0.id == p.id }) {
