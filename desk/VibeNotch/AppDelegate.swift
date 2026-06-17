@@ -338,22 +338,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         udsServer = server
     }
 
-    /// 路由 hook 连接。Phase 5 起 VibeNotch 只接管**自己 spawn 的控制台会话**:
-    /// 控制台会话的 PreToolUse → 新权限路由(审批走控制台/手机);其余一律 dismiss
-    /// (用户手敲的 claude 不再被观察/遥控,保持纯本地)。
+    /// Routes an incoming hook connection. Dangerous PreToolUse events are
+    /// enrolled in `pendingStore`; everything else is dismissed immediately.
     private func handleConnection(_ conn: HookConnection) {
         let event = conn.event
-        guard let ppid = event.ppid, agentManager.isConsoleSession(ownerPID: pid_t(ppid)) else {
-            conn.dismiss()   // 非控制台(手敲)会话:不观察、不遥控
+        let term: String = {
+            guard let p = event.ppid, p > 1 else { return "?" }
+            return ProcessUtils.findTerminalKind(startPid: pid_t(p)).displayName
+        }()
+        vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term) tx=\(event.transcriptPath ?? "<nil>")")
+
+        // 控制台(stream-json 新架构)spawn 的会话:**不进旧 store 路径**(避免与新桥接重复显示)。
+        // 仅 PreToolUse 交给新权限路由(审批走控制台/手机);其余事件直接放过。
+        if let ppid = event.ppid, agentManager.isConsoleSession(ownerPID: pid_t(ppid)) {
+            if event.hookEventName == "PreToolUse" {
+                _ = agentManager.handleConsolePreToolUse(
+                    ownerPID: pid_t(ppid),
+                    toolName: event.toolName ?? "",
+                    detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
+                    decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) })
+            } else {
+                conn.dismiss()
+            }
             return
         }
-        vlog("EVENT \(event.hookEventName) tool=\(event.toolName ?? "-") ppid=\(ppid) (console)")
-        if event.hookEventName == "PreToolUse" {
-            _ = agentManager.handleConsolePreToolUse(
-                ownerPID: pid_t(ppid),
-                toolName: event.toolName ?? "",
-                detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
-                decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) })
+
+        store.apply(event)
+
+        // 每个工具/停止事件来时立即读一次转录,不等下一次 800ms 轮询 → 执行完一步即时显示
+        // (刘海 + 手机两端都受益,因为 RelayAgent 订阅 store 变化即时推送)。
+        if let sid = event.sessionId, let path = event.transcriptPath {
+            switch event.hookEventName {
+            case "PreToolUse", "PostToolUse", "Stop", "Notification":
+                store.updateTurnSteps(sessionId: sid, steps: CodingAgents.turnSteps(transcriptPath: path))
+            default:
+                break
+            }
+        }
+
+        // Start polling the transcript as soon as a new turn begins so that
+        // intermediate assistant text (between tool calls) surfaces live, not
+        // only after Stop. The poll auto-cancels on the next UPS.
+        if event.hookEventName == "UserPromptSubmit",
+           let sid = event.sessionId,
+           let path = event.transcriptPath {
+            scheduleReplyRefresh(sessionId: sid, transcriptPath: path)
+        }
+        // Also start a poll on Stop in case the App was launched mid-turn and
+        // missed the UPS (e.g. App restart while claude was thinking).
+        if event.hookEventName == "Stop",
+           let sid = event.sessionId,
+           let path = event.transcriptPath,
+           replyRefreshTasks[sid] == nil {
+            scheduleReplyRefresh(sessionId: sid, transcriptPath: path)
+        }
+
+        if event.hookEventName == "PreToolUse",
+           let tool = event.toolName,
+           PolicyConstants.dangerousTools.contains(tool),
+           let sid = event.sessionId {
+            vlog("pending permission: sid=\(sid.prefix(8)) tool=\(tool)")
+            pendingStore.add(sid: sid, conn: conn)
+        } else if event.hookEventName == "PreToolUse",
+                  event.toolName == "AskUserQuestion",
+                  let sid = event.sessionId {
+            // 扣住问题:手机可经 hook 字节级精确回答(不模拟按键);
+            // 超时 / 用户选「改在电脑上回答」→ 放行,终端正常弹题。
+            vlog("question gate hold: sid=\(sid.prefix(8)) (不限时,等手机或转电脑)")
+            questionGates[sid]?.dismiss()
+            questionGates[sid] = conn
         } else {
             conn.dismiss()
         }
