@@ -72,6 +72,21 @@ final class RelayAgent: NSObject, ObservableObject {
     private var consoleWindow: [String: Int] = [:]   // csid → 当前推送的消息窗口大小(懒加载)
     private static let defaultConsoleWindow = 25
     private static let consoleWindowStep = 25
+    // hook 会话历史回填(转录里、当前轮之前的旧消息):缓存解析结果 + 窗口大小,翻页扩大窗口。
+    private var hookWindow: [String: Int] = [:]
+    private var hookHistoryCache: [String: [(role: String, kind: AgentMessage.Kind, text: String)]] = [:]
+
+    /// 取某 hook 会话「当前轮之前」的历史消息(转录里),一次解析后缓存复用。
+    private func hookHistory(for e: SessionEntry) -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        if let cached = hookHistoryCache[e.id] { return cached }
+        guard let path = e.transcriptPath else { return [] }
+        let all = AgentSessionManager.parseTranscriptFile(path: path)
+        // 边界 = 最后一条用户消息(当前轮起点);它之后由实时管线渲染,历史只取之前的,避免重复。
+        let boundary = all.lastIndex { $0.role == "user" } ?? all.count
+        let hist = Array(all.prefix(boundary))
+        hookHistoryCache[e.id] = hist
+        return hist
+    }
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
     private var knownSids: Set<String> = []         // 已推送过的会话,用于检测会话整体消失
@@ -205,6 +220,8 @@ final class RelayAgent: NSObject, ObservableObject {
         lastSent.removeAll()
         lastSentConsole.removeAll()   // 否则新连/重连的手机拿不到 console 会话与项目(被去重缓存挡住)
         consoleWindow.removeAll()
+        hookWindow.removeAll()
+        hookHistoryCache.removeAll()  // 重连重算历史边界(当前轮可能已变)
         syncToServer()
         syncConsole()
         syncProjects()
@@ -276,6 +293,7 @@ final class RelayAgent: NSObject, ObservableObject {
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
             for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
             permRecords[sid] = nil
+            hookWindow[sid] = nil; hookHistoryCache[sid] = nil
         }
         knownSids = activeSids
 
@@ -288,7 +306,11 @@ final class RelayAgent: NSObject, ObservableObject {
             }
             let turn = max(turnCount[e.id] ?? 0, 1)
 
-            let meta = sessionMeta(e)
+            // hook 历史回填:窗口默认最后 N 条(当前轮之前);hasMore 让手机显示「加载更早」。
+            let hist = hookHistory(for: e)
+            let hwin = hookWindow[e.id] ?? Self.defaultConsoleWindow
+            var meta = sessionMeta(e)
+            meta["hasMore"] = hist.count > hwin
             let msgs = buildMessages(e, turn: turn)
             let currentIds = Set(msgs.map { $0.id })
             // 只清理**当前轮**消失的消息(流式变化/待批准已处理);过去轮永久保留为历史。
@@ -310,6 +332,30 @@ final class RelayAgent: NSObject, ObservableObject {
                     "v": 1, "t": "ui", "id": m.id, "sid": e.id, "seq": seq, "from": "agent",
                     "fallbackText": m.fallback, "body": body
                 ]))
+            }
+
+            // 历史回填:发窗口内的旧消息(当前轮之前),ord 取负值 —— 永远排在实时消息之前。
+            let shown = hist.suffix(hwin)
+            let startIdx = hist.count - shown.count
+            for (k, hm) in shown.enumerated() {
+                let idx = startIdx + k
+                let mid = "m:\(e.id):h\(idx)"
+                let root: [String: Any]
+                switch hm.kind {
+                case .text where hm.role == "user": root = bubble(role: "user", hm.text)
+                case .tool:                          root = commandComp(hm.text)
+                case .file:                          root = fileComp(path: hm.text, hunks: [])
+                default:                             root = bubble(role: "agent", hm.text)
+                }
+                let body: [String: Any] = ["role": hm.role == "user" ? "user" : "agent",
+                                           "session": meta, "root": root,
+                                           "time": stamp(for: mid), "ord": idx - hist.count]
+                let sig = jsonString(body)
+                guard lastSent[mid] != sig else { continue }
+                lastSent[mid] = sig
+                seq += 1
+                send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": e.id, "seq": seq,
+                                 "from": "agent", "fallbackText": cap(hm.text, 120), "body": body]))
             }
         }
     }
@@ -968,11 +1014,15 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         // 懒加载:手机「加载更早」→ 扩大该会话窗口,重推更老的一批。
         if actionId == "console_load_more" {
-            let csid = body["value"] as? String ?? ""
-            guard !csid.isEmpty else { return }
-            let cur = consoleWindow[csid] ?? Self.defaultConsoleWindow
-            consoleWindow[csid] = cur + Self.consoleWindowStep
-            Task { @MainActor in self.syncConsole() }
+            let sid = body["value"] as? String ?? ""
+            guard !sid.isEmpty else { return }
+            if sid.hasPrefix("c:") {   // 控制台会话
+                consoleWindow[sid] = (consoleWindow[sid] ?? Self.defaultConsoleWindow) + Self.consoleWindowStep
+                Task { @MainActor in self.syncConsole() }
+            } else {                   // hook 会话
+                hookWindow[sid] = (hookWindow[sid] ?? Self.defaultConsoleWindow) + Self.consoleWindowStep
+                Task { @MainActor in self.syncToServer() }
+            }
             return
         }
         // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)

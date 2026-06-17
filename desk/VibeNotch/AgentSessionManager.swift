@@ -191,8 +191,14 @@ final class AgentSessionManager: ObservableObject {
     /// 解析转录 JSONL → (role, kind, 文本)。user 文本 / assistant 文本 / assistant 工具调用。
     nonisolated private static func parseTranscript(sessionId: String)
         -> [(role: String, kind: AgentMessage.Kind, text: String)] {
-        guard let path = findTranscript(sessionId: sessionId),
-              let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+        guard let path = findTranscript(sessionId: sessionId) else { return [] }
+        return parseTranscriptFile(path: path)
+    }
+
+    /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
+    nonisolated static func parseTranscriptFile(path: String)
+        -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
         var out: [(String, AgentMessage.Kind, String)] = []
         for line in content.split(separator: "\n") {
             guard let d = line.data(using: .utf8),
