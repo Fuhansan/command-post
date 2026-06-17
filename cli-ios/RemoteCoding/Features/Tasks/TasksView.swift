@@ -28,8 +28,9 @@ enum SessionStatusUI {
 /// 屏 1 —— 任务列表(首页)。每个 claude 终端会话 = 一个任务(来自服务器,非模拟数据)。
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
-    @State private var showLaunch = false
-    @State private var launchedId: String? = nil   // 已点击启动的 CLI id(展示「已发送」)
+
+    /// 手动会话(用户自己敲的 claude):平铺首页,带「锁屏不可控」标签。
+    private var manualSessions: [RelaySession] { relay.sessions.filter { $0.isManual } }
 
     var body: some View {
         NavigationStack {
@@ -38,14 +39,24 @@ struct TasksView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         header
-                        if relay.sessions.isEmpty {
+                        if relay.projects.isEmpty && manualSessions.isEmpty {
                             emptyState
                         } else {
-                            ForEach(relay.sessions) { s in
-                                NavigationLink(value: s.id) {
-                                    SessionCard(session: s)
+                            if !relay.projects.isEmpty {
+                                sectionTitle("项目", count: relay.projects.count)
+                                ForEach(relay.projects) { proj in
+                                    NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
+                                        ProjectRow(project: proj, sessions: relay.sessions)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
+                            }
+                            if !manualSessions.isEmpty {
+                                sectionTitle("手动会话", count: manualSessions.count)
+                                ForEach(manualSessions) { s in
+                                    NavigationLink(value: s.id) { SessionCard(session: s) }
+                                        .buttonStyle(.plain)
+                                }
                             }
                         }
                     }
@@ -60,8 +71,18 @@ struct TasksView: View {
             .navigationDestination(for: String.self) { sid in
                 TaskDetailView(sessionId: sid)
             }
+            .navigationDestination(for: ProjectRoute.self) { route in
+                ProjectSessionsView(workdir: route.workdir)
+            }
             .toolbar(.hidden, for: .navigationBar)
-            .sheet(isPresented: $showLaunch) { launchSheet }
+        }
+    }
+
+    private func sectionTitle(_ t: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(t).font(.system(size: 14, weight: .bold)).foregroundStyle(Theme.text)
+            Text("\(count)").font(.system(size: 13)).foregroundStyle(Theme.textSec)
+            Spacer()
         }
     }
 
@@ -76,57 +97,7 @@ struct TasksView: View {
                 connectionLine
             }
             Spacer()
-            // 新建会话:电脑端开一个终端跑命令
-            Button {
-                launchedId = nil; showLaunch = true
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .background(Theme.blueBtn).clipShape(Circle())
-            }
-            .disabled(!relay.agents.contains { $0.online })
         }
-    }
-
-    /// 新建会话弹层:选一个 coding 工具,电脑端在默认目录起一个会话(选项而非手输命令)。
-    private var launchSheet: some View {
-        ZStack {
-            Theme.bg.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 14) {
-                Text("新建会话").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
-                Text("选择要启动的工具,电脑端会打开一个会话(工作目录 / 代理在 VibeNotch 设置里配置)。")
-                    .font(.system(size: 13)).foregroundStyle(Theme.textSec)
-                ForEach(CLIKind.all) { cli in
-                    Button {
-                        relay.launchCommand(cli.launchCommand)
-                        launchedId = cli.id
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { showLaunch = false }
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: launchedId == cli.id ? "checkmark.circle.fill" : "terminal")
-                                .font(.system(size: 18))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(cli.displayName).font(.system(size: 16, weight: .semibold))
-                                Text(cli.launchCommand).font(.system(size: 12, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.7))
-                            }
-                            Spacer()
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.vertical, 13).padding(.horizontal, 16)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(launchedId == cli.id ? Theme.green : Theme.blueBtn)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(launchedId != nil)
-                }
-                Spacer()
-            }
-            .padding(24)
-        }
-        .presentationDetents([.medium])
     }
 
     private var connectionLine: some View {
@@ -158,9 +129,9 @@ struct TasksView: View {
         VStack(spacing: 12) {
             Image(systemName: "terminal")
                 .font(.system(size: 40)).foregroundStyle(Theme.textTer)
-            Text("暂无进行中的任务")
+            Text("还没有项目或会话")
                 .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-            Text("在电脑上打开终端运行 Claude Code,会话会作为任务出现在这里")
+            Text("在电脑 VibeNotch「打开项目」,或在终端运行 Claude Code,就会出现在这里")
                 .font(.system(size: 13)).foregroundStyle(Theme.textSec)
                 .multilineTextAlignment(.center)
         }
@@ -202,6 +173,16 @@ struct SessionCard: View {
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .background(Theme.coral).clipShape(Capsule())
                 }
+            }
+            if session.isManual {
+                // 手动会话:用户自己敲的 claude,反控走 GUI 模拟,电脑锁屏后无法操作。
+                HStack(spacing: 5) {
+                    Image(systemName: "hand.raised.fill").font(.system(size: 10))
+                    Text("手动 · 锁屏不可控").font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(Theme.gold)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Theme.gold.opacity(0.15)).clipShape(Capsule())
             }
             if hasCwd {
                 HStack(spacing: 5) {

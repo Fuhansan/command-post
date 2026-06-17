@@ -371,6 +371,7 @@ final class RelayAgent: NSObject, ObservableObject {
         let sid = "console:projects"
         let mid = "m:\(sid):list"
         var cards: [[String: Any]] = []
+        var projList: [[String: Any]] = []     // 结构化项目数据(手机端建项目模型用)
         for proj in mgr.projects {
             let name = (proj as NSString).lastPathComponent
             var kids: [[String: Any]] = [text(proj, color: "secondary", style: "caption")]
@@ -389,6 +390,10 @@ final class RelayAgent: NSObject, ObservableObject {
                 }
             }
             cards.append(card(title: name, icon: "folder.fill", style: "default", children: kids))
+            projList.append([
+                "workdir": proj, "name": name,
+                "history": hist.map { ["id": $0.id, "label": $0.label] }
+            ])
         }
         let root: [String: Any] = cards.isEmpty
             ? bubble(role: "agent", "电脑端还没打开项目。在电脑 VibeNotch「打开项目」后,这里就能选项目开会话。")
@@ -396,10 +401,11 @@ final class RelayAgent: NSObject, ObservableObject {
         let meta: [String: Any] = [
             "title": "📁 打开项目", "terminal": "控制台", "cli": "claude", "cwd": "",
             "subtitle": "选项目开会话", "status": "idle", "needsAction": false,
-            "pendingKind": "", "pendingDetail": "", "agent": Self.deviceId
+            "pendingKind": "", "pendingDetail": "", "agent": Self.deviceId, "source": "projects"
         ]
+        // body.projects:结构化项目列表 —— 手机端据此渲染原生「项目」页(不再解析聊天卡片)。
         let body: [String: Any] = ["role": "agent", "session": meta, "root": root,
-                                   "time": stamp(for: mid), "ord": 0]
+                                   "projects": projList, "time": stamp(for: mid), "ord": 0]
         let sig = jsonString(body)
         guard lastSentConsole[mid] != sig else { return }
         lastSentConsole[mid] = sig
@@ -468,6 +474,8 @@ final class RelayAgent: NSObject, ObservableObject {
             "pendingKind": pendingKind,
             "pendingDetail": cap(permMsg?.text ?? s.pending.first?.detail ?? "", 160),
             "agent": Self.deviceId,
+            "source": "console",          // VibeNotch 起的项目会话 → 手机按项目归类
+            "project": s.workdir,         // 所属项目(工作目录)
             "title": s.title,
             "terminal": "控制台",
             "cli": s.agent.rawValue,
@@ -530,6 +538,8 @@ final class RelayAgent: NSObject, ObservableObject {
             "pendingKind": pendingKind,            // perm=待审批(可批量) question=待选择(逐个)
             "pendingDetail": cap(pendingDetail, 160),
             "agent": Self.deviceId,                // 来自哪台电脑
+            "source": "hook",                      // 用户手动敲的 claude → 手机平铺成独立卡片(锁屏不可控)
+            "project": "",                         // 手动会话不归项目
             "title": project,                     // 项目名(主标题)
             "terminal": e.terminal.displayName,    // 终端 / IDE
             "cli": cli,                            // claude | codex |(空=未知)

@@ -14,7 +14,10 @@ struct RelaySession: Identifiable {
     var pendingKind: String     // ""|perm(待审批,可批量)|question(待选择,需进会话)
     var pendingDetail: String   // 待办摘要(命令 / 题目)
     var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
+    var source: String = ""     // console=VibeNotch 项目会话 | hook=用户手动敲的(锁屏不可控)
     var messages: [UIMessage]   // 该会话的下行富消息
+
+    var isManual: Bool { source == "hook" }   // 手动会话:平铺首页 + 打「锁屏不可控」标签
 }
 
 /// 应用级中转连接(单例,经 environmentObject 注入)。
@@ -24,6 +27,8 @@ final class RelayClient: ObservableObject {
     @Published private(set) var connection: ConnectionState = .disconnected
     @Published private(set) var agents: [AgentInfo] = []
     @Published private(set) var sessions: [RelaySession] = []
+    /// 电脑端打开的项目列表(结构化,来自 `console:projects` 通道)。首页「项目区」用。
+    @Published private(set) var projects: [ProjectInfo] = []
 
     /// 中转地址。iOS 模拟器可直连宿主机 127.0.0.1;真机改成电脑的局域网 IP。
     // MARK: - 服务器地址(设置页只填 IP + 端口,其余固定拼接)
@@ -110,6 +115,7 @@ final class RelayClient: ObservableObject {
         self.account = account
         sessions = []
         agents = []
+        projects = []
         ws.connect(to: Self.currentURL())
     }
 
@@ -119,6 +125,7 @@ final class RelayClient: ObservableObject {
         ws.disconnect()
         sessions = []
         agents = []
+        projects = []
         ws.connect(to: Self.currentURL())
     }
 
@@ -127,12 +134,14 @@ final class RelayClient: ObservableObject {
         ws.disconnect()
         sessions = []
         agents = []
+        projects = []
     }
 
     func disconnect() {
         account = nil
         agents = []
         sessions = []
+        projects = []
         ws.disconnect()
     }
 
@@ -249,7 +258,10 @@ final class RelayClient: ObservableObject {
 
     /// PROTOCOL §5 —— ui 帧按 `sid` 归入对应会话;`body.session` 为任务元信息(首页行用)。
     private func applyUI(_ frame: Frame) {
-        guard let sid = frame.sid, let msg = UIMessage(frame: frame) else { return }
+        guard let sid = frame.sid else { return }
+        // 项目列表通道:解析成结构化项目模型,不当作聊天会话展示。
+        if sid == "console:projects" { applyProjects(frame.body); return }
+        guard let msg = UIMessage(frame: frame) else { return }
         let meta = frame.body?["session"]
         let idx = sessions.firstIndex(where: { $0.id == sid })
         var s = idx.map { sessions[$0] }
@@ -258,6 +270,7 @@ final class RelayClient: ObservableObject {
                             pendingKind: "", pendingDetail: "", agentId: "", messages: [])
         if let meta {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
+            s.source = meta["source"]?.stringValue ?? s.source
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
             s.cli = meta["cli"]?.stringValue ?? s.cli
@@ -279,6 +292,19 @@ final class RelayClient: ObservableObject {
             s.messages.append(msg)
         }
         if let idx { sessions[idx] = s } else { sessions.append(s) }
+    }
+
+    /// 解析 `console:projects` 通道的结构化项目列表 → 驱动首页「项目区」。
+    private func applyProjects(_ body: JSONValue?) {
+        let arr = body?["projects"]?.arrayValue ?? []
+        projects = arr.compactMap { p in
+            let wd = p.string("workdir")
+            guard !wd.isEmpty else { return nil }
+            let hist = (p["history"]?.arrayValue ?? []).map {
+                ProjectHistory(id: $0.string("id"), label: $0.string("label"))
+            }
+            return ProjectInfo(workdir: wd, name: p.string("name"), history: hist)
+        }
     }
 
     /// PROTOCOL §7 —— patch:
@@ -370,6 +396,21 @@ final class RelayClient: ObservableObject {
                        "action_id": .string("launch_command"),
                        "value": .string(cmd)
                      ]))
+    }
+
+    // MARK: - 项目内开会话(电脑端 onRemoteConsoleOpen 处理)
+
+    /// 在项目里「继续最近」会话(claude --continue)。
+    func consoleContinue(workdir: String) { sendConsoleOpen("console_continue", value: workdir) }
+    /// 在项目里开「全新」会话。
+    func consoleNewSession(workdir: String) { sendConsoleOpen("console_new", value: workdir) }
+    /// 从项目历史里「恢复」一条会话(claude --resume <id>)。
+    func consoleResume(workdir: String, historyId: String) {
+        sendConsoleOpen("console_resume", value: "\(workdir)\u{1}\(historyId)")
+    }
+    private func sendConsoleOpen(_ actionId: String, value: String) {
+        sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: "system", localMsgId: nil,
+                     body: .object(["action_id": .string(actionId), "value": .string(value)]))
     }
 
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
