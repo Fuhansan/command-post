@@ -76,6 +76,15 @@ final class RelayAgent: NSObject, ObservableObject {
     private var hookWindow: [String: Int] = [:]
     private var hookHistoryCache: [String: [(role: String, kind: AgentMessage.Kind, text: String)]] = [:]
 
+    // 稳定顺序:每条消息按「首次出现」分配单调递增 ord 并固定 —— 审批卡停在它出现的位置,
+    // 不会因为之后到达的文本而被挤到末尾(修审批后顺序错乱)。
+    private var liveOrdMap: [String: Int] = [:]
+    private var liveOrdCounter = 0
+    private func liveOrd(for id: String) -> Int {
+        if let o = liveOrdMap[id] { return o }
+        let o = liveOrdCounter; liveOrdCounter += 1; liveOrdMap[id] = o; return o
+    }
+
     /// 取某 hook 会话「当前轮之前」的历史消息(转录里),一次解析后缓存复用。
     private func hookHistory(for e: SessionEntry) -> [(role: String, kind: AgentMessage.Kind, text: String)] {
         if let cached = hookHistoryCache[e.id] { return cached }
@@ -294,6 +303,7 @@ final class RelayAgent: NSObject, ObservableObject {
             for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
             permRecords[sid] = nil
             hookWindow[sid] = nil; hookHistoryCache[sid] = nil
+            for k in Array(liveOrdMap.keys) where k.hasPrefix("m:\(sid):") { liveOrdMap[k] = nil }
         }
         knownSids = activeSids
 
@@ -321,9 +331,9 @@ final class RelayAgent: NSObject, ObservableObject {
             }
             // 变化的消息才推。ord = 逻辑顺序号(轮次×1000+轮内位置),手机据此排序渲染,
             // 不受推送到达时序影响 —— 修复审批卡比它前面的文本先到达而排到文本上面的问题。
-            for (i, m) in msgs.enumerated() {
+            for m in msgs {
                 let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
-                                           "time": stamp(for: m.id), "ord": turn * 1000 + i]
+                                           "time": stamp(for: m.id), "ord": liveOrd(for: m.id)]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
