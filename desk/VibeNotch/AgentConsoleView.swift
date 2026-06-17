@@ -6,19 +6,29 @@ import AppKit
 struct AgentConsoleRootView: View {
     @ObservedObject var manager: AgentSessionManager
     @State private var selectedProject: String?
+    @State private var selectedSessionId: String?
+    @State private var projectsCollapsed = false
     @State private var draft: String = ""
 
+    // 微信式三栏:项目栏(可收缩) | 会话列表 | 对话。
     var body: some View {
         HSplitView {
-            sidebar.frame(minWidth: 200, maxWidth: 270)
-            console.frame(minWidth: 520)
+            if !projectsCollapsed {
+                projectsRail.frame(minWidth: 150, maxWidth: 220)
+            }
+            sessionColumn.frame(minWidth: 220, maxWidth: 320)
+            conversationPane.frame(minWidth: 420)
         }
-        .frame(minWidth: 800, minHeight: 480)
+        .frame(minWidth: 880, minHeight: 480)
+        .onChange(of: selectedProject) { _, p in
+            // 切项目 → 默认选中该项目第一个会话(没有则清空,右侧显示新建提示)。
+            selectedSessionId = p.flatMap { proj in manager.sessions.first { $0.workdir == proj }?.id }
+        }
     }
 
-    // MARK: - 左:项目列表
+    // MARK: - 左:项目栏(可收缩)
 
-    private var sidebar: some View {
+    private var projectsRail: some View {
         VStack(spacing: 0) {
             Button(action: openProject) {
                 Label("打开项目", systemImage: "folder.badge.plus").frame(maxWidth: .infinity)
@@ -36,19 +46,15 @@ struct AgentConsoleRootView: View {
     }
 
     private func projectRow(_ proj: String) -> some View {
-        let s = manager.activeSession(for: proj)
-        let needsResp = s.map { !$0.pending.isEmpty
-            || $0.messages.contains { $0.kind == .permission && $0.permState == nil } } ?? false
+        let sessions = manager.sessions.filter { $0.workdir == proj }
+        let needsResp = sessions.contains { !$0.pending.isEmpty
+            || $0.messages.contains { $0.kind == .permission && $0.permState == nil } }
         return VStack(alignment: .leading, spacing: 2) {
             Text((proj as NSString).lastPathComponent).font(.system(size: 13, weight: .medium)).lineLimit(1)
             HStack(spacing: 4) {
-                if let s {
-                    Circle().fill(statusColor(s.status)).frame(width: 7, height: 7)
-                    Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(.secondary)
-                    if needsResp { Text("● 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
-                } else {
-                    Text("未打开会话").font(.system(size: 11)).foregroundStyle(.secondary)
-                }
+                Text(sessions.isEmpty ? "未打开会话" : "\(sessions.count) 个会话")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                if needsResp { Text("● 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
             }
         }
         .padding(.vertical, 2)
@@ -60,69 +66,135 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    // MARK: - 右:会话对话 / 开始面板
+    // MARK: - 中:会话(任务)列表
+
+    private var sessionColumn: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button { projectsCollapsed.toggle() } label: {
+                    Image(systemName: projectsCollapsed ? "sidebar.left" : "sidebar.leading")
+                }
+                .buttonStyle(.plain).help(projectsCollapsed ? "展开项目栏" : "收起项目栏")
+                if let proj = selectedProject {
+                    Text((proj as NSString).lastPathComponent)
+                        .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                } else {
+                    Text("选择项目").font(.system(size: 13)).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let proj = selectedProject { newSessionMenu(proj) }
+            }
+            .padding(8)
+            Divider()
+            if let proj = selectedProject {
+                let sessions = manager.sessions.filter { $0.workdir == proj }
+                if sessions.isEmpty {
+                    startInline(proj)
+                } else {
+                    List(selection: $selectedSessionId) {
+                        ForEach(sessions) { s in sessionRow(s).tag(s.id) }
+                    }
+                    .listStyle(.sidebar)
+                }
+            } else {
+                Spacer()
+            }
+        }
+    }
+
+    private func sessionRow(_ s: AgentSession) -> some View {
+        let needsResp = !s.pending.isEmpty
+            || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(s.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
+            HStack(spacing: 4) {
+                Circle().fill(statusColor(s.status)).frame(width: 7, height: 7)
+                Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(.secondary)
+                if needsResp { Text("● 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+            }
+        }
+        .padding(.vertical, 2)
+        .contextMenu {
+            Button("结束会话") {
+                manager.closeSession(s.id)
+                if selectedSessionId == s.id { selectedSessionId = nil }
+            }
+        }
+    }
+
+    /// 新建会话菜单:继续最近 / 全新 / 从历史恢复。
+    private func newSessionMenu(_ proj: String) -> some View {
+        Menu {
+            Button { start(proj, continueLast: true) } label: {
+                Label("继续最近的会话", systemImage: "clock.arrow.circlepath") }
+            Button { start(proj) } label: { Label("全新会话", systemImage: "plus.bubble") }
+            let history = manager.historyByProject[proj] ?? []
+            if !history.isEmpty {
+                Divider()
+                ForEach(history, id: \.id) { h in
+                    Button { start(proj, resume: h.id) } label: { Text("↩︎ " + h.label) }
+                }
+            }
+        } label: {
+            Image(systemName: "plus.circle.fill").font(.system(size: 15))
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .task(id: proj) { manager.loadHistoryList(for: proj) }
+    }
+
+    /// 项目下还没有会话时,会话栏内联显示「继续最近 / 全新 / 历史」。
+    private func startInline(_ proj: String) -> some View {
+        let history = manager.historyByProject[proj] ?? []
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Button { start(proj, continueLast: true) } label: {
+                    Label("继续最近的会话", systemImage: "clock.arrow.circlepath").frame(maxWidth: .infinity) }
+                    .buttonStyle(.borderedProminent)
+                Button { start(proj) } label: {
+                    Label("全新会话", systemImage: "plus.bubble").frame(maxWidth: .infinity) }
+                if !history.isEmpty {
+                    Text("从历史恢复:").font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary).padding(.top, 4)
+                    ForEach(history, id: \.id) { h in
+                        Button { start(proj, resume: h.id) } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.uturn.backward").font(.system(size: 11))
+                                Text(h.label).font(.system(size: 12)).lineLimit(1)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain).padding(6)
+                        .background(Color.gray.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+            .padding(10)
+        }
+        .task(id: proj) { manager.loadHistoryList(for: proj) }
+    }
+
+    // MARK: - 右:对话
 
     @ViewBuilder
-    private var console: some View {
-        if let proj = selectedProject {
-            if let s = manager.activeSession(for: proj) {
-                conversation(s)
-            } else {
-                startPanel(proj)
-            }
+    private var conversationPane: some View {
+        if let sid = selectedSessionId, let s = manager.sessions.first(where: { $0.id == sid }) {
+            conversation(s)
         } else {
             VStack(spacing: 10) {
-                Image(systemName: "folder").font(.system(size: 40)).foregroundStyle(.secondary)
-                Text("选择左侧项目,或「打开项目」开始").foregroundStyle(.secondary)
+                Image(systemName: selectedProject == nil ? "folder" : "bubble.left.and.bubble.right")
+                    .font(.system(size: 40)).foregroundStyle(.secondary)
+                Text(selectedProject == nil ? "选择左侧项目,或「打开项目」开始"
+                                            : "选择一个会话,或用右上「+」新建")
+                    .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
-    /// 项目无活跃会话 → 选择:继续最近(--continue)/ 全新 / 从历史恢复(--resume)。
-    /// 历史列表走 manager 的项目级缓存,异步加载,切项目秒开不卡。
-    private func startPanel(_ proj: String) -> some View {
-        let history = manager.historyByProject[proj] ?? []
-        return VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text((proj as NSString).lastPathComponent).font(.system(size: 15, weight: .semibold))
-                Text(proj).font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 10) {
-                Button { start(proj, continueLast: true) } label: {
-                    Label("继续最近的会话", systemImage: "clock.arrow.circlepath") }
-                    .buttonStyle(.borderedProminent)
-                Button { start(proj) } label: { Label("全新会话", systemImage: "plus.bubble") }
-            }
-            if !history.isEmpty {
-                Text("从历史恢复:").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(history, id: \.id) { h in
-                            Button { start(proj, resume: h.id) } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "arrow.uturn.backward").font(.system(size: 11))
-                                    Text(h.label).font(.system(size: 12)).lineLimit(1)
-                                    Spacer()
-                                }
-                            }
-                            .buttonStyle(.plain).padding(6)
-                            .background(Color.gray.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
-                        }
-                    }
-                }
-                .frame(maxHeight: 260)
-            }
-            Spacer()
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .task(id: proj) { manager.loadHistoryList(for: proj) }
-    }
-
     private func start(_ proj: String, resume: String? = nil, continueLast: Bool = false) {
-        manager.newSession(agent: .claude, workdir: proj, resume: resume, continueLast: continueLast)
-        // 活跃会话出现后 console 自动切到对话(由 manager.activeSession 驱动)
+        // 新建后立即选中它,右侧切到该会话对话。
+        selectedSessionId = manager.newSession(agent: .claude, workdir: proj,
+                                               resume: resume, continueLast: continueLast)
     }
 
     /// 顶栏 session_id 徽标:显示短 id,点一下复制完整 id(方便排查时直接发出来)。
