@@ -91,6 +91,22 @@ final class AgentSessionManager: ObservableObject {
 
     func interrupt(_ sid: String) { managed[sid]?.driver.interrupt() }
 
+    /// 手机回传:批准/拒绝该会话当前的权限待决项。
+    func respondPermission(_ sid: String, allow: Bool) {
+        guard let s = sessions.first(where: { $0.id == sid }),
+              let req = s.pending.first(where: { $0.kind == .permission }) else { return }
+        respond(sid, requestId: req.id, choose: [allow ? "allow" : "deny"])
+    }
+
+    /// 手机回传:回答该会话当前的选择题待决项(optionIndex 为 1 起的选项序号)。
+    func respondChoice(_ sid: String, optionIndex: Int) {
+        guard let s = sessions.first(where: { $0.id == sid }),
+              let req = s.pending.first(where: { $0.kind == .choice || $0.kind == .planConfirm }) else { return }
+        let i = optionIndex - 1
+        guard i >= 0, i < req.options.count else { return }
+        respond(sid, requestId: req.id, choose: [req.options[i].id])
+    }
+
     /// Path A 权限通道入口:AppDelegate 收到 PreToolUse hook 时调用。
     /// 若该 hook 属于本管理器 spawn 的某个会话(按 ownerPID 父链匹配)→ 接管并返回 true:
     /// - AskUserQuestion / ExitPlanMode:hook 层直接放行(交互由 stream 的 tool_use 处理);
@@ -106,6 +122,9 @@ final class AgentSessionManager: ObservableObject {
         }
         return true
     }
+
+    /// 该 ownerPID(hook 的 _ppid)是否属于本管理器 spawn 的控制台会话。
+    func isConsoleSession(ownerPID: pid_t) -> Bool { driver(forOwnerPID: ownerPID) != nil }
 
     /// 沿 ownerPID 父链上溯,匹配某会话 driver 的 ownerPID(claude 子进程 pid)。
     private func driver(forOwnerPID pid: pid_t) -> AgentDriver? {

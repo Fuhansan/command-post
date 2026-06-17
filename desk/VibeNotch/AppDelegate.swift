@@ -265,6 +265,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             vlog("relay launch: \(command) (workdir=\(dir.isEmpty ? "~" : dir)) proxy=\(proxy.isEmpty ? "无" : "有")")
             TerminalLauncher.run(command: command, workdir: dir, proxy: proxy)
         }
+        agent.agentManager = agentManager   // 控制台(stream-json)会话也桥接到手机(start 内订阅)
         agent.start()
         relayAgent = agent
         SettingsWindowController.shared.relayAgent = agent
@@ -345,6 +346,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return ProcessUtils.findTerminalKind(startPid: pid_t(p)).displayName
         }()
         vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term) tx=\(event.transcriptPath ?? "<nil>")")
+
+        // 控制台(stream-json 新架构)spawn 的会话:**不进旧 store 路径**(避免与新桥接重复显示)。
+        // 仅 PreToolUse 交给新权限路由(审批走控制台/手机);其余事件直接放过。
+        if let ppid = event.ppid, agentManager.isConsoleSession(ownerPID: pid_t(ppid)) {
+            if event.hookEventName == "PreToolUse" {
+                _ = agentManager.handleConsolePreToolUse(
+                    ownerPID: pid_t(ppid),
+                    toolName: event.toolName ?? "",
+                    detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
+                    decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) })
+            } else {
+                conn.dismiss()
+            }
+            return
+        }
+
         store.apply(event)
 
         // 每个工具/停止事件来时立即读一次转录,不等下一次 800ms 轮询 → 执行完一步即时显示
@@ -373,18 +390,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let path = event.transcriptPath,
            replyRefreshTasks[sid] == nil {
             scheduleReplyRefresh(sessionId: sid, transcriptPath: path)
-        }
-
-        // 先看是不是「Agent 控制台」(stream-json 新架构)spawn 的会话:是则权限走新路径
-        // (控制台/手机审批,decide 写回解除 hook 阻塞),不进旧 pendingStore。
-        if event.hookEventName == "PreToolUse", let ppid = event.ppid,
-           agentManager.handleConsolePreToolUse(
-                ownerPID: pid_t(ppid),
-                toolName: event.toolName ?? "",
-                detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
-                decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) }) {
-            vlog("permission → Agent 控制台会话 ppid=\(ppid) tool=\(event.toolName ?? "-")")
-            return
         }
 
         if event.hookEventName == "PreToolUse",

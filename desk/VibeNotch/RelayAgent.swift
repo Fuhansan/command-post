@@ -61,6 +61,11 @@ final class RelayAgent: NSObject, ObservableObject {
     private var task: URLSessionWebSocketTask?
     private lazy var session = URLSession.direct   // 直连中转服务器,不走系统代理
     private var cancellables = Set<AnyCancellable>()
+
+    /// 控制台(stream-json 新架构)会话桥接:订阅它,把 AgentSession 翻成现有手机协议帧。
+    weak var agentManager: AgentSessionManager?
+    private var lastSentConsole: [String: String] = [:]
+    private var knownConsoleSids: Set<String> = []
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
     private var knownSids: Set<String> = []         // 已推送过的会话,用于检测会话整体消失
@@ -130,6 +135,11 @@ final class RelayAgent: NSObject, ObservableObject {
         pending.$decisionEvents
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
+        if let mgr = agentManager {
+            mgr.$sessions
+                .sink { [weak self] _ in Task { @MainActor in self?.syncConsole() } }
+                .store(in: &cancellables)
+        }
         connect()
     }
 
@@ -307,6 +317,123 @@ final class RelayAgent: NSObject, ObservableObject {
         seq += 1
         send(jsonString(["v": 1, "t": "patch", "id": msgId, "sid": sid, "seq": seq,
                          "from": "agent", "body": ["op": "remove"]]))
+    }
+
+    // MARK: - 控制台(stream-json)会话 → 手机(复用现有协议)
+
+    /// 把 AgentSessionManager 的会话翻成手机协议帧。手机 sid 加 "c:" 前缀避免与旧会话冲突;
+    /// 用独立的 lastSentConsole 去重,不与旧 hook 路径互相干扰。
+    private func syncConsole() {
+        guard let mgr = agentManager else { return }
+        let active = Set(mgr.sessions.map { "c:\($0.id)" })
+        for csid in knownConsoleSids where !active.contains(csid) {
+            sendSessionRemove(sid: csid)
+            for k in Array(lastSentConsole.keys) where k.hasPrefix("m:\(csid):") { lastSentConsole[k] = nil }
+        }
+        knownConsoleSids = active
+
+        for s in mgr.sessions {
+            let csid = "c:\(s.id)"
+            let meta = consoleMeta(s)
+            let msgs = consoleMessages(s)
+            let prefix = "m:\(csid):"
+            let curIds = Set(msgs.map { prefix + $0.id })
+            for k in Array(lastSentConsole.keys) where k.hasPrefix(prefix) && !curIds.contains(k) {
+                sendMessageRemove(sid: csid, msgId: k); lastSentConsole[k] = nil
+            }
+            for m in msgs {
+                let mid = prefix + m.id
+                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
+                                           "time": stamp(for: mid), "ord": m.ord]
+                let sig = jsonString(body)
+                guard lastSentConsole[mid] != sig else { continue }
+                lastSentConsole[mid] = sig
+                seq += 1
+                send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": csid, "seq": seq,
+                                 "from": "agent", "fallbackText": m.fallback, "body": body]))
+            }
+        }
+    }
+
+    private func consoleMessages(_ s: AgentSession)
+        -> [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] {
+        var out: [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] = []
+        for m in s.messages {
+            switch m.kind {
+            case .text where m.role == "user":
+                out.append(("msg:\(m.id)", "user", bubble(role: "user", m.text), m.text, m.ord))
+            case .text:
+                out.append(("msg:\(m.id)", "agent", bubble(role: "agent", m.text), m.text, m.ord))
+            case .tool:
+                out.append(("msg:\(m.id)", "agent", commandComp(m.text), m.text, m.ord))
+            case .file:
+                out.append(("msg:\(m.id)", "agent", fileComp(path: m.text, hunks: []), m.text, m.ord))
+            }
+        }
+        var pord = 1_000_000
+        for req in s.pending {
+            pord += 1
+            switch req.kind {
+            case .permission:
+                out.append(("pend:\(req.id)", "agent", consolePermCard(req, csid: "c:\(s.id)"), "需要批准", pord))
+            case .choice, .planConfirm:
+                out.append(("pend:\(req.id)", "agent", consoleChoiceCard(req), "等待你选择", pord))
+            }
+        }
+        if out.isEmpty {
+            out.append(("ready", "agent", bubble(role: "agent", "会话已就绪,发送指令开始 👇"), "会话已就绪", 0))
+        }
+        return out
+    }
+
+    private func consoleMeta(_ s: AgentSession) -> [String: Any] {
+        let isPending = !s.pending.isEmpty
+        let kind = s.pending.first?.kind
+        let pendingKind = kind == .permission ? "perm" : (kind != nil ? "question" : "")
+        return [
+            "pendingKind": pendingKind,
+            "pendingDetail": cap(s.pending.first?.detail ?? "", 160),
+            "agent": Self.deviceId,
+            "title": s.title,
+            "terminal": "控制台",
+            "cli": s.agent.rawValue,
+            "cwd": s.workdir,
+            "subtitle": cap(s.messages.last?.text ?? "", 80),
+            "status": isPending ? "waiting" : consoleStatusKey(s.status),
+            "needsAction": isPending
+        ]
+    }
+
+    private func consoleStatusKey(_ st: SessionStatus) -> String {
+        switch st {
+        case .working, .starting: return "working"
+        case .waitingInput:       return "suspended"
+        case .needsResponse:      return "waiting"
+        case .idle:               return "idle"
+        case .done:               return "done"
+        case .error:              return "error"
+        }
+    }
+
+    private func consolePermCard(_ req: PendingRequest, csid: String) -> [String: Any] {
+        var kids: [[String: Any]] = [text("请求执行以下操作:", color: "secondary", style: "caption")]
+        if let d = req.detail { kids.append(code(d)) }
+        kids.append(["type": "button_group", "props": ["buttons": [
+            button(label: "拒绝", style: "default", actionId: "perm_deny", value: csid),
+            button(label: "允许", style: "danger", actionId: "perm_allow", value: csid)
+        ]]])
+        return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
+    }
+
+    private func consoleChoiceCard(_ req: PendingRequest) -> [String: Any] {
+        var kids: [[String: Any]] = []
+        if let d = req.detail { kids.append(text(d, bold: true)) }
+        let buttons = req.options.enumerated().map { i, opt in
+            button(label: "\(i + 1) · \(opt.label)", style: i == 0 ? "danger" : "default",
+                   actionId: "question_answer", value: "\(i + 1)")
+        }
+        kids.append(["type": "button_group", "props": ["buttons": buttons]])
+        return card(title: req.title, icon: "list.bullet.clipboard.fill", style: "warning", children: kids)
     }
 
     /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
@@ -736,6 +863,11 @@ final class RelayAgent: NSObject, ObservableObject {
             // value = "2"(单选)或 "1,3"(多选,完成后一次性回传)
             let digits = value.split(separator: ",").map(String.init).filter { Int($0) != nil }
             guard !digits.isEmpty else { return }
+            // 控制台(stream-json)会话:路由到 AgentSessionManager
+            if sid.hasPrefix("c:"), let n = Int(digits[0]) {
+                agentManager?.respondChoice(String(sid.dropFirst(2)), optionIndex: n)
+                return
+            }
             var isMulti = false
             if let e = store.sessions.first(where: { $0.id == sid }), let pq = e.pendingQuestion {
                 isMulti = pq.questions.first?.multiSelect == true
@@ -770,6 +902,17 @@ final class RelayAgent: NSObject, ObservableObject {
             ?? (body["msg_id"] as? String).map { $0.replacingOccurrences(of: "msg:", with: "") }
             ?? ""
         guard !sid.isEmpty else { return }
+        // 控制台(stream-json)会话:sid 带 "c:" 前缀 → 路由到 AgentSessionManager
+        if sid.hasPrefix("c:") {
+            let csid = String(sid.dropFirst(2))
+            switch actionId {
+            case "perm_allow":    agentManager?.respondPermission(csid, allow: true)
+            case "perm_deny":     agentManager?.respondPermission(csid, allow: false)
+            case "session_close": agentManager?.closeSession(csid)
+            default: break
+            }
+            return
+        }
         switch actionId {
         case "perm_allow":    onRemoteDecision?(sid, .allow)
         case "perm_deny":     onRemoteDecision?(sid, .deny)
@@ -784,6 +927,11 @@ final class RelayAgent: NSObject, ObservableObject {
         guard let sid = obj["sid"] as? String,
               let body = obj["body"] as? [String: Any] else { return }
         let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // 控制台(stream-json)会话:文本直接路由到 AgentSessionManager(图片后续支持)
+        if sid.hasPrefix("c:") {
+            agentManager?.send(String(sid.dropFirst(2)), text: text)
+            return
+        }
         let images = body["images"] as? [[String: Any]] ?? []
         // 图片要从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程注入终端。
         Task.detached(priority: .userInitiated) { [weak self] in
