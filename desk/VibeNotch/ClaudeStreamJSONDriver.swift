@@ -44,7 +44,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
 
     // MARK: - 生命周期
 
-    func start(workdir: String, resume: String?) async throws {
+    func start(workdir: String, resume: String?, continueLast: Bool) async throws {
         guard let bin = Self.claudeBinary() else {
             emit.yield(.error("找不到 claude 可执行文件"))
             throw DriverError.binaryNotFound
@@ -54,7 +54,8 @@ final class ClaudeStreamJSONDriver: AgentDriver {
                     "--output-format", "stream-json",
                     "--verbose",
                     "--permission-mode", permissionMode]
-        if let resume, !resume.isEmpty { args += ["--resume", resume] }
+        if continueLast { args += ["--continue"] }
+        else if let resume, !resume.isEmpty { args += ["--resume", resume] }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)

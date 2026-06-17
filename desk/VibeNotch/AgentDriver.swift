@@ -125,8 +125,8 @@ protocol AgentDriver: AnyObject {
     /// 统一事件流 —— 上层唯一消费点。driver 是事件源,天然解耦,一个崩了不连累别的会话。
     var events: AsyncStream<SessionEvent> { get }
 
-    /// 启动会话(在 workdir 起子进程;resume 非空则恢复既有会话)。
-    func start(workdir: String, resume: String?) async throws
+    /// 启动会话。resume 非空 → 恢复指定会话(--resume);continueLast → 继续该目录最近会话(--continue)。
+    func start(workdir: String, resume: String?, continueLast: Bool) async throws
     /// 发用户输入(文本 + 图片)。
     func send(_ input: UserInput)
     /// 回答一个待决项(权限放行/拒绝、或选择题选项)。optionIds 取自 PendingRequest.options。

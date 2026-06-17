@@ -185,9 +185,32 @@ struct AgentConsoleRootView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "在此目录开会话"
+        panel.prompt = "选此目录"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        selected = manager.newSession(agent: .claude, workdir: url.path)
+        let workdir = url.path
+        let history = AgentSessionManager.listHistory(workdir: workdir)
+
+        // 选择:全新 / 继续最近(--continue)/ 从该目录历史会话恢复(--resume)
+        let alert = NSAlert()
+        alert.messageText = "在此目录开会话"
+        alert.informativeText = workdir
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 380, height: 26))
+        popup.addItem(withTitle: "全新会话")
+        popup.addItem(withTitle: "继续最近的会话(--continue)")
+        for h in history { popup.addItem(withTitle: "恢复:\(h.label)") }
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "开始")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let idx = popup.indexOfSelectedItem
+        if idx == 1 {
+            selected = manager.newSession(agent: .claude, workdir: workdir, continueLast: true)
+        } else if idx >= 2, idx - 2 < history.count {
+            selected = manager.newSession(agent: .claude, workdir: workdir, resume: history[idx - 2].id)
+        } else {
+            selected = manager.newSession(agent: .claude, workdir: workdir)
+        }
     }
 
     private func statusColor(_ s: SessionStatus) -> Color {

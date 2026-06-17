@@ -61,7 +61,8 @@ final class AgentSessionManager: ObservableObject {
     /// resume 非空 → claude --resume <id> 恢复既有会话;restoreId 非空 → 沿用旧的 VibeNotch
     /// 会话 id(崩溃恢复时保持 id 稳定,手机端不混乱)。
     @discardableResult
-    func newSession(agent: AgentKind, workdir: String, resume: String? = nil, restoreId: String? = nil) -> String {
+    func newSession(agent: AgentKind, workdir: String, resume: String? = nil,
+                    continueLast: Bool = false, restoreId: String? = nil) -> String {
         let sid = restoreId ?? "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
         let driver = makeDriver(agent)
         let title = (workdir as NSString).lastPathComponent
@@ -75,7 +76,7 @@ final class AgentSessionManager: ObservableObject {
         }
         managed[sid] = m
         Task {
-            do { try await driver.start(workdir: workdir, resume: resume) }
+            do { try await driver.start(workdir: workdir, resume: resume, continueLast: continueLast) }
             catch { await self.apply(.error("启动失败: \(error)"), to: sid) }
         }
         persist()
@@ -106,7 +107,7 @@ final class AgentSessionManager: ObservableObject {
             let kind = AgentKind(rawValue: p.agent) ?? .claude
             vlog("console restore: 恢复会话 \(p.title) (--resume \(p.resumeId?.prefix(8) ?? "-"))")
             newSession(agent: kind, workdir: p.workdir, resume: p.resumeId, restoreId: p.id)
-            if let rid = p.resumeId { loadHistory(sessionId: rid, into: p.id) }   // 读转录重建历史
+            // 历史在拿到 session_id 时统一加载(见 apply(.sessionId))。
         }
     }
 
@@ -166,6 +167,44 @@ final class AgentSessionManager: ObservableObject {
             }
         }
         return out
+    }
+
+    /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。
+    nonisolated static func listHistory(workdir: String, limit: Int = 30) -> [(id: String, label: String)] {
+        let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        let dir = NSString(string: "~/.claude/projects/\(enc)").expandingTildeInPath
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+        var items: [(id: String, label: String, mtime: Date)] = []
+        for f in files where f.hasSuffix(".jsonl") {
+            let id = String(f.dropLast(6))
+            let full = "\(dir)/\(f)"
+            let mtime = (try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date ?? .distantPast
+            let prompt = firstUserPrompt(path: full).map { String($0.prefix(48)) } ?? id
+            items.append((id, prompt, mtime))
+        }
+        return items.sorted { $0.mtime > $1.mtime }.prefix(limit).map { (id: $0.id, label: $0.label) }
+    }
+
+    /// 读转录里第一条用户文本(历史列表的标签)。
+    nonisolated private static func firstUserPrompt(path: String) -> String? {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        for line in content.split(separator: "\n") {
+            guard let d = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (o["type"] as? String) == "user", let m = o["message"] as? [String: Any] else { continue }
+            if let s = (m["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                return s
+            }
+            if let blocks = m["content"] as? [[String: Any]] {
+                for b in blocks where (b["type"] as? String) == "text" {
+                    if let t = (b["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+                        return t
+                    }
+                }
+            }
+        }
+        return nil
     }
 
     /// 按 sessionId 在 ~/.claude/projects 下递归找转录文件(不必算目录编码)。
@@ -274,6 +313,7 @@ final class AgentSessionManager: ObservableObject {
         case .sessionId(let aid):
             mutate(sid) { $0.agentSessionId = aid }
             persist()   // 拿到 claude session_id → 落盘,供崩溃后 --resume 恢复
+            loadHistory(sessionId: aid, into: sid)   // resume/continue/restore 时把历史读回来(空会话无害)
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {
