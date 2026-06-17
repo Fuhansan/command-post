@@ -18,8 +18,12 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     )
 
     private(set) var sessionId: String?
+    var ownerPID: pid_t? { proc?.processIdentifier }
     let events: AsyncStream<SessionEvent>
     private let emit: AsyncStream<SessionEvent>.Continuation
+
+    /// 权限审批回写器:reqId → 调用即写回 allow/deny 解除 PreToolUse hook 阻塞。
+    private var permDeciders: [String: (PermissionDecision) -> Void] = [:]
 
     private var proc: Process?
     private var stdinHandle: FileHandle?
@@ -28,7 +32,11 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     /// 记录最近一次 assistant 文本块的 msgId,便于 messageComplete 配对。
     private var lastAssistantMsgId: String?
 
-    init() {
+    /// default = 权限走 PreToolUse hook(Path A,控制台默认);bypassPermissions = 全放行(测试用)。
+    private let permissionMode: String
+
+    init(permissionMode: String = "default") {
+        self.permissionMode = permissionMode
         var c: AsyncStream<SessionEvent>.Continuation!
         events = AsyncStream { c = $0 }
         emit = c
@@ -45,7 +53,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
                     "--input-format", "stream-json",
                     "--output-format", "stream-json",
                     "--verbose",
-                    "--permission-mode", "default"]
+                    "--permission-mode", permissionMode]
         if let resume, !resume.isEmpty { args += ["--resume", resume] }
 
         let p = Process()
@@ -99,15 +107,32 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         writeJSON(["type": "user", "message": ["role": "user", "content": content]])
     }
 
+    /// Path A 权限通道:PreToolUse hook(经 AppDelegate/SessionManager 按 ppid 路由进来)→
+    /// 发出 pendingRequest(.permission),记下回写器;respond 时调用它解除 hook 阻塞。
+    func injectPermission(toolName: String, detail: String, decide: @escaping (PermissionDecision) -> Void) {
+        let reqId = "perm_" + UUID().uuidString
+        permDeciders[reqId] = decide
+        emit.yield(.pendingRequest(PendingRequest(
+            id: reqId, kind: .permission, title: "审批请求",
+            detail: detail.isEmpty ? toolName : "\(toolName): \(detail)",
+            options: [.init(id: "allow", label: "允许", detail: nil),
+                      .init(id: "deny", label: "拒绝", detail: nil)],
+            multiSelect: false)))
+    }
+
     func respond(to requestId: String, choose optionIds: [String]) {
-        // 选项卡(AskUserQuestion/ExitPlanMode):回 tool_result,tool_use_id = requestId。
-        // 选择内容用 label 文本(Phase 0 实测纯文本即可驱动 claude 继续)。
+        // ① 权限审批:写回 hook 解除阻塞,不走 stdin。
+        if let decide = permDeciders.removeValue(forKey: requestId) {
+            decide(optionIds.contains("allow") ? .allow : .deny)
+            emit.yield(.pendingResolved(id: requestId))
+            return
+        }
+        // ② 选项卡(AskUserQuestion/ExitPlanMode):回 tool_result,tool_use_id = requestId。
         let answer = optionIds.joined(separator: ", ")
         writeJSON(["type": "user", "message": ["role": "user", "content": [
             ["type": "tool_result", "tool_use_id": requestId, "content": answer]
         ]]])
         emit.yield(.pendingResolved(id: requestId))
-        // TODO(权限通道):.permission 类不走这里,而是通过 UDSServer 解除 PreToolUse hook 阻塞。
     }
 
     // MARK: - 下行:stream-json 解析 → 统一事件

@@ -117,6 +117,11 @@ protocol AgentDriver: AnyObject {
     var capabilities: AgentCapabilities { get }
     /// agent 报告的会话 id(供 resume);未知时为 nil。
     var sessionId: String? { get }
+    /// 子进程 pid —— 用于把外部 hook 事件(按 _ppid 父链)关联回本会话(Path A 权限通道)。
+    var ownerPID: pid_t? { get }
+    /// 注入一个权限审批请求(claude:由 PreToolUse hook 路由进来)。driver 据此发出
+    /// `pendingRequest(.permission)`,并在 `respond` 时调用 `decide` 写回 allow/deny 解除阻塞。
+    func injectPermission(toolName: String, detail: String, decide: @escaping (PermissionDecision) -> Void)
     /// 统一事件流 —— 上层唯一消费点。driver 是事件源,天然解耦,一个崩了不连累别的会话。
     var events: AsyncStream<SessionEvent> { get }
 
@@ -130,4 +135,11 @@ protocol AgentDriver: AnyObject {
     func interrupt()
     /// 结束会话(杀子进程)。
     func stop()
+}
+
+extension AgentDriver {
+    /// 默认:不支持权限注入的 driver 兜底拒绝(避免 hook 永久阻塞)。
+    func injectPermission(toolName: String, detail: String, decide: @escaping (PermissionDecision) -> Void) {
+        decide(.deny)
+    }
 }

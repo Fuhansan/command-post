@@ -26,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastHoverState: Bool = false
     private static let hoverCollapseGrace: TimeInterval = 0.20
     let store = SessionStore()
+    /// stream-json 新架构的多会话宿主(与旧 hook 路径并存,经 Agent 控制台使用)。
+    let agentManager = AgentSessionManager()
     let pendingStore = PendingDecisionStore()
     private var relayAgent: RelayAgent?
     private var autoExpandUntil: Date?
@@ -69,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startLivenessSweep()
         setupRelayAgent()
         startCaffeinate()
+        AgentConsoleWindowController.shared.manager = agentManager
     }
 
     /// 防系统深度休眠 —— 否则锁屏后系统休眠会断 WS、停掉 tmux,远程就失联。
@@ -372,6 +375,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             scheduleReplyRefresh(sessionId: sid, transcriptPath: path)
         }
 
+        // 先看是不是「Agent 控制台」(stream-json 新架构)spawn 的会话:是则权限走新路径
+        // (控制台/手机审批,decide 写回解除 hook 阻塞),不进旧 pendingStore。
+        if event.hookEventName == "PreToolUse", let ppid = event.ppid,
+           agentManager.handleConsolePreToolUse(
+                ownerPID: pid_t(ppid),
+                toolName: event.toolName ?? "",
+                detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
+                decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) }) {
+            vlog("permission → Agent 控制台会话 ppid=\(ppid) tool=\(event.toolName ?? "-")")
+            return
+        }
+
         if event.hookEventName == "PreToolUse",
            let tool = event.toolName,
            PolicyConstants.dangerousTools.contains(tool),
@@ -565,6 +580,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(tmux)
         tmuxItem = tmux
 
+        // stream-json 新架构的桌面入口(实验):点开类终端窗口,自己 spawn 会话对话。
+        menu.addItem({
+            let mi = NSMenuItem(title: "Agent 控制台(实验)",
+                                action: #selector(openAgentConsole), keyEquivalent: "")
+            return mi
+        }())
+
         menu.addItem(.separator())
 
         let displayParent = NSMenuItem(
@@ -623,6 +645,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mi.state = (stored == screen.localizedName) ? .on : .off
             menu.addItem(mi)
         }
+    }
+
+    @objc private func openAgentConsole() {
+        AgentConsoleWindowController.shared.show()
     }
 
     @objc private func openSettings() {

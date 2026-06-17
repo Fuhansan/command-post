@@ -91,6 +91,33 @@ final class AgentSessionManager: ObservableObject {
 
     func interrupt(_ sid: String) { managed[sid]?.driver.interrupt() }
 
+    /// Path A 权限通道入口:AppDelegate 收到 PreToolUse hook 时调用。
+    /// 若该 hook 属于本管理器 spawn 的某个会话(按 ownerPID 父链匹配)→ 接管并返回 true:
+    /// - AskUserQuestion / ExitPlanMode:hook 层直接放行(交互由 stream 的 tool_use 处理);
+    /// - 其它工具:注入 .permission 待响应,审批走控制台/手机,decide 写回解除 hook 阻塞。
+    /// 不属于本管理器(用户自己终端里的 claude)→ 返回 false,走旧路径。
+    func handleConsolePreToolUse(ownerPID: pid_t, toolName: String, detail: String,
+                                 decide: @escaping (PermissionDecision) -> Void) -> Bool {
+        guard let driver = driver(forOwnerPID: ownerPID) else { return false }
+        if toolName == "AskUserQuestion" || toolName == "ExitPlanMode" {
+            decide(.allow)   // 放行,让 stream 里的 tool_use→tool_result 处理交互
+        } else {
+            driver.injectPermission(toolName: toolName, detail: detail, decide: decide)
+        }
+        return true
+    }
+
+    /// 沿 ownerPID 父链上溯,匹配某会话 driver 的 ownerPID(claude 子进程 pid)。
+    private func driver(forOwnerPID pid: pid_t) -> AgentDriver? {
+        var cur = pid, depth = 0
+        while cur > 1 && depth < 32 {
+            for m in managed.values where m.driver.ownerPID == cur { return m.driver }
+            guard let info = ProcessUtils.procInfo(pid: cur) else { return nil }
+            cur = info.ppid; depth += 1
+        }
+        return nil
+    }
+
     func closeSession(_ sid: String) {
         managed[sid]?.consumeTask?.cancel()
         managed[sid]?.driver.stop()
