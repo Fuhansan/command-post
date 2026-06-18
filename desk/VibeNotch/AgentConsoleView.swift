@@ -131,8 +131,7 @@ struct AgentConsoleRootView: View {
         let dot: Color = sessions.isEmpty ? CT.faint : (working ? CT.success : CT.accent)
         return Button { selectedProject = proj } label: {
             HStack(spacing: 9) {
-                Image(systemName: "folder.fill").font(.system(size: 12))
-                    .foregroundStyle(sel ? CT.accent : CT.faint)
+                iconBox("folder.fill", CT.accent, size: 26)
                 VStack(alignment: .leading, spacing: 2) {
                     Text((proj as NSString).lastPathComponent)
                         .font(.system(size: 13, weight: .medium)).foregroundStyle(CT.text).lineLimit(1)
@@ -140,14 +139,16 @@ struct AgentConsoleRootView: View {
                         Circle().fill(dot).frame(width: 5, height: 5)
                         Text(sessions.isEmpty ? "未打开会话" : "\(sessions.count) 个会话")
                             .font(.system(size: 11)).foregroundStyle(CT.sub)
-                        if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+                        if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(CT.warn) }
                     }
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 8).padding(.vertical, 7)
+            .padding(.horizontal, 8).padding(.vertical, 6)
             .background(sel ? CT.sel : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(sel ? CT.selBorder : Color.clear, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain).focusEffectDisabled()
@@ -206,31 +207,45 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 干净白卡外壳(对齐设计图):标题 + 状态行(点+文字+可选标签)+ 右侧相对时间;选中=蓝框浅蓝底。
-    private func cleanCard<S: View>(selected: Bool, title: String, time: String,
-                                    @ViewBuilder status: () -> S) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
-            HStack(spacing: 5) {
-                status()
-                Spacer(minLength: 6)
-                Text(time).font(.system(size: 11)).foregroundStyle(CT.faint)
+    /// 图标进彩色圆角方块(CC Switch 范式)。
+    private func iconBox(_ systemName: String, _ tint: Color, size: CGFloat = 32) -> some View {
+        Image(systemName: systemName).font(.system(size: size * 0.44, weight: .medium))
+            .foregroundStyle(tint)
+            .frame(width: size, height: size)
+            .background(tint.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: size * 0.26))
+    }
+
+    /// 状态胶囊(浅色底 + 同色字)。
+    private func statusPill(_ text: String, _ color: Color) -> some View {
+        Text(text).font(.system(size: 10.5, weight: .medium)).foregroundStyle(color)
+            .padding(.horizontal, 7).padding(.vertical, 1.5)
+            .background(color.opacity(0.12)).clipShape(Capsule())
+    }
+
+    /// 会话卡外壳(CC Switch 风):图标方块 + 标题 + 右侧时间 + 状态行;白卡细描边,选中浅蓝底蓝边。
+    private func cleanCard<S: View>(selected: Bool, icon: String, tint: Color, title: String,
+                                    time: String, @ViewBuilder status: () -> S) -> some View {
+        HStack(spacing: 11) {
+            iconBox(icon, tint)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(title).font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(CT.text).lineLimit(1)
+                    Spacer(minLength: 6)
+                    if !time.isEmpty {
+                        Text(time).font(.system(size: 11)).foregroundStyle(CT.faint)
+                    }
+                }
+                HStack(spacing: 6) { status() }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(selected ? CT.sel : CT.bg)
-        .overlay(RoundedRectangle(cornerRadius: 9)
-            .stroke(selected ? CT.accent : CT.hairline, lineWidth: selected ? 1.5 : 1))
-        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .padding(12)
+        .background(selected ? CT.sel : CT.card)
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .stroke(selected ? CT.selBorder : CT.border, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .contentShape(Rectangle())
-    }
-
-    /// 类型小标签(非默认会话才显示:Codex / 手动 / 历史)。
-    private func typeChip(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.system(size: 9, weight: .semibold)).foregroundStyle(color)
-            .padding(.horizontal, 5).padding(.vertical, 1.5)
-            .background(color.opacity(0.13)).clipShape(Capsule())
     }
 
     /// 相对时间:今天=HH:mm,昨天,N 天前,更早=MM-dd。
@@ -252,12 +267,12 @@ struct AgentConsoleRootView: View {
         let sel = selectedSessionId == s.id
         let needsResp = !s.pending.isEmpty
             || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+        let tint: Color = s.agent == .codex ? CT.indigo : CT.accent
         return Button { selectedSessionId = s.id; activeTab = .session } label: {
-            cleanCard(selected: sel, title: s.title, time: relTime(s.startedAt)) {
-                Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
-                Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
-                if s.agent == .codex { typeChip("Codex", CT.indigo) }
-                if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+            cleanCard(selected: sel, icon: "sparkle", tint: tint, title: s.title, time: relTime(s.startedAt)) {
+                statusPill(statusText(s.status), statusColor(s.status))
+                if needsResp { statusPill("待响应", CT.warn) }
+                Spacer(minLength: 0)
             }
         }
         .buttonStyle(.plain).focusEffectDisabled()
@@ -269,36 +284,30 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 手动会话卡:橙色「手动」标签 —— 你在 IDE/终端里自己跑的,只读 + 可唤起窗口。
+    /// 手动会话卡:橙色「手动」—— 你在 IDE/终端里自己跑的,只读 + 可唤起窗口。
     private func manualCard(_ e: SessionEntry) -> some View {
         let sel = selectedSessionId == e.id
-        let dot: Color = {
-            switch e.state {
-            case .working: return CT.success
-            case .waiting: return CT.orange
-            default:       return CT.faint
-            }
-        }()
         return Button { selectedSessionId = e.id; activeTab = .session } label: {
-            cleanCard(selected: sel, title: manualTitle(e), time: relTime(e.lastActivityAt)) {
-                Circle().fill(dot).frame(width: 6, height: 6)
+            cleanCard(selected: sel, icon: "hand.raised.fill", tint: CT.orange,
+                      title: manualTitle(e), time: relTime(e.lastActivityAt)) {
+                statusPill("手动", CT.orange)
                 Text(e.terminal.displayName).font(.system(size: 11)).foregroundStyle(CT.sub)
-                typeChip("手动", CT.orange)
+                Spacer(minLength: 0)
             }
         }
         .buttonStyle(.plain).focusEffectDisabled()
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
-    /// 历史会话卡:灰「历史」标签 —— 已结束、可恢复。点击=选中只读浏览(不重启),
-    /// 进去后点屏幕才恢复。
+    /// 历史会话卡:灰「历史」—— 已结束、可恢复。点击=选中只读浏览(不重启),进去后点屏幕才恢复。
     private func historyCard(_ h: HistoryEntry, _ proj: String) -> some View {
         let sel = selectedSessionId == h.id
         return Button { selectedSessionId = h.id; activeTab = .session } label: {
-            cleanCard(selected: sel, title: h.label, time: relTime(h.mtime)) {
-                Circle().fill(CT.faint).frame(width: 6, height: 6)
+            cleanCard(selected: sel, icon: "clock.arrow.circlepath", tint: CT.faint,
+                      title: h.label, time: relTime(h.mtime)) {
+                statusPill("历史", CT.faint)
                 Text("已结束").font(.system(size: 11)).foregroundStyle(CT.sub)
-                typeChip("历史", CT.faint)
+                Spacer(minLength: 0)
             }
         }
         .buttonStyle(.plain).focusEffectDisabled()
@@ -397,11 +406,11 @@ struct AgentConsoleRootView: View {
                     .frame(width: 12, height: 12).contentShape(Rectangle()).onTapGesture { onClose() }
             }
         }
-        .padding(.horizontal, 9).padding(.vertical, 5)
+        .padding(.horizontal, 10).padding(.vertical, 6)
         .background(active ? CT.sel : Color.clear)
-        .overlay(RoundedRectangle(cornerRadius: 7)
-            .stroke(active ? CT.accent.opacity(0.4) : Color.clear, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .stroke(active ? CT.selBorder : Color.clear, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle()).onTapGesture { onTap() }
     }
 
@@ -759,10 +768,11 @@ struct AgentConsoleRootView: View {
         }
     }
 
+    /// 消息头像:同 iconBox 范式(浅色底 + 同色图标)。
     private func avatar(_ system: String, _ color: Color) -> some View {
-        Image(systemName: system).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
-            .frame(width: 22, height: 22).background(color)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+        Image(systemName: system).font(.system(size: 11, weight: .semibold)).foregroundStyle(color)
+            .frame(width: 26, height: 26).background(color.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
     }
 
     /// 工具卡:工具名 + 命令代码块(m.text = "Bash: <命令>")。
@@ -772,7 +782,7 @@ struct AgentConsoleRootView: View {
         let name = parts.first.flatMap { $0.isEmpty ? nil : $0 } ?? "工具"
         let cmd = parts.count > 1 ? parts[1] : ""
         return HStack(alignment: .top, spacing: 9) {
-            avatar("terminal.fill", CT.text.opacity(0.75))
+            avatar("terminal.fill", CT.sub)
             VStack(alignment: .leading, spacing: 7) {
                 Text(name).font(.system(size: 12, weight: .semibold)).foregroundStyle(CT.text)
                 if !cmd.isEmpty {
@@ -784,7 +794,8 @@ struct AgentConsoleRootView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(CT.hairline, lineWidth: 1))
+            .background(CT.card)
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(CT.border, lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
     }
@@ -889,19 +900,23 @@ private enum CT {
         Color(.sRGB, red: Double((v >> 16) & 0xFF) / 255,
               green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
     }
-    static let bg       = hex(0xFFFFFF)   // 对话区底
-    static let panel    = hex(0xF7F8FA)   // 左/中栏底
-    static let accent   = hex(0x3B82F6)   // 主蓝
-    static let text     = hex(0x1F2328)   // 主文字
-    static let sub      = hex(0x6B7280)   // 次文字
-    static let faint    = hex(0x9AA1AC)   // 更淡
-    static let hairline = Color.black.opacity(0.08)
-    static let sel      = hex(0x3B82F6).opacity(0.10)   // 选中底
+    static let bg        = hex(0xFFFFFF)   // 内容白
+    static let panel     = hex(0xF6F7F9)   // 侧栏极浅灰
+    static let card      = hex(0xFFFFFF)   // 卡片白
+    static let border    = hex(0xE5E7EB)   // 极细描边
+    static let hairline  = hex(0xEDEFF2)   // 分隔线(更淡)
+    static let accent    = hex(0x2563EB)   // 主蓝
+    static let text      = hex(0x1F2937)   // 近黑
+    static let sub       = hex(0x6B7280)   // 中灰
+    static let faint     = hex(0x9CA3AF)   // 浅灰
+    static let sel       = hex(0xEFF4FE)   // 选中浅蓝底
+    static let selBorder = hex(0xA5C8F5)   // 选中蓝边
     static let userBubble = hex(0xEAF1FE)  // 用户气泡
-    static let toolBg   = hex(0xF3F4F6)   // 代码/工具底
-    static let success  = hex(0x16A34A)   // 绿
-    static let indigo   = hex(0x7C5CD6)   // Codex 会话类型色
-    static let orange   = hex(0xE8810C)   // 手动会话类型色
+    static let toolBg    = hex(0xF6F7F9)   // 代码/工具底
+    static let success   = hex(0x16A34A)   // 绿
+    static let warn      = hex(0xE8810C)   // 橙(警示 / 手动)
+    static let indigo    = hex(0x7C5CD6)   // Codex
+    static let orange    = hex(0xE8810C)   // 手动
 }
 
 /// 文件树节点(url + 是否目录,isDir 预算好不再 body 里 syscall)。
