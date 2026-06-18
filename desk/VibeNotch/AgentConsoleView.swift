@@ -107,9 +107,9 @@ struct AgentConsoleRootView: View {
                 }
                 .padding(.horizontal, 14).padding(.bottom, 4)
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(FileTreeRow.children(of: URL(fileURLWithPath: proj)), id: \.self) { url in
-                            FileTreeRow(url: url, depth: 0, expanded: $expandedDirs, onOpen: openFile)
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(DirCache.children(URL(fileURLWithPath: proj)), id: \.self) { node in
+                            FileTreeRow(node: node, depth: 0, expanded: $expandedDirs, onOpen: openFile)
                         }
                     }
                     .padding(.horizontal, 6).padding(.bottom, 8)
@@ -852,33 +852,71 @@ private enum CT {
     static let orange   = hex(0xE8810C)   // 手动会话类型色
 }
 
-/// 文件树一行(递归):文件夹可展开,文件点击 → onOpen。用 AnyView 断递归类型。
+/// 文件树节点(url + 是否目录,isDir 预算好不再 body 里 syscall)。
+struct FileNode: Hashable { let url: URL; let isDir: Bool }
+
+/// 目录内容缓存:一次解析后复用,避免在 SwiftUI body/布局过程中反复读磁盘。
+enum DirCache {
+    static let skipDirs: Set<String> = [
+        "node_modules", ".git", ".build", "build", "DerivedData", "Pods", ".next",
+        "dist", "out", "target", ".venv", "venv", "__pycache__", ".gradle", ".idea",
+        "Carthage", ".swiftpm", ".cache", "vendor"
+    ]
+    static let maxChildren = 300
+    private static var cache: [String: [FileNode]] = [:]
+
+    static func children(_ dir: URL) -> [FileNode] {
+        if let c = cache[dir.path] { return c }
+        let nodes = compute(dir)
+        cache[dir.path] = nodes
+        return nodes
+    }
+    static func clear() { cache.removeAll() }
+
+    private static func compute(_ dir: URL) -> [FileNode] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
+        let nodes = items.compactMap { url -> FileNode? in
+            if skipDirs.contains(url.lastPathComponent) { return nil }
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            return FileNode(url: url, isDir: isDir)
+        }
+        let sorted = nodes.sorted { a, b in
+            if a.isDir != b.isDir { return a.isDir }
+            return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
+        }
+        return Array(sorted.prefix(maxChildren))
+    }
+}
+
+/// 文件树一行(递归):文件夹可展开,文件点击 → onOpen。用 AnyView 断递归类型;
+/// 普通 VStack(非 Lazy)避免 LazyLayoutViewCache 在布局中失效崩溃。
 struct FileTreeRow: View {
-    let url: URL
+    let node: FileNode
     let depth: Int
     @Binding var expanded: Set<String>
     let onOpen: (URL) -> Void
 
-    private var isDir: Bool { (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
-    private var isOpen: Bool { expanded.contains(url.path) }
+    private var isOpen: Bool { expanded.contains(node.url.path) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                if isDir {
-                    if isOpen { expanded.remove(url.path) } else { expanded.insert(url.path) }
-                } else { onOpen(url) }
+                if node.isDir {
+                    if isOpen { expanded.remove(node.url.path) } else { expanded.insert(node.url.path) }
+                } else { onOpen(node.url) }
             } label: {
                 HStack(spacing: 5) {
-                    if isDir {
+                    if node.isDir {
                         Image(systemName: isOpen ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8, weight: .semibold)).foregroundStyle(CT.faint).frame(width: 9)
                     } else {
                         Color.clear.frame(width: 9, height: 1)
                     }
-                    Image(systemName: isDir ? "folder.fill" : "doc")
-                        .font(.system(size: 11)).foregroundStyle(isDir ? CT.accent.opacity(0.85) : CT.sub)
-                    Text(url.lastPathComponent).font(.system(size: 12)).foregroundStyle(CT.text).lineLimit(1)
+                    Image(systemName: node.isDir ? "folder.fill" : "doc")
+                        .font(.system(size: 11)).foregroundStyle(node.isDir ? CT.accent.opacity(0.85) : CT.sub)
+                    Text(node.url.lastPathComponent).font(.system(size: 12)).foregroundStyle(CT.text).lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 .padding(.leading, CGFloat(depth) * 12 + 4).padding(.vertical, 3).padding(.trailing, 4)
@@ -886,35 +924,11 @@ struct FileTreeRow: View {
             }
             .buttonStyle(.plain).focusEffectDisabled()
 
-            if isDir && isOpen {
-                ForEach(FileTreeRow.children(of: url), id: \.self) { child in
-                    AnyView(FileTreeRow(url: child, depth: depth + 1, expanded: $expanded, onOpen: onOpen))
+            if node.isDir && isOpen {
+                ForEach(DirCache.children(node.url), id: \.self) { child in
+                    AnyView(FileTreeRow(node: child, depth: depth + 1, expanded: $expanded, onOpen: onOpen))
                 }
             }
         }
-    }
-
-    /// 跳过的超大/噪音目录(否则展开会一次性建巨量视图,布局崩溃)。
-    static let skipDirs: Set<String> = [
-        "node_modules", ".git", ".build", "build", "DerivedData", "Pods", ".next",
-        "dist", "out", "target", ".venv", "venv", "__pycache__", ".gradle", ".idea",
-        "Carthage", ".swiftpm", ".cache", "vendor"
-    ]
-    /// 每层最多展示的条目数(再多用占位提示,防超大目录建巨量视图)。
-    static let maxChildren = 300
-
-    /// 目录内容:过滤噪音目录 + 上限;文件夹在前,按名称自然排序;跳过隐藏文件。
-    static func children(of dir: URL) -> [URL] {
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
-        let filtered = items.filter { !skipDirs.contains($0.lastPathComponent) }
-        let sorted = filtered.sorted { a, b in
-            let aDir = (try? a.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            let bDir = (try? b.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            if aDir != bDir { return aDir }
-            return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
-        }
-        return Array(sorted.prefix(maxChildren))
     }
 }
