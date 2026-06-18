@@ -122,7 +122,7 @@ struct AgentConsoleRootView: View {
             .clipShape(RoundedRectangle(cornerRadius: 7))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusEffectDisabled()
         .contextMenu {
             Button("关闭项目") {
                 manager.closeProject(proj)
@@ -140,7 +140,7 @@ struct AgentConsoleRootView: View {
                     Image(systemName: projectsCollapsed ? "sidebar.left" : "sidebar.leading")
                         .foregroundStyle(CT.sub)
                 }
-                .buttonStyle(.plain).help(projectsCollapsed ? "展开项目栏" : "收起项目栏")
+                .buttonStyle(.plain).focusEffectDisabled().help(projectsCollapsed ? "展开项目栏" : "收起项目栏")
                 if let proj = selectedProject {
                     Text((proj as NSString).lastPathComponent)
                         .font(.system(size: 14, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
@@ -232,7 +232,7 @@ struct AgentConsoleRootView: View {
                 if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusEffectDisabled()
         .contextMenu {
             Button("结束会话") {
                 manager.closeSession(s.id)
@@ -258,7 +258,7 @@ struct AgentConsoleRootView: View {
                 typeChip("手动", CT.orange)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusEffectDisabled()
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
@@ -273,7 +273,7 @@ struct AgentConsoleRootView: View {
                 typeChip("历史", CT.faint)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusEffectDisabled()
     }
 
     /// 新建会话菜单:继续最近 / 全新 / 从历史恢复。
@@ -318,7 +318,7 @@ struct AgentConsoleRootView: View {
                                 Spacer()
                             }
                         }
-                        .buttonStyle(.plain).padding(6)
+                        .buttonStyle(.plain).focusEffectDisabled().padding(6)
                         .background(Color.gray.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 6))
                     }
                 }
@@ -430,29 +430,32 @@ struct AgentConsoleRootView: View {
             .background(CT.bg)
             Divider().overlay(CT.hairline)
             ZStack(alignment: .bottom) {
+                // 只读浏览:滚轮正常滚动看历史;点空白处恢复(不再用覆盖层挡滚动)。
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(manualTranscript[h.id] ?? []) { m in messageRow(m, sid: h.id) }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16).padding(.vertical, 14)
+                    .padding(.bottom, 44)   // 给底部浮动按钮留位
                 }
                 .defaultScrollAnchor(.bottom)
-                .background(CT.bg)
-                // 锁层:轻微变暗 + 捕获点击恢复;滚轮滚动穿透,不挡浏览。
-                Color.black.opacity(0.025).contentShape(Rectangle())
-                    .onTapGesture { start(proj, resume: h.id) }
-                // 浮动提示(不拦点击,点击由上面的锁层处理)
-                HStack(spacing: 6) {
-                    Image(systemName: "lock.open.fill").font(.system(size: 11))
-                    Text("点击任意处恢复会话").font(.system(size: 12, weight: .medium))
+                .background(CT.panel.opacity(0.45))   // 淡色底示意只读锁定
+                .contentShape(Rectangle())
+                .onTapGesture { start(proj, resume: h.id) }
+                // 浮动「恢复会话」按钮(可点)
+                Button { start(proj, resume: h.id) } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "lock.open.fill").font(.system(size: 11))
+                        Text("点击恢复会话").font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(CT.accent).clipShape(Capsule())
+                    .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(CT.accent).clipShape(Capsule())
-                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
-                .padding(.bottom, 18)
-                .allowsHitTesting(false)
+                .buttonStyle(.plain).focusEffectDisabled()
+                .padding(.bottom, 16)
             }
         }
         .task(id: h.id) { await loadHistoryTranscript(h, proj) }
@@ -492,7 +495,7 @@ struct AgentConsoleRootView: View {
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(Color.gray.opacity(0.12)).clipShape(Capsule())
             }
-            .buttonStyle(.plain).help("点击复制完整 session id:\(sid)")
+            .buttonStyle(.plain).focusEffectDisabled().help("点击复制完整 session id:\(sid)")
         } else {
             Text("id 待生成").font(.system(size: 10)).foregroundStyle(.tertiary)
         }
@@ -553,7 +556,7 @@ struct AgentConsoleRootView: View {
                         .frame(width: 34, height: 34)
                         .background(empty ? CT.faint : CT.accent).clipShape(RoundedRectangle(cornerRadius: 9))
                 }
-                .buttonStyle(.plain).keyboardShortcut(.return, modifiers: .command).disabled(empty)
+                .buttonStyle(.plain).focusEffectDisabled().keyboardShortcut(.return, modifiers: .command).disabled(empty)
             }
             .padding(.horizontal, 14).padding(.vertical, 12)
             .background(CT.bg)
@@ -565,7 +568,7 @@ struct AgentConsoleRootView: View {
             Image(systemName: name).font(.system(size: 13)).foregroundStyle(CT.sub)
                 .frame(width: 26, height: 26)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.plain).focusEffectDisabled()
     }
 
     @ViewBuilder
