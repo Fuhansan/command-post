@@ -15,7 +15,8 @@ struct AgentConsoleRootView: View {
     @State private var openFiles: [URL] = []
     @State private var activeTab: ConsoleTab = .session
     @State private var expandedDirs: Set<String> = []
-    @State private var fileCache: [String: String] = [:]   // 文件内容缓存
+    @State private var fileCache: [String: FileContent] = [:]   // 文件分块内容缓存
+    private let fileChunk = 64 * 1024   // 每次读取的字节数(懒加载,先读一段)
     private let topInset: CGFloat = 28   // 统一标题栏:各栏内容顶部留出标题栏高度(背景延伸到顶)
 
     /// 某 cwd 是否属于该项目(等于或在其子目录下)。
@@ -50,8 +51,9 @@ struct AgentConsoleRootView: View {
         .preferredColorScheme(.light)
         .frame(minWidth: 940, minHeight: 580)
         .onChange(of: selectedProject) { _, p in
-            // 切项目 → 默认选中该项目第一个会话(没有则清空,右侧显示新建提示)。
+            // 切项目 → 默认选中该项目第一个会话(没有则清空,右侧显示新建提示),并切回会话 tab。
             selectedSessionId = p.flatMap { proj in manager.sessions.first { $0.workdir == proj }?.id }
+            activeTab = .session
         }
     }
 
@@ -250,7 +252,7 @@ struct AgentConsoleRootView: View {
         let sel = selectedSessionId == s.id
         let needsResp = !s.pending.isEmpty
             || s.messages.contains { $0.kind == .permission && $0.permState == nil }
-        return Button { selectedSessionId = s.id } label: {
+        return Button { selectedSessionId = s.id; activeTab = .session } label: {
             cleanCard(selected: sel, title: s.title, time: relTime(s.startedAt)) {
                 Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
                 Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
@@ -277,7 +279,7 @@ struct AgentConsoleRootView: View {
             default:       return CT.faint
             }
         }()
-        return Button { selectedSessionId = e.id } label: {
+        return Button { selectedSessionId = e.id; activeTab = .session } label: {
             cleanCard(selected: sel, title: manualTitle(e), time: relTime(e.lastActivityAt)) {
                 Circle().fill(dot).frame(width: 6, height: 6)
                 Text(e.terminal.displayName).font(.system(size: 11)).foregroundStyle(CT.sub)
@@ -292,7 +294,7 @@ struct AgentConsoleRootView: View {
     /// 进去后点屏幕才恢复。
     private func historyCard(_ h: HistoryEntry, _ proj: String) -> some View {
         let sel = selectedSessionId == h.id
-        return Button { selectedSessionId = h.id } label: {
+        return Button { selectedSessionId = h.id; activeTab = .session } label: {
             cleanCard(selected: sel, title: h.label, time: relTime(h.mtime)) {
                 Circle().fill(CT.faint).frame(width: 6, height: 6)
                 Text("已结束").font(.system(size: 11)).foregroundStyle(CT.sub)
@@ -404,21 +406,36 @@ struct AgentConsoleRootView: View {
     }
 
     private func fileViewer(_ url: URL) -> some View {
-        VStack(spacing: 0) {
+        let fc = fileCache[url.path]
+        return VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "doc.text").font(.system(size: 12)).foregroundStyle(CT.sub)
                 Text(url.lastPathComponent).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text)
                 Text(url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
                     .font(.system(size: 11)).foregroundStyle(CT.faint).lineLimit(1).truncationMode(.middle)
                 Spacer()
+                if let fc, fc.total > 0 {
+                    Text("\(fc.loaded / 1024)/\(fc.total / 1024) KB")
+                        .font(.system(size: 11)).foregroundStyle(CT.faint)
+                }
             }
             .padding(.horizontal, 14).padding(.vertical, 10).background(CT.bg)
             Divider().overlay(CT.hairline)
             ScrollView([.vertical, .horizontal]) {
-                Text(fileCache[url.path] ?? "加载中…")
-                    .font(.system(size: 12, design: .monospaced)).foregroundStyle(CT.text)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(fc?.text ?? "加载中…")
+                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(CT.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let fc, fc.hasMore {
+                        Button { Task { await loadMoreFile(url) } } label: {
+                            Label("加载更多", systemImage: "arrow.down.circle")
+                                .font(.system(size: 12, weight: .medium)).foregroundStyle(CT.accent)
+                        }
+                        .buttonStyle(.plain).focusEffectDisabled()
+                    }
+                }
+                .padding(12)
             }
             .background(CT.bg)
         }
@@ -433,14 +450,39 @@ struct AgentConsoleRootView: View {
         openFiles.removeAll { $0 == url }
         if activeTab == .file(url) { activeTab = openFiles.last.map { .file($0) } ?? .session }
     }
+    /// 懒加载:只读首块(fileChunk 字节),不一次性读整个文件。
     private func loadFile(_ url: URL) async {
         guard fileCache[url.path] == nil else { return }
-        let content = await Task.detached(priority: .userInitiated) { () -> String in
-            guard let data = try? Data(contentsOf: url) else { return "(无法读取)" }
-            if data.count > 2_000_000 { return "(文件过大 \(data.count / 1024)KB,暂不预览)" }
-            return String(data: data, encoding: .utf8) ?? "(二进制文件,无法以文本预览)"
+        let chunk = fileChunk
+        let fc = await Task.detached(priority: .userInitiated) { () -> FileContent in
+            let total = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int) ?? 0
+            guard let fh = try? FileHandle(forReadingFrom: url) else {
+                return FileContent(text: "(无法读取)", loaded: 0, total: 0, binary: false)
+            }
+            defer { try? fh.close() }
+            let data = (try? fh.read(upToCount: chunk)) ?? Data()
+            if data.prefix(8000).contains(0) {
+                return FileContent(text: "(二进制文件,无法预览)", loaded: data.count, total: total, binary: true)
+            }
+            return FileContent(text: String(decoding: data, as: UTF8.self),
+                               loaded: data.count, total: total, binary: false)
         }.value
-        fileCache[url.path] = content
+        fileCache[url.path] = fc
+    }
+    /// 续读下一块,追加到已加载内容。
+    private func loadMoreFile(_ url: URL) async {
+        guard let cur = fileCache[url.path], cur.hasMore else { return }
+        let offset = cur.loaded, chunk = fileChunk
+        let more = await Task.detached(priority: .userInitiated) { () -> Data in
+            guard let fh = try? FileHandle(forReadingFrom: url) else { return Data() }
+            defer { try? fh.close() }
+            try? fh.seek(toOffset: UInt64(offset))
+            return (try? fh.read(upToCount: chunk)) ?? Data()
+        }.value
+        var fc = cur
+        fc.text += String(decoding: more, as: UTF8.self)
+        fc.loaded += more.count
+        fileCache[url.path] = fc
     }
 
     // MARK: - 右:对话
@@ -592,6 +634,7 @@ struct AgentConsoleRootView: View {
         // 新建后立即选中它,右侧切到该会话对话。
         selectedSessionId = manager.newSession(agent: .claude, workdir: proj,
                                                resume: resume, continueLast: continueLast)
+        activeTab = .session
     }
 
     /// 顶栏 session_id 徽标:显示短 id,点一下复制完整 id(方便排查时直接发出来)。
@@ -830,6 +873,15 @@ struct AgentConsoleRootView: View {
 
 /// 右侧标签页:会话 或 某个文件。
 enum ConsoleTab: Hashable { case session; case file(URL) }
+
+/// 文件分块加载内容:已读 loaded / 总 total 字节;binary=二进制不预览。
+struct FileContent {
+    var text: String
+    var loaded: Int
+    var total: Int
+    var binary: Bool
+    var hasMore: Bool { !binary && loaded < total }
+}
 
 /// 控制台浅色配色(对齐高保真设计)。
 private enum CT {
