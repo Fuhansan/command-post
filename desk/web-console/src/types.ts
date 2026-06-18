@@ -25,9 +25,20 @@ export interface Session {
   pending: Pending[]
 }
 
-export interface Project { workdir: string; name: string }
+export interface History { id: string; label: string; mtime: number }
+export interface Project { workdir: string; name: string; history: History[] }
+
+export interface Manual {
+  id: string
+  title: string
+  cwd: string
+  terminal: string
+  state: string         // working|waiting|done|idle
+  lastActivityAt: number
+}
 
 export interface AppState {
   projects: Project[]
   sessions: Session[]
+  manual: Manual[]
 }

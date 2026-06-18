@@ -32,6 +32,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
         manager.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
         manager.$projects.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
+        manager.$historyByProject.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
+        store.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
     }
 
     private func loadFrontend() {
@@ -65,8 +67,39 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "respond":
             if let sid = obj["sid"] as? String, let req = obj["reqId"] as? String,
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
+        case "raiseWindow":
+            if let id = obj["id"] as? String { raiseWindow(manualId: id) }
+        case "loadTranscript":
+            // 历史/手动会话只读浏览:解析转录,推回消息。
+            guard let id = obj["id"] as? String, let kind = obj["kind"] as? String else { return }
+            let path: String?
+            if kind == "history", let wd = obj["workdir"] as? String {
+                path = AgentSessionManager.historyTranscriptPath(workdir: wd, id: id)
+            } else {
+                path = store?.sessions.first { $0.id == id }?.transcriptPath
+            }
+            loadTranscript(id: id, path: path)
         default:
             break
+        }
+    }
+
+    private func raiseWindow(manualId: String) {
+        guard let e = store?.sessions.first(where: { $0.id == manualId }),
+              let start = e.ownerPID ?? e.terminalPID, start > 1,
+              let appPid = ProcessUtils.findTerminal(startPid: start).pid,
+              let app = NSRunningApplication(processIdentifier: appPid) else { return }
+        app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private func loadTranscript(id: String, path: String?) {
+        guard let path else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let items = AgentSessionManager.parseTranscriptFile(path: path)
+            let msgs = items.enumerated().map { i, t -> [String: Any] in
+                ["id": "h\(i)", "role": t.role, "kind": t.kind.rawValue, "text": t.text, "ord": i]
+            }
+            await MainActor.run { self?.pushJSON(type: "transcript", payload: ["id": id, "messages": msgs]) }
         }
     }
 
@@ -81,9 +114,33 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     private func pushState() {
         guard ready, let manager else { return }
-        let projects = manager.projects.map { ["workdir": $0, "name": ($0 as NSString).lastPathComponent] }
+        let projects = manager.projects.map { proj -> [String: Any] in
+            manager.loadHistoryList(for: proj)   // 懒加载历史(已缓存则跳过)
+            let hist = (manager.historyByProject[proj] ?? []).map {
+                ["id": $0.id, "label": $0.label, "mtime": $0.mtime.timeIntervalSince1970 * 1000]
+            }
+            return ["workdir": proj, "name": (proj as NSString).lastPathComponent, "history": hist]
+        }
         let sessions = manager.sessions.map { sessionDTO($0) }
-        pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions])
+        let manual = (store?.sessions ?? []).map { manualDTO($0) }
+        pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions, "manual": manual])
+    }
+
+    private func manualDTO(_ e: SessionEntry) -> [String: Any] {
+        let title = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
+            .map { String($0.prefix(40)) } ?? (e.promptSummary.map { String($0.prefix(40)) } ?? "手动会话")
+        return [
+            "id": e.id, "title": title, "cwd": e.cwd,
+            "terminal": e.terminal.displayName,
+            "state": manualState(e.state),
+            "lastActivityAt": e.lastActivityAt.timeIntervalSince1970 * 1000,
+        ]
+    }
+    private func manualState(_ s: SessionState) -> String {
+        switch s {
+        case .working: return "working"; case .waiting: return "waiting"; case .done: return "done"
+        default: return "idle"
+        }
     }
 
     private func sessionDTO(_ s: AgentSession) -> [String: Any] {

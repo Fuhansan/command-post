@@ -1,4 +1,4 @@
-import { setState } from './store'
+import { setState, setTranscript } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -17,7 +17,9 @@ function installReceiver() {
         case 'state':
           setState(msg.payload)
           break
-        // 后续步骤:sessionPatch / fileChunk / dirList …
+        case 'transcript':
+          setTranscript(msg.payload.id, msg.payload.messages)
+          break
         default:
           console.warn('未知推送', msg.type)
       }
@@ -31,10 +33,14 @@ export function ready() { send({ action: 'ready' }) }
 
 // —— 命令封装 ——
 export const cmd = {
-  newSession: (workdir: string, opts?: { resume?: string; continueLast?: boolean }) =>
-    send({ action: 'newSession', workdir, resume: opts?.resume, continueLast: opts?.continueLast }),
+  newSession: (workdir: string) => send({ action: 'newSession', workdir }),
+  continueLast: (workdir: string) => send({ action: 'newSession', workdir, continueLast: true }),
+  resume: (workdir: string, id: string) => send({ action: 'newSession', workdir, resume: id }),
   closeSession: (sid: string) => send({ action: 'closeSession', sid }),
   sendInput: (sid: string, text: string) => send({ action: 'send', sid, text }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
+  raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),
+  loadTranscript: (kind: 'manual' | 'history', id: string, workdir?: string) =>
+    send({ action: 'loadTranscript', kind, id, workdir }),
 }
