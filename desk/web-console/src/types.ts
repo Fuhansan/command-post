@@ -53,13 +53,14 @@ export interface AppState {
 }
 
 export interface UsageTotals {
-  input: number; output: number; cacheRead: number; cacheCreation: number
-  tokens: number; requests: number; cost: number; cacheHit: number
+  requests: number; cost: number
+  input: number; output: number; tokens: number
+  cacheWrite: number; cacheRead: number; cacheTokens: number
 }
-export interface UsageModel { name: string; tokens: number; requests: number; cost: number }
+export interface UsageSeries { name: string; cost: number[]; token: number[]; req: number[] }
 export interface UsageData {
-  days: number
+  range: number
   totals: UsageTotals
-  daily: { day: string; tokens: number }[]
-  models: UsageModel[]
+  days: string[]          // x 轴标签(MM-DD)
+  series: UsageSeries[]   // 按模型,每个 measure 一条 per-day 数组
 }

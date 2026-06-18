@@ -34,6 +34,7 @@ body {
   transition: background .2s ease, color .2s ease;
 }
 .titlebar-pad { padding-top: 8px; }
+[data-theme="dark"] { -webkit-font-smoothing: subpixel-antialiased; }
 
 /* 运行中状态点:柔和脉冲 */
 @keyframes pulseDot { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.4; transform:scale(.82); } }

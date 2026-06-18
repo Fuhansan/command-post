@@ -5,10 +5,11 @@ import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
   BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff,
+  Activity, DollarSign, Boxes, Database,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage } from './store'
 import { cmd } from './bridge'
-import type { Session, Msg, Manual, History, Project, Entry } from './types'
+import type { Session, Msg, Manual, History, Project, Entry, UsageData } from './types'
 
 const HLJS_EXT: Record<string, string> = {
   ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript',
@@ -681,86 +682,204 @@ function ConsolePage() {
 }
 
 // ===== 使用统计(扫本地 .jsonl,花费按内置单价表估算)=====
-const fmtTok = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`
-const fmtUsd = (c: number) => `$${c.toFixed(c < 10 ? 2 : 1)}`
-const MODEL_COLORS = ['var(--accent)', '#7d9bd4', '#b9c0e8', '#9aa0ad']
+const fmtTok = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${Math.round(n)}`
+const fmtUsd = (c: number) => `$${c < 10 ? c.toFixed(2) : c.toFixed(1)}`
+const fmtNum = (n: number) => Math.round(n).toLocaleString()
+const USAGE_COLORS = ['#5562c9', '#2fae79', '#e8943a', '#a574d8', '#5b8def', '#e0609a', '#2fb6c8']
+type Measure = 'cost' | 'token' | 'req'
+const MEASURES: { k: Measure; label: string }[] = [{ k: 'cost', label: '成本' }, { k: 'token', label: 'Token' }, { k: 'req', label: '请求数' }]
+const fmtMeasure = (m: Measure, v: number) => m === 'cost' ? fmtUsd(v) : m === 'token' ? fmtTok(v) : fmtNum(v)
+
+function Seg<T extends string | number>({ value, onPick, options, width }: {
+  value: T; onPick: (v: T) => void; options: { k: T; label: string }[]; width?: number
+}) {
+  return (
+    <div className="flex gap-[3px] p-[3px] rounded-[9px]" style={{ background: 'var(--bg-sunken)', width }}>
+      {options.map((o) => {
+        const on = o.k === value
+        return (
+          <button key={String(o.k)} onClick={() => onPick(o.k)} className="flex-1 px-3 py-1.5 rounded-[7px] text-[12px] whitespace-nowrap transition"
+            style={on ? { background: 'var(--bg-elev)', fontWeight: 500, boxShadow: '0 1px 2px rgba(0,0,0,.08)' } : { color: 'var(--text-dim)' }}>
+            {o.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function UsageCard({ icon, tint, label, value, sub }: { icon: React.ReactNode; tint: string; label: string; value: string; sub?: React.ReactNode }) {
+  return (
+    <div className="p-4 rounded-[13px] border border-line bg-elev">
+      <div className="flex items-center justify-between">
+        <span className="text-[12px] text-dim">{label}</span>
+        <span className="w-[26px] h-[26px] rounded-[7px] flex items-center justify-center" style={{ background: tint + '22', color: tint }}>{icon}</span>
+      </div>
+      <div className="text-[25px] font-semibold mt-2.5 text-ink tracking-tight">{value}</div>
+      {sub && <div className="flex gap-4 mt-2 text-[11px] text-faint">{sub}</div>}
+    </div>
+  )
+}
+
+function UsageChart({ usage, measure, group }: { usage: UsageData; measure: Measure; group: 'model' | 'total' }) {
+  const [hidden, setHidden] = useState<Set<string>>(new Set())
+  const [hover, setHover] = useState<number | null>(null)
+  const N = usage.days.length
+  const allSeries = useMemo(() => {
+    if (group === 'total') {
+      const vals = usage.days.map((_, i) => usage.series.reduce((s, se) => s + se[measure][i], 0))
+      return [{ key: 'total', label: '总计', color: USAGE_COLORS[0], vals }]
+    }
+    return [...usage.series]
+      .map((se, i) => ({ key: se.name, label: modelLabel(se.name), color: USAGE_COLORS[i % USAGE_COLORS.length], vals: se[measure] }))
+      .sort((a, b) => b.vals.reduce((s, v) => s + v, 0) - a.vals.reduce((s, v) => s + v, 0))
+  }, [usage, measure, group])
+  const visible = allSeries.filter((s) => !hidden.has(s.key))
+  const maxY = Math.max(1, ...visible.flatMap((s) => s.vals))
+  const W = 1000, H = 230, padT = 12, padB = 6
+  const X = (i: number) => N <= 1 ? W / 2 : (i / (N - 1)) * W
+  const Y = (v: number) => padT + (1 - v / maxY) * (H - padT - padB)
+  const yTicks = Array.from({ length: 5 }, (_, i) => maxY * (1 - i / 4))
+  const tickIdx = Array.from({ length: Math.min(7, N) }, (_, i) => Math.round(i * (N - 1) / Math.max(1, Math.min(7, N) - 1)))
+
+  return (
+    <div>
+      <div className="relative" style={{ height: H + 22 }}
+        onMouseMove={(e) => { const r = e.currentTarget.getBoundingClientRect(); setHover(Math.max(0, Math.min(N - 1, Math.round(((e.clientX - r.left) / r.width) * (N - 1))))) }}
+        onMouseLeave={() => setHover(null)}>
+        {/* Y 轴标签 */}
+        {yTicks.map((v, i) => (
+          <span key={i} className="absolute left-0 font-mono text-[9.5px] text-faint -translate-y-1/2 pr-1 z-[2]" style={{ top: `${(i / 4) * (H / (H + 22)) * 100}%`, background: 'var(--bg-elev)' }}>{fmtMeasure(measure, v)}</span>
+        ))}
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: '100%', height: H }}>
+          {/* 网格 */}
+          {[0, 1, 2, 3, 4].map((i) => (
+            <line key={i} x1={0} x2={W} y1={padT + (i / 4) * (H - padT - padB)} y2={padT + (i / 4) * (H - padT - padB)} stroke="var(--border)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+          ))}
+          {visible.map((s) => (
+            <polyline key={s.key} points={s.vals.map((v, i) => `${X(i)},${Y(v)}`).join(' ')}
+              fill="none" stroke={s.color} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+          ))}
+          {hover != null && <line x1={X(hover)} x2={X(hover)} y1={padT} y2={H - padB} stroke="var(--border-strong)" strokeWidth={1} vectorEffect="non-scaling-stroke" />}
+        </svg>
+        {/* hover 点(用百分比定位,避免 svg 非等比拉伸变形)*/}
+        {hover != null && visible.map((s) => (
+          <span key={s.key} className="absolute w-2 h-2 rounded-full -translate-x-1/2 -translate-y-1/2 pointer-events-none border-2"
+            style={{ left: `${(N <= 1 ? 0.5 : hover / (N - 1)) * 100}%`, top: `${(Y(s.vals[hover]) / (H + 22)) * 100}%`, background: s.color, borderColor: 'var(--bg-elev)' }} />
+        ))}
+        {/* tooltip */}
+        {hover != null && (
+          <div className="absolute top-1.5 z-[5] pointer-events-none" style={{ left: `${(N <= 1 ? 0.5 : hover / (N - 1)) * 100}%`, transform: hover > N / 2 ? 'translateX(-100%)' : 'none' }}>
+            <div className="rounded-[10px] border border-strong bg-elev shadow-pop p-2.5 min-w-[150px]">
+              <div className="font-mono text-[10.5px] text-faint mb-1.5">{usage.days[hover]}</div>
+              {visible.map((s) => (
+                <div key={s.key} className="flex items-center gap-2 mb-1">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ background: s.color }} />
+                  <span className="text-[11px] text-dim flex-1 truncate">{s.label}</span>
+                  <span className="font-mono text-[11px] font-semibold text-ink">{fmtMeasure(measure, s.vals[hover])}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      {/* X 刻度 */}
+      <div className="flex justify-between mt-1.5 px-0.5">
+        {tickIdx.map((i) => <span key={i} className="font-mono text-[10px] text-faint">{usage.days[i]}</span>)}
+      </div>
+      {/* 图例 */}
+      <div className="flex flex-wrap justify-center gap-1 mt-3.5 pt-3.5 border-t border-line">
+        {allSeries.map((s) => {
+          const off = hidden.has(s.key)
+          return (
+            <button key={s.key} onClick={() => setHidden((p) => { const n = new Set(p); n.has(s.key) ? n.delete(s.key) : n.add(s.key); return n })}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-md hover:bg-sunken transition-colors">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: off ? 'var(--text-faint)' : s.color, opacity: off ? 0.4 : 1 }} />
+              <span className="text-[11.5px]" style={{ color: off ? 'var(--text-faint)' : 'var(--text-dim)', textDecoration: off ? 'line-through' : 'none' }}>{s.label}</span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 function UsagePage() {
   const usage = useUsage()
   const [days, setDays] = useState(14)
+  const [measure, setMeasure] = useState<Measure>('cost')
+  const [group, setGroup] = useState<'model' | 'total'>('model')
   useEffect(() => { cmd.loadUsage(days) }, [days])
   const t = usage?.totals
-  const maxBar = Math.max(1, ...(usage?.daily ?? []).map((d) => d.tokens))
-  const totalTok = Math.max(1, t?.tokens ?? 1)
-  const RANGES: { d: number; label: string }[] = [{ d: 14, label: '14 天' }, { d: 30, label: '30 天' }, { d: 0, label: '全部' }]
+  const RANGES = [{ k: 7, label: '7 天' }, { k: 14, label: '14 天' }, { k: 30, label: '30 天' }, { k: 90, label: '90 天' }, { k: 0, label: '全部' }]
+  const measureLabel = MEASURES.find((m) => m.k === measure)!.label
+
+  // 排行(按当前 measure)
+  const rank = useMemo(() => {
+    if (!usage) return []
+    return usage.series.map((s) => ({ name: s.name, total: s[measure].reduce((a, b) => a + b, 0) }))
+      .sort((a, b) => b.total - a.total)
+  }, [usage, measure])
+  const rankSum = Math.max(1, rank.reduce((a, b) => a + b.total, 0))
+  const rankMax = Math.max(1, ...rank.map((r) => r.total))
+
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
-      <div className="max-w-[920px] mx-auto px-8 pt-8 pb-12">
-        <div className="flex items-end justify-between mb-5">
+      <div className="max-w-[1000px] mx-auto px-8 pt-8 pb-12">
+        <div className="flex items-end justify-between mb-5 gap-4">
           <div>
             <div className="text-[20px] font-semibold text-ink">使用统计</div>
-            <div className="text-[12.5px] text-dim mt-1">扫描本地 Claude 转录 · 花费为单价表估算</div>
+            <div className="text-[12.5px] text-dim mt-1">按日期范围查看请求、Token、缓存与成本(花费为单价表估算)</div>
           </div>
-          <div className="flex gap-1 p-[3px] rounded-[9px]" style={{ background: 'var(--bg-sunken)' }}>
-            {RANGES.map((r) => (
-              <button key={r.d} onClick={() => setDays(r.d)} className="px-3 py-1.5 rounded-[7px] text-[12px] transition"
-                style={days === r.d ? { background: 'var(--bg-elev)', fontWeight: 500, boxShadow: '0 1px 2px rgba(0,0,0,.08)' } : { color: 'var(--text-dim)' }}>
-                {r.label}
-              </button>
-            ))}
-          </div>
+          <Seg value={days} onPick={setDays} options={RANGES} />
         </div>
 
         {!usage ? <div className="text-[13px] text-faint py-16 text-center">统计中…</div> : (
           <>
             <div className="grid grid-cols-4 gap-3.5">
-              {[
-                { l: '总 Token', v: fmtTok(t!.tokens), s: `输入 ${fmtTok(t!.input)} · 输出 ${fmtTok(t!.output)}` },
-                { l: '花费(估算)', v: fmtUsd(t!.cost), s: '按内置单价表' },
-                { l: '缓存命中', v: `${(t!.cacheHit * 100).toFixed(0)}%`, s: `读取 ${fmtTok(t!.cacheRead)}` },
-                { l: '请求数', v: t!.requests.toLocaleString(), s: days > 0 ? `近 ${days} 天` : '全部' },
-              ].map((c) => (
-                <div key={c.l} className="p-4 rounded-[13px] border border-line bg-elev">
-                  <div className="text-[11.5px] text-dim">{c.l}</div>
-                  <div className="text-[24px] font-semibold mt-2 text-ink tracking-tight">{c.v}</div>
-                  <div className="text-[11px] text-faint mt-1 truncate">{c.s}</div>
-                </div>
-              ))}
+              <UsageCard icon={<Activity size={14} />} tint="#5b8def" label="总请求数" value={fmtNum(t!.requests)} />
+              <UsageCard icon={<DollarSign size={14} />} tint="#a574d8" label="总成本" value={fmtUsd(t!.cost)} />
+              <UsageCard icon={<Boxes size={14} />} tint="#2fae79" label="总 Token 数" value={fmtTok(t!.tokens)}
+                sub={<><span>Input <b className="text-dim font-semibold">{fmtTok(t!.input)}</b></span><span>Output <b className="text-dim font-semibold">{fmtTok(t!.output)}</b></span></>} />
+              <UsageCard icon={<Database size={14} />} tint="#e8943a" label="缓存 Token" value={fmtTok(t!.cacheTokens)}
+                sub={<><span>Write <b className="text-dim font-semibold">{fmtTok(t!.cacheWrite)}</b></span><span>Read <b className="text-dim font-semibold">{fmtTok(t!.cacheRead)}</b></span></>} />
             </div>
 
-            <div className="mt-4 p-5 rounded-[13px] border border-line bg-elev">
-              <div className="text-[13px] font-semibold text-ink mb-4">每日 Token 消耗</div>
-              <div className="flex items-end gap-1.5 h-[150px]">
-                {usage.daily.map((b, i) => (
-                  <div key={i} className="flex-1 flex flex-col items-center gap-1.5 h-full justify-end" title={`${b.day}: ${fmtTok(b.tokens)}`}>
-                    <div className="w-full rounded-t-[5px] transition-all" style={{ height: `${Math.max(2, (b.tokens / maxBar) * 100)}%`, background: i === usage.daily.length - 1 ? 'var(--accent)' : 'var(--accent-soft)' }} />
-                    <span className="text-[9px] text-faint">{b.day}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="mt-4 p-5 rounded-[13px] border border-line bg-elev">
-              <div className="text-[13px] font-semibold text-ink mb-4">按模型分布</div>
-              {usage.models.length === 0 && <div className="text-[12px] text-faint">本范围无数据。</div>}
-              {usage.models.map((m, i) => (
-                <div key={m.name} className="flex items-center gap-3.5 py-2">
-                  <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: MODEL_COLORS[i] ?? 'var(--text-faint)' }} />
-                  <span className="font-mono text-[12px] w-[150px] shrink-0 truncate">{modelLabel(m.name)}</span>
-                  <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-sunken)' }}>
-                    <div className="h-full rounded-full" style={{ width: `${(m.tokens / totalTok) * 100}%`, background: MODEL_COLORS[i] ?? 'var(--text-faint)' }} />
-                  </div>
-                  <span className="text-[12px] text-dim w-[80px] text-right shrink-0">{fmtTok(m.tokens)}</span>
-                  <span className="text-[12px] text-faint w-[64px] text-right shrink-0">{fmtUsd(m.cost)}</span>
-                </div>
-              ))}
-              <div className="flex items-center gap-3.5 pt-3 mt-1 border-t border-line">
-                <span className="w-2.5 h-2.5 shrink-0" />
-                <span className="text-[12px] font-semibold text-ink w-[150px] shrink-0">汇总</span>
+            <div className="mt-4.5 p-6 rounded-[13px] border border-line bg-elev">
+              <div className="flex items-center gap-3.5 flex-wrap mb-4">
+                <div className="text-[13px] font-semibold text-ink">使用趋势</div>
                 <span className="flex-1" />
-                <span className="text-[12px] font-semibold text-ink w-[80px] text-right shrink-0">{fmtTok(t!.tokens)}</span>
-                <span className="text-[12px] font-semibold text-ink w-[64px] text-right shrink-0">{fmtUsd(t!.cost)}</span>
+                <div className="flex items-center gap-1.5"><span className="text-[11px] text-faint">指标</span><Seg value={measure} onPick={setMeasure} options={MEASURES} /></div>
+                <div className="flex items-center gap-1.5"><span className="text-[11px] text-faint">维度</span><Seg value={group} onPick={setGroup} options={[{ k: 'model', label: '模型' }, { k: 'total', label: '总计' }]} /></div>
               </div>
+              <UsageChart usage={usage} measure={measure} group={group} />
+            </div>
+
+            <div className="mt-4.5 p-6 rounded-[13px] border border-line bg-elev">
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-[13px] font-semibold text-ink">消耗排行</div>
+                <div className="text-[11.5px] text-faint">按{measureLabel}</div>
+              </div>
+              {rank.length === 0 && <div className="text-[12px] text-faint mt-3">本范围无数据。</div>}
+              {rank.length > 0 && (
+                <>
+                  <div className="text-[11.5px] text-dim mb-4">{modelLabel(rank[0].name)} 占用最多,约 {Math.round((rank[0].total / rankSum) * 100)}% 的{measureLabel}消耗</div>
+                  <div className="flex flex-col gap-3">
+                    {rank.map((r, i) => (
+                      <div key={r.name} className="flex items-center gap-3">
+                        <span className="font-mono text-[11px] text-faint w-3.5 shrink-0">{i + 1}</span>
+                        <span className="w-2 h-2 rounded-full shrink-0" style={{ background: USAGE_COLORS[i % USAGE_COLORS.length] }} />
+                        <span className="text-[12px] w-[130px] shrink-0 truncate">{modelLabel(r.name)}</span>
+                        <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-sunken)' }}>
+                          <div className="h-full rounded-full" style={{ width: `${(r.total / rankMax) * 100}%`, background: USAGE_COLORS[i % USAGE_COLORS.length] }} />
+                        </div>
+                        <span className="font-mono text-[11.5px] font-semibold text-ink w-[84px] text-right shrink-0">{fmtMeasure(measure, r.total)}</span>
+                        <span className="font-mono text-[11px] text-faint w-12 text-right shrink-0">{Math.round((r.total / rankSum) * 100)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           </>
         )}

@@ -35,7 +35,7 @@ actor UsageScanner {
         f.timeZone = TimeZone(identifier: "UTC"); f.locale = Locale(identifier: "en_US_POSIX"); return f
     }()
 
-    /// 聚合。days>0 = 最近 N 天;days==0 = 全部。返回可直接 JSON 化的字典。
+    /// 聚合。days>0 = 最近 N 天;days==0 = 全部。返回汇总 + 按天按模型的趋势序列(供折线图/排行)。
     func aggregate(days: Int) -> [String: Any] {
         let root = NSString(string: "~/.claude/projects").expandingTildeInPath
         let fm = FileManager.default
@@ -49,64 +49,66 @@ actor UsageScanner {
         var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(identifier: "UTC")!
         let startToday = utc.startOfDay(for: Date())
         let cutoffDate = days > 0 ? utc.date(byAdding: .day, value: -(days - 1), to: startToday) : nil
-        let cutoffStr = cutoffDate.map { Self.dayFmt.string(from: $0) }
 
         for path in files {
             let attrs = try? fm.attributesOfItem(atPath: path)
             let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
             let size = (attrs?[.size] as? Int) ?? 0
             if let c = cache[path], c.mtime == mtime, c.size == size { continue }   // 已缓存且未变
-            if let cut = cutoffDate, mtime < cut { continue }                        // 老文件,本范围用不到,跳过解析
+            if let cut = cutoffDate, mtime < cut { continue }                        // 老文件,本范围用不到,跳过
             cache[path] = FileCache(mtime: mtime, size: size, perDayModel: Self.parseFile(path))
         }
-        let present = Set(files)
-        cache = cache.filter { present.contains($0.key) }
+        cache = cache.filter { files.contains($0.key) }
+
+        // 日期序列(短范围补零成连续天;全部=已有天升序)
+        var dayKeys: [String]
+        if let cutoffDate {
+            dayKeys = (0..<days).map { Self.dayFmt.string(from: utc.date(byAdding: .day, value: $0, to: cutoffDate)!) }
+        } else {
+            var s = Set<String>()
+            for (_, fc) in cache { for (day, _) in fc.perDayModel { s.insert(day) } }
+            dayKeys = s.sorted()
+        }
+        let n = dayKeys.count
+        var dayIndex: [String: Int] = [:]
+        for (i, d) in dayKeys.enumerated() { dayIndex[d] = i }
 
         var totals = Bucket()
-        var perModel: [String: Bucket] = [:]
-        var perDay: [String: Int] = [:]
+        var perModelDay: [String: [Bucket]] = [:]
         for (_, fc) in cache {
             for (day, models) in fc.perDayModel {
-                if let cs = cutoffStr, day < cs { continue }
+                guard let idx = dayIndex[day] else { continue }
                 for (model, b) in models {
                     totals.add(b)
-                    perModel[model, default: Bucket()].add(b)
-                    perDay[day, default: 0] += b.tokens
+                    if perModelDay[model] == nil { perModelDay[model] = Array(repeating: Bucket(), count: n) }
+                    perModelDay[model]![idx].add(b)
                 }
             }
         }
 
-        // 按天序列(短范围补零成连续天;全部范围给已有天升序)
-        var daily: [[String: Any]] = []
-        if days > 0 {
-            for i in stride(from: days - 1, through: 0, by: -1) {
-                let d = utc.date(byAdding: .day, value: -i, to: startToday)!
-                let key = Self.dayFmt.string(from: d)
-                daily.append(["day": String(key.suffix(5)), "tokens": perDay[key] ?? 0])
-            }
-        } else {
-            for key in perDay.keys.sorted() {
-                daily.append(["day": String(key.suffix(5)), "tokens": perDay[key] ?? 0])
-            }
+        var totalCost = 0.0
+        var series: [[String: Any]] = []
+        for (model, arr) in perModelDay {
+            let cost = arr.map { Self.cost(model, $0) }
+            totalCost += cost.reduce(0, +)
+            series.append([
+                "name": model,
+                "cost": cost,
+                "token": arr.map { $0.input + $0.output },
+                "req": arr.map { $0.requests },
+            ])
         }
-
-        let models = perModel.sorted { $0.value.tokens > $1.value.tokens }.map { (name, b) -> [String: Any] in
-            ["name": name, "tokens": b.tokens, "requests": b.requests, "cost": Self.cost(name, b)]
-        }
-        let totalCost = perModel.reduce(0.0) { $0 + Self.cost($1.key, $1.value) }
-        let denom = totals.input + totals.cacheRead + totals.cacheCreation
-        let cacheHit = denom > 0 ? Double(totals.cacheRead) / Double(denom) : 0
 
         return [
-            "days": days,
+            "range": days,
             "totals": [
-                "input": totals.input, "output": totals.output,
-                "cacheRead": totals.cacheRead, "cacheCreation": totals.cacheCreation,
-                "tokens": totals.tokens, "requests": totals.requests,
-                "cost": totalCost, "cacheHit": cacheHit,
+                "requests": totals.requests, "cost": totalCost,
+                "input": totals.input, "output": totals.output, "tokens": totals.input + totals.output,
+                "cacheWrite": totals.cacheCreation, "cacheRead": totals.cacheRead,
+                "cacheTokens": totals.cacheCreation + totals.cacheRead,
             ],
-            "daily": daily,
-            "models": models,
+            "days": dayKeys.map { String($0.suffix(5)) },
+            "series": series,
         ]
     }
 
