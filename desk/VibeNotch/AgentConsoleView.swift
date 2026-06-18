@@ -27,20 +27,44 @@ struct AgentConsoleRootView: View {
         return (manager.historyByProject[proj] ?? []).filter { !live.contains($0.id) }
     }
 
-    // 微信式三栏:项目栏(可收缩) | 会话列表 | 对话。
+    // 三栏:项目栏(可收缩) | 会话列表 | 对话 + 底部状态栏。
     var body: some View {
-        HSplitView {
-            if !projectsCollapsed {
-                projectsRail.frame(minWidth: 150, maxWidth: 220)
+        VStack(spacing: 0) {
+            HSplitView {
+                if !projectsCollapsed {
+                    projectsRail.frame(minWidth: 180, maxWidth: 240)
+                }
+                sessionColumn.frame(minWidth: 240, maxWidth: 340)
+                conversationPane.frame(minWidth: 460)
             }
-            sessionColumn.frame(minWidth: 220, maxWidth: 320)
-            conversationPane.frame(minWidth: 420)
+            Divider().overlay(CT.hairline)
+            statusBar
         }
-        .frame(minWidth: 880, minHeight: 480)
+        .background(CT.bg)
+        .preferredColorScheme(.light)
+        .frame(minWidth: 940, minHeight: 580)
         .onChange(of: selectedProject) { _, p in
             // 切项目 → 默认选中该项目第一个会话(没有则清空,右侧显示新建提示)。
             selectedSessionId = p.flatMap { proj in manager.sessions.first { $0.workdir == proj }?.id }
         }
+    }
+
+    /// 底部状态栏(视觉):连接状态 + 自动审批 + 编码。
+    private var statusBar: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 5) {
+                Circle().fill(CT.success).frame(width: 7, height: 7)
+                Text("已连接到 Agent").font(.system(size: 11)).foregroundStyle(CT.sub)
+            }
+            Spacer()
+            HStack(spacing: 5) {
+                Circle().fill(CT.success).frame(width: 6, height: 6)
+                Text("自动审批:安全命令").font(.system(size: 11)).foregroundStyle(CT.sub)
+            }
+            Text("UTF-8").font(.system(size: 11)).foregroundStyle(CT.faint)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(CT.panel)
     }
 
     // MARK: - 左:项目栏(可收缩)
@@ -48,33 +72,45 @@ struct AgentConsoleRootView: View {
     private var projectsRail: some View {
         VStack(spacing: 0) {
             Button(action: openProject) {
-                Label("打开项目", systemImage: "folder.badge.plus").frame(maxWidth: .infinity)
+                Label("打开项目", systemImage: "folder.badge.plus")
+                    .font(.system(size: 13, weight: .medium)).frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .padding(8)
+            .buttonStyle(.borderedProminent).controlSize(.large)
+            .padding(10)
+
+            HStack {
+                Text("项目").font(.system(size: 11, weight: .semibold)).foregroundStyle(CT.faint)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.bottom, 4)
 
             List(selection: $selectedProject) {
                 ForEach(manager.projects, id: \.self) { proj in
                     projectRow(proj).tag(proj)
                 }
             }
-            .listStyle(.sidebar)
+            .listStyle(.sidebar).scrollContentBackground(.hidden)
         }
+        .background(CT.panel)
     }
 
     private func projectRow(_ proj: String) -> some View {
         let sessions = manager.sessions.filter { $0.workdir == proj }
         let needsResp = sessions.contains { !$0.pending.isEmpty
             || $0.messages.contains { $0.kind == .permission && $0.permState == nil } }
-        return VStack(alignment: .leading, spacing: 2) {
-            Text((proj as NSString).lastPathComponent).font(.system(size: 13, weight: .medium)).lineLimit(1)
-            HStack(spacing: 4) {
+        let working = sessions.contains { $0.status == .working || $0.status == .starting }
+        let dot: Color = sessions.isEmpty ? CT.faint : (working ? CT.accent : CT.success)
+        return VStack(alignment: .leading, spacing: 3) {
+            Text((proj as NSString).lastPathComponent)
+                .font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
+            HStack(spacing: 5) {
+                Circle().fill(dot).frame(width: 6, height: 6)
                 Text(sessions.isEmpty ? "未打开会话" : "\(sessions.count) 个会话")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-                if needsResp { Text("● 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+                    .font(.system(size: 11)).foregroundStyle(CT.sub)
+                if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
         .contextMenu {
             Button("关闭项目") {
                 manager.closeProject(proj)
@@ -90,49 +126,65 @@ struct AgentConsoleRootView: View {
             HStack(spacing: 8) {
                 Button { projectsCollapsed.toggle() } label: {
                     Image(systemName: projectsCollapsed ? "sidebar.left" : "sidebar.leading")
+                        .foregroundStyle(CT.sub)
                 }
                 .buttonStyle(.plain).help(projectsCollapsed ? "展开项目栏" : "收起项目栏")
                 if let proj = selectedProject {
                     Text((proj as NSString).lastPathComponent)
-                        .font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
                 } else {
-                    Text("选择项目").font(.system(size: 13)).foregroundStyle(.secondary)
+                    Text("选择项目").font(.system(size: 13)).foregroundStyle(CT.sub)
                 }
                 Spacer()
                 if let proj = selectedProject { newSessionMenu(proj) }
             }
-            .padding(8)
-            Divider()
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            Divider().overlay(CT.hairline)
             if let proj = selectedProject {
                 let consoleSessions = manager.sessions.filter { $0.workdir == proj }
                 let manualSessions = hookSessions(proj)
                 if consoleSessions.isEmpty && manualSessions.isEmpty {
                     startInline(proj)
                 } else {
-                    List(selection: $selectedSessionId) {
-                        ForEach(consoleSessions) { s in sessionRow(s).tag(s.id) }
-                        ForEach(manualSessions) { e in manualSessionRow(e).tag(e.id) }
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            ForEach(consoleSessions) { sessionCard($0) }
+                            ForEach(manualSessions) { manualCard($0) }
+                        }
+                        .padding(8)
                     }
-                    .listStyle(.sidebar)
                 }
             } else {
                 Spacer()
             }
         }
+        .background(CT.panel)
     }
 
-    private func sessionRow(_ s: AgentSession) -> some View {
+    /// 会话卡(console):标题 + 状态点;选中高亮。
+    private func sessionCard(_ s: AgentSession) -> some View {
+        let sel = selectedSessionId == s.id
         let needsResp = !s.pending.isEmpty
             || s.messages.contains { $0.kind == .permission && $0.permState == nil }
-        return VStack(alignment: .leading, spacing: 2) {
-            Text(s.title).font(.system(size: 13, weight: .medium)).lineLimit(1)
-            HStack(spacing: 4) {
-                Circle().fill(statusColor(s.status)).frame(width: 7, height: 7)
-                Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(.secondary)
-                if needsResp { Text("● 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+        return Button { selectedSessionId = s.id } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(s.title).font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(CT.text).lineLimit(1)
+                HStack(spacing: 5) {
+                    Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
+                    Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
+                    if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10).padding(.vertical, 9)
+            .background(sel ? CT.sel : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(sel ? CT.accent.opacity(0.35) : Color.clear, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
         .contextMenu {
             Button("结束会话") {
                 manager.closeSession(s.id)
@@ -141,19 +193,28 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 手动(hook)会话行:打「手动」标签 —— 它是你在 IDE/终端里自己跑的,选中后只读 + 可唤起窗口。
-    private func manualSessionRow(_ e: SessionEntry) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(manualTitle(e)).font(.system(size: 13, weight: .medium)).lineLimit(1)
-            HStack(spacing: 4) {
-                Image(systemName: "hand.raised.fill").font(.system(size: 9)).foregroundStyle(.orange)
-                Text("手动 · \(e.terminal.displayName)").font(.system(size: 11)).foregroundStyle(.secondary)
+    /// 手动会话卡:打「手动」标签 —— 你在 IDE/终端里自己跑的,选中后只读 + 可唤起窗口。
+    private func manualCard(_ e: SessionEntry) -> some View {
+        let sel = selectedSessionId == e.id
+        return Button { selectedSessionId = e.id } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(manualTitle(e)).font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(CT.text).lineLimit(1)
+                HStack(spacing: 5) {
+                    Image(systemName: "hand.raised.fill").font(.system(size: 9)).foregroundStyle(.orange)
+                    Text("手动 · \(e.terminal.displayName)").font(.system(size: 11)).foregroundStyle(CT.sub)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10).padding(.vertical, 9)
+            .background(sel ? CT.sel : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(sel ? CT.accent.opacity(0.35) : Color.clear, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 2)
-        .contextMenu {
-            Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) }
-        }
+        .buttonStyle(.plain)
+        .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
     /// 新建会话菜单:继续最近 / 全新 / 从历史恢复。
@@ -170,7 +231,15 @@ struct AgentConsoleRootView: View {
                 }
             }
         } label: {
-            Image(systemName: "plus.circle.fill").font(.system(size: 15))
+            HStack(spacing: 4) {
+                Image(systemName: "plus").font(.system(size: 11, weight: .semibold))
+                Text("新建会话").font(.system(size: 12, weight: .medium))
+            }
+            .foregroundStyle(CT.text)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(CT.bg)
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(CT.hairline, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
         }
         .menuStyle(.borderlessButton).fixedSize()
         .task(id: proj) { manager.loadHistoryList(for: proj) }
@@ -319,41 +388,72 @@ struct AgentConsoleRootView: View {
 
     private func conversation(_ s: AgentSession) -> some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(s.title).font(.system(size: 13, weight: .semibold))
-                Text(s.workdir).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                Spacer()
-                sessionIdBadge(s)
-                Button("结束会话") { manager.closeSession(s.id) }.controlSize(.small)
+            // 顶栏:工具图标 + 标题 + 路径 + 书签/复制/更多
+            HStack(spacing: 10) {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.accent)
+                Text(s.title).font(.system(size: 14, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
+                Text(s.workdir).font(.system(size: 11)).foregroundStyle(CT.sub)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 8)
+                headerIcon("bookmark") {}
+                headerIcon("doc.on.doc") {
+                    if let id = s.agentSessionId {
+                        let pb = NSPasteboard.general; pb.clearContents(); pb.setString(id, forType: .string)
+                    }
+                }
+                Menu {
+                    Button("结束会话") { manager.closeSession(s.id); selectedSessionId = nil }
+                } label: { Image(systemName: "ellipsis").foregroundStyle(CT.sub) }
+                    .menuStyle(.borderlessButton).fixedSize()
             }
-            .padding(8)
-            Divider()
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(CT.bg)
+            Divider().overlay(CT.hairline)
             ScrollViewReader { proxy in
                 ScrollView {
-                    // LazyVStack:超长会话只构建/渲染可见的消息行,进入秒开、滚动流畅。
-                    LazyVStack(alignment: .leading, spacing: 8) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(s.messages) { m in messageRow(m, sid: s.id) }
                         ForEach(s.pending) { req in pendingCard(sid: s.id, req: req) }
                         Color.clear.frame(height: 1).id("BOTTOM")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
+                    .padding(.horizontal, 16).padding(.vertical, 14)
                 }
-                // 底部锚定管「拉宽/切回」稳定;onChange 补一刀管「历史异步灌入 + 新消息」精确到底。
+                .background(CT.bg)
                 .defaultScrollAnchor(.bottom)
                 .onChange(of: s.messages.count) { _, _ in proxy.scrollTo("BOTTOM", anchor: .bottom) }
                 .onChange(of: s.pending.count) { _, _ in proxy.scrollTo("BOTTOM", anchor: .bottom) }
             }
-            Divider()
-            HStack(spacing: 8) {
-                TextField("输入指令…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder).lineLimit(1...5).onSubmit { submit(s.id) }
-                Button(action: { submit(s.id) }) { Image(systemName: "paperplane.fill") }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Divider().overlay(CT.hairline)
+            // 输入栏
+            HStack(spacing: 10) {
+                TextField("输入指令(支持 / 命令、@ 资源、↑ 历史)", text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...6)
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .background(CT.panel)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(CT.hairline, lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onSubmit { submit(s.id) }
+                let empty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                Button { submit(s.id) } label: {
+                    Image(systemName: "paperplane.fill").font(.system(size: 14)).foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(empty ? CT.faint : CT.accent).clipShape(RoundedRectangle(cornerRadius: 9))
+                }
+                .buttonStyle(.plain).keyboardShortcut(.return, modifiers: .command).disabled(empty)
             }
-            .padding(8)
+            .padding(.horizontal, 14).padding(.vertical, 12)
+            .background(CT.bg)
         }
+    }
+
+    private func headerIcon(_ name: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name).font(.system(size: 13)).foregroundStyle(CT.sub)
+                .frame(width: 26, height: 26)
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -361,23 +461,58 @@ struct AgentConsoleRootView: View {
         switch m.kind {
         case .text where m.role == "user":
             HStack { Spacer(minLength: 60)
-                Text(m.text).padding(8).background(Color.blue.opacity(0.22))
-                    .clipShape(RoundedRectangle(cornerRadius: 10)) }
+                Text(m.text).font(.system(size: 13)).foregroundStyle(CT.text).textSelection(.enabled)
+                    .padding(.horizontal, 12).padding(.vertical, 9)
+                    .background(CT.userBubble).clipShape(RoundedRectangle(cornerRadius: 12)) }
         case .text:
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: m.role == "system" ? "exclamationmark.triangle" : "sparkle")
-                    .foregroundStyle(m.role == "system" ? .orange : .purple)
-                Text(m.text).textSelection(.enabled)
+            HStack(alignment: .top, spacing: 9) {
+                avatar(m.role == "system" ? "exclamationmark.triangle.fill" : "sparkle",
+                       m.role == "system" ? .orange : CT.accent)
+                Text(m.text).font(.system(size: 13)).foregroundStyle(CT.text).textSelection(.enabled)
                 Spacer(minLength: 0)
             }
         case .tool:
-            Label(m.text, systemImage: "terminal").font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.secondary).padding(.leading, 4)
+            toolCard(m.text)
         case .file:
-            Label(m.text, systemImage: "doc.text").font(.system(size: 12))
-                .foregroundStyle(.green).padding(.leading, 4)
+            HStack(alignment: .top, spacing: 9) {
+                avatar("doc.text.fill", CT.success)
+                Text(m.text).font(.system(size: 12, design: .monospaced)).foregroundStyle(CT.text)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(CT.toolBg).clipShape(RoundedRectangle(cornerRadius: 8))
+            }
         case .permission:
             permissionCard(m, sid: sid)
+        }
+    }
+
+    private func avatar(_ system: String, _ color: Color) -> some View {
+        Image(systemName: system).font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+            .frame(width: 22, height: 22).background(color)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// 工具卡:工具名 + 命令代码块(m.text = "Bash: <命令>")。
+    private func toolCard(_ text: String) -> some View {
+        let parts = text.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        let name = parts.first.flatMap { $0.isEmpty ? nil : $0 } ?? "工具"
+        let cmd = parts.count > 1 ? parts[1] : ""
+        return HStack(alignment: .top, spacing: 9) {
+            avatar("terminal.fill", CT.text.opacity(0.75))
+            VStack(alignment: .leading, spacing: 7) {
+                Text(name).font(.system(size: 12, weight: .semibold)).foregroundStyle(CT.text)
+                if !cmd.isEmpty {
+                    Text(cmd).font(.system(size: 12, design: .monospaced)).foregroundStyle(CT.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10).background(CT.toolBg).clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(CT.hairline, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
         }
     }
 
@@ -461,4 +596,23 @@ struct AgentConsoleRootView: View {
         case .done: return "结束"; case .error: return "错误"
         }
     }
+}
+
+/// 控制台浅色配色(对齐高保真设计)。
+private enum CT {
+    static func hex(_ v: UInt32) -> Color {
+        Color(.sRGB, red: Double((v >> 16) & 0xFF) / 255,
+              green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
+    }
+    static let bg       = hex(0xFFFFFF)   // 对话区底
+    static let panel    = hex(0xF7F8FA)   // 左/中栏底
+    static let accent   = hex(0x3B82F6)   // 主蓝
+    static let text     = hex(0x1F2328)   // 主文字
+    static let sub      = hex(0x6B7280)   // 次文字
+    static let faint    = hex(0x9AA1AC)   // 更淡
+    static let hairline = Color.black.opacity(0.08)
+    static let sel      = hex(0x3B82F6).opacity(0.10)   // 选中底
+    static let userBubble = hex(0xEAF1FE)  // 用户气泡
+    static let toolBg   = hex(0xF3F4F6)   // 代码/工具底
+    static let success  = hex(0x16A34A)   // 绿
 }
