@@ -4,11 +4,21 @@
 
 html, body, #root { height: 100%; margin: 0; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  font-family: "Hanken Grotesk Variable", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
   -webkit-font-smoothing: antialiased;
-  color: #1F2937;
-  background: #FFFFFF;
+  text-rendering: optimizeLegibility;
+  color: #14151A;
+  background: #FBFBFC;
   user-select: none;
+  letter-spacing: -0.005em;
 }
-/* webview 已从原生标题栏下方开始,这里只需少量呼吸空间 */
 .titlebar-pad { padding-top: 8px; }
+
+/* 细腻滚动条(像原生 Mac 控制台) */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: rgba(20,21,26,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(20,21,26,0.26); background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* highlight.js 代码块跟随等宽字体 */
+.hljs { font-family: "JetBrains Mono", ui-monospace, monospace; }

@@ -1,5 +1,11 @@
 import { useSyncExternalStore, useState, useMemo, useRef, useEffect } from 'react'
+import type { ReactNode } from 'react'
 import hljs from 'highlight.js'
+import {
+  Sparkles, Cpu, Hand, History as HistoryIcon, Folder, FolderOpen, FileText, File as FileIcon,
+  MessageSquare, BarChart3, Plus, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus, Unlock,
+  Lock, AppWindow,
+} from 'lucide-react'
 import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry } from './types'
@@ -36,11 +42,11 @@ function StatusPill({ status }: { status: string }) {
   const s = STATUS[status] ?? { label: status, cls: 'text-gray-500 bg-gray-100' }
   return <Pill text={s.label} cls={s.cls} />
 }
-function IconBox({ tint, glyph, size = 32 }: { tint: string; glyph: string; size?: number }) {
+function IconBox({ tint, children, size = 32 }: { tint: string; children: ReactNode; size?: number }) {
   return (
-    <div className="rounded-lg flex items-center justify-center font-semibold shrink-0"
-      style={{ width: size, height: size, fontSize: size * 0.4, background: tint + '1F', color: tint }}>
-      {glyph}
+    <div className="rounded-[9px] flex items-center justify-center shrink-0 ring-1 ring-inset"
+      style={{ width: size, height: size, background: tint + '16', color: tint, borderColor: tint + '22' }}>
+      {children}
     </div>
   )
 }
@@ -61,21 +67,22 @@ type Sel =
   | { kind: 'history'; id: string; workdir: string }
   | null
 
-function Card({ active, tint, glyph, title, time, pill, sub, onClick }: {
-  active: boolean; tint: string; glyph: string; title: string; time?: string
-  pill?: React.ReactNode; sub?: string; onClick: () => void
+function Card({ active, tint, icon, title, time, pill, sub, onClick }: {
+  active: boolean; tint: string; icon: ReactNode; title: string; time?: string
+  pill?: ReactNode; sub?: string; onClick: () => void
 }) {
   return (
     <button onClick={onClick}
-      className={`w-full text-left flex gap-3 items-start p-3 rounded-[10px] border transition
-        ${active ? 'bg-selbg border-selborder' : 'bg-white border-line hover:bg-gray-50'}`}>
-      <IconBox tint={tint} glyph={glyph} />
+      className={`w-full text-left flex gap-3 items-start p-3 rounded-xl border animate-rise
+        transition-all duration-150 hover:-translate-y-px
+        ${active ? 'bg-selbg border-selborder shadow-card' : 'bg-card border-line shadow-card hover:shadow-pop'}`}>
+      <IconBox tint={tint}>{icon}</IconBox>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <div className="font-semibold text-[13.5px] text-ink truncate flex-1">{title || '新会话'}</div>
-          {time && <div className="text-[11px] text-faint shrink-0">{time}</div>}
+          <div className="font-semibold text-[13.5px] text-ink truncate flex-1 tracking-tight">{title || '新会话'}</div>
+          {time && <div className="text-[11px] text-faint shrink-0 font-mono">{time}</div>}
         </div>
-        <div className="mt-1 flex items-center gap-2">
+        <div className="mt-1.5 flex items-center gap-2">
           {pill}
           {sub && <span className="text-[11px] text-sub truncate">{sub}</span>}
         </div>
@@ -189,10 +196,14 @@ function TreeRow({ entry, depth, expanded, toggle, openFile }: {
     <div>
       <button
         onClick={() => (entry.isDir ? toggle(entry.path) : openFile(entry.path))}
-        className="w-full text-left flex items-center gap-1.5 py-[3px] pr-1 rounded hover:bg-gray-100"
+        className="w-full text-left flex items-center gap-1.5 py-[3px] pr-1 rounded-md hover:bg-black/[0.04] transition-colors"
         style={{ paddingLeft: depth * 12 + 4 }}>
-        <span className="w-2.5 text-[9px] text-faint">{entry.isDir ? (isOpen ? '▾' : '▸') : ''}</span>
-        <span className="text-[11px]">{entry.isDir ? '📁' : '📄'}</span>
+        <span className="w-3 flex justify-center text-faint">
+          {entry.isDir ? (isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />) : null}
+        </span>
+        {entry.isDir
+          ? (isOpen ? <FolderOpen size={13} className="text-brand/80 shrink-0" /> : <Folder size={13} className="text-faint shrink-0" />)
+          : <FileIcon size={13} className="text-faint shrink-0" />}
         <span className="text-[12px] text-ink truncate">{entry.name}</span>
       </button>
       {entry.isDir && isOpen && (children ?? []).map((c) => (
@@ -263,7 +274,10 @@ function Tab({ label, active, closable, onTap, onClose }: {
       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer text-[12px] border
         ${active ? 'bg-selbg border-selborder text-ink font-medium' : 'border-transparent text-sub hover:bg-gray-100'}`}>
       <span className="truncate max-w-[140px]">{label}</span>
-      {closable && <span onClick={(e) => { e.stopPropagation(); onClose?.() }} className="text-faint hover:text-ink">✕</span>}
+      {closable && (
+        <span onClick={(e) => { e.stopPropagation(); onClose?.() }}
+          className="text-faint hover:text-ink rounded p-0.5 hover:bg-black/5"><X size={11} /></span>
+      )}
     </div>
   )
 }
@@ -282,7 +296,9 @@ function Conversation({ s }: { s: Session }) {
           rows={1} placeholder="输入指令…(Enter 发送,Shift+Enter 换行)"
           className="flex-1 resize-none text-[13px] px-3 py-2 rounded-[10px] bg-panel border border-line focus:outline-none focus:border-brand select-text" />
         <button onClick={submit} disabled={!draft.trim()}
-          className="w-9 h-9 rounded-[9px] bg-brand text-white disabled:bg-faint flex items-center justify-center">↑</button>
+          className="w-9 h-9 rounded-[10px] bg-brand text-white disabled:bg-faint flex items-center justify-center transition-colors hover:bg-blue-700">
+          <ArrowUp size={16} />
+        </button>
       </div>
     </div>
   )
@@ -295,7 +311,9 @@ function ManualView({ m, msgs }: { m: Manual; msgs: Msg[] }) {
         <>
           <Pill text="手动" cls="text-orange-600 bg-orange-50" />
           <button onClick={() => cmd.raiseWindow(m.id)}
-            className="text-[12px] text-white bg-brand px-2.5 py-1 rounded-md">唤起 {m.terminal}</button>
+            className="text-[12px] text-white bg-brand px-2.5 py-1 rounded-md flex items-center gap-1.5 hover:bg-blue-700 transition-colors">
+            <AppWindow size={13} /> 唤起 {m.terminal}
+          </button>
         </>
       } />
       <MsgList msgs={msgs} />
@@ -313,8 +331,9 @@ function HistoryView({ h, msgs, onResume, resuming }: {
       <div className="flex-1 relative bg-panel/40 min-h-0">
         <MsgList msgs={msgs} />
         <button onClick={onResume} disabled={resuming}
-          className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-brand text-white text-[12px] font-medium shadow-lg disabled:opacity-60">
-          {resuming ? '正在恢复…' : '🔓 恢复会话'}
+          className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-brand text-white text-[12px] font-medium shadow-pop disabled:opacity-60 flex items-center gap-1.5 transition-transform hover:scale-[1.03]">
+          {resuming ? <Lock size={13} /> : <Unlock size={13} />}
+          {resuming ? '正在恢复…' : '恢复会话'}
         </button>
       </div>
     </div>
@@ -383,21 +402,23 @@ function ConsolePage() {
       {/* 列1:项目(可展开成文件夹,目录嵌在项目下) */}
       <div className="w-[240px] shrink-0 bg-panel border-r border-line flex flex-col">
         <div className="titlebar-pad px-3 pb-2 flex items-center justify-between">
-          <span className="text-[11px] font-semibold text-faint tracking-wide">项目</span>
+          <span className="text-[11px] font-semibold text-faint tracking-[0.08em] uppercase">项目</span>
           <button onClick={() => cmd.openProject()} title="打开项目"
-            className="w-5 h-5 flex items-center justify-center text-sub hover:text-ink rounded">＋</button>
+            className="w-6 h-6 flex items-center justify-center text-sub hover:text-brand hover:bg-brand/10 rounded-md transition-colors">
+            <FolderPlus size={14} />
+          </button>
         </div>
         <div className="flex-1 overflow-auto px-2 pb-3">
-          {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3">点上方「＋」打开一个项目</div>}
+          {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3 leading-relaxed">点右上角打开一个项目。</div>}
           {state.projects.map((p) => {
             const cnt = state.sessions.filter((s) => s.workdir === p.workdir).length
             const active = p.workdir === selectedProject
             return (
               <div key={p.workdir}>
                 <button onClick={() => { setSelectedProject(p.workdir); setSel(null); setActiveFile(null) }}
-                  className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border
-                    ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-gray-100'}`}>
-                  <span className="text-[13px]">{active ? '📂' : '📁'}</span>
+                  className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border transition-colors
+                    ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-black/[0.04]'}`}>
+                  {active ? <FolderOpen size={15} className="text-brand shrink-0" /> : <Folder size={15} className="text-faint shrink-0" />}
                   <div className="min-w-0 flex-1">
                     <div className="text-[12.5px] font-medium text-ink truncate">{p.name}</div>
                     <div className="text-[10.5px] text-sub">{cnt ? `${cnt} 个会话` : '未打开会话'}</div>
@@ -463,19 +484,20 @@ function SessionList({ p, state, sel, setSel, inProject }: {
     <>
       {consoleSessions.map((s) => (
         <Card key={s.id} active={sel?.kind === 'session' && sel.id === s.id}
-          tint={s.agent === 'codex' ? '#7C5CD6' : '#2563EB'} glyph={s.agent === 'codex' ? 'Cx' : 'CC'}
+          tint={s.agent === 'codex' ? '#7C5CD6' : '#2563EB'}
+          icon={s.agent === 'codex' ? <Cpu size={15} /> : <Sparkles size={15} />}
           title={s.title} time={relTime(s.startedAt)} pill={<StatusPill status={s.status} />}
           onClick={() => setSel({ kind: 'session', id: s.id })} />
       ))}
       {manual.map((m) => (
         <Card key={m.id} active={sel?.kind === 'manual' && sel.id === m.id}
-          tint="#E8810C" glyph="✋" title={m.title} time={relTime(m.lastActivityAt)}
+          tint="#E8810C" icon={<Hand size={15} />} title={m.title} time={relTime(m.lastActivityAt)}
           pill={<Pill text="手动" cls="text-orange-600 bg-orange-50" />} sub={m.terminal}
           onClick={() => setSel({ kind: 'manual', id: m.id })} />
       ))}
       {history.map((h) => (
         <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
-          tint="#9CA3AF" glyph="◷" title={h.label} time={relTime(h.mtime)}
+          tint="#8B909B" icon={<HistoryIcon size={15} />} title={h.label} time={relTime(h.mtime)}
           pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
           onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
       ))}
@@ -487,27 +509,36 @@ function SessionList({ p, state, sel, setSel, inProject }: {
 // —— 顶层导航(多页面:控制台 / 使用统计 / …)——
 function NavRail({ page, setPage }: { page: string; setPage: (p: string) => void }) {
   const items = [
-    { id: 'console', glyph: '💬', label: '控制台' },
-    { id: 'stats', glyph: '📊', label: '使用统计' },
+    { id: 'console', icon: <MessageSquare size={18} />, label: '控制台' },
+    { id: 'stats', icon: <BarChart3 size={18} />, label: '使用统计' },
   ]
   return (
-    <div className="w-[52px] shrink-0 bg-[#ECEEF1] border-r border-line flex flex-col items-center pt-2 gap-1.5">
-      {items.map((it) => (
-        <button key={it.id} onClick={() => setPage(it.id)} title={it.label}
-          className={`w-9 h-9 rounded-xl flex items-center justify-center text-[16px]
-            ${page === it.id ? 'bg-white shadow-sm' : 'hover:bg-white/60'}`}>
-          {it.glyph}
-        </button>
-      ))}
+    <div className="w-[56px] shrink-0 bg-[#ECEEF1] border-r border-line flex flex-col items-center pt-2 gap-1">
+      <div className="w-9 h-9 mb-1 rounded-xl bg-brand/10 text-brand flex items-center justify-center">
+        <AppWindow size={17} />
+      </div>
+      {items.map((it) => {
+        const on = page === it.id
+        return (
+          <button key={it.id} onClick={() => setPage(it.id)} title={it.label}
+            className={`relative w-10 h-10 rounded-xl flex items-center justify-center transition-all
+              ${on ? 'bg-white text-brand shadow-card' : 'text-sub hover:bg-white/70 hover:text-ink'}`}>
+            {on && <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-brand" />}
+            {it.icon}
+          </button>
+        )
+      })}
     </div>
   )
 }
 
 function StatsPage() {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center text-sub">
-      <div className="text-[40px] mb-2">📊</div>
-      <div className="text-[14px] font-semibold text-ink">使用统计</div>
+    <div className="flex-1 flex flex-col items-center justify-center text-sub bg-bg">
+      <div className="w-14 h-14 rounded-2xl bg-brand/10 text-brand flex items-center justify-center mb-3">
+        <BarChart3 size={26} />
+      </div>
+      <div className="text-[15px] font-semibold text-ink tracking-tight">使用统计</div>
       <div className="text-[12px] mt-1">这个页面之后做(占位)。</div>
     </div>
   )
