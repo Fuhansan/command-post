@@ -48,7 +48,6 @@ struct AgentConsoleRootView: View {
             statusBar
         }
         .background(CT.bg)
-        .preferredColorScheme(.light)
         .frame(minWidth: 940, minHeight: 580)
         .onChange(of: selectedProject) { _, p in
             // 切项目 → 默认选中该项目第一个会话(没有则清空,右侧显示新建提示),并切回会话 tab。
@@ -72,7 +71,7 @@ struct AgentConsoleRootView: View {
             Text("UTF-8").font(.system(size: 11)).foregroundStyle(CT.faint)
         }
         .padding(.horizontal, 14).padding(.vertical, 7)
-        .background(CT.panel)
+        .background(VisualEffectBackground(material: .sidebar))
     }
 
     // MARK: - 左:项目栏(可收缩)
@@ -119,7 +118,7 @@ struct AgentConsoleRootView: View {
             }
             Spacer(minLength: 0)
         }
-        .background(CT.panel)
+        .background(VisualEffectBackground(material: .sidebar))
     }
 
     private func projectRow(_ proj: String) -> some View {
@@ -200,7 +199,7 @@ struct AgentConsoleRootView: View {
                 Spacer()
             }
         }
-        .background(CT.panel)
+        .background(VisualEffectBackground(material: .sidebar))
         .task(id: selectedProject) {
             if let p = selectedProject { manager.loadHistoryList(for: p) }
         }
@@ -704,7 +703,7 @@ struct AgentConsoleRootView: View {
                 TextField("输入指令(支持 / 命令、@ 资源、↑ 历史)", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...6)
                     .padding(.horizontal, 12).padding(.vertical, 9)
-                    .background(CT.panel)
+                    .background(Color.primary.opacity(0.04))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(CT.hairline, lineWidth: 1))
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .onSubmit { submit(s.id) }
@@ -883,25 +882,35 @@ struct FileContent {
     var hasMore: Bool { !binary && loaded < total }
 }
 
-/// 控制台浅色配色(对齐高保真设计)。
+/// 控制台配色:全部用系统语义色,自动跟随明/暗,贴近原生 Mac app。
 private enum CT {
-    static func hex(_ v: UInt32) -> Color {
-        Color(.sRGB, red: Double((v >> 16) & 0xFF) / 255,
-              green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
+    static let accent   = Color(nsColor: .controlAccentColor)
+    static let text     = Color(nsColor: .labelColor)
+    static let sub      = Color(nsColor: .secondaryLabelColor)
+    static let faint    = Color(nsColor: .tertiaryLabelColor)
+    static let hairline = Color(nsColor: .separatorColor)
+    static let bg       = Color(nsColor: .textBackgroundColor)    // 内容区底(白/黑)
+    static let panel    = Color(nsColor: .windowBackgroundColor)  // 材质失败时的兜底
+    static let sel      = Color(nsColor: .controlAccentColor).opacity(0.16)   // 选中底
+    static let userBubble = Color(nsColor: .controlAccentColor).opacity(0.14) // 用户气泡
+    static let toolBg   = Color.primary.opacity(0.05)             // 代码/工具底
+    static let success  = Color.green
+    static let indigo   = Color.indigo
+    static let orange   = Color.orange
+}
+
+/// NSVisualEffectView 毛玻璃材质背景(原生侧栏/标题栏通透感)。
+struct VisualEffectBackground: NSViewRepresentable {
+    var material: NSVisualEffectView.Material = .sidebar
+    var blending: NSVisualEffectView.BlendingMode = .behindWindow
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = material; v.blendingMode = blending; v.state = .followsWindowActiveState
+        return v
     }
-    static let bg       = hex(0xFFFFFF)   // 对话区底
-    static let panel    = hex(0xF7F8FA)   // 左/中栏底
-    static let accent   = hex(0x3B82F6)   // 主蓝
-    static let text     = hex(0x1F2328)   // 主文字
-    static let sub      = hex(0x6B7280)   // 次文字
-    static let faint    = hex(0x9AA1AC)   // 更淡
-    static let hairline = Color.black.opacity(0.08)
-    static let sel      = hex(0x3B82F6).opacity(0.10)   // 选中底
-    static let userBubble = hex(0xEAF1FE)  // 用户气泡
-    static let toolBg   = hex(0xF3F4F6)   // 代码/工具底
-    static let success  = hex(0x16A34A)   // 绿
-    static let indigo   = hex(0x7C5CD6)   // Codex 会话类型色
-    static let orange   = hex(0xE8810C)   // 手动会话类型色
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {
+        v.material = material; v.blendingMode = blending
+    }
 }
 
 /// 文件树节点(url + 是否目录,isDir 预算好不再 body 里 syscall)。
