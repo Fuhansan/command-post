@@ -894,16 +894,27 @@ struct FileTreeRow: View {
         }
     }
 
-    /// 目录内容:文件夹在前,按名称自然排序;跳过隐藏文件。
+    /// 跳过的超大/噪音目录(否则展开会一次性建巨量视图,布局崩溃)。
+    static let skipDirs: Set<String> = [
+        "node_modules", ".git", ".build", "build", "DerivedData", "Pods", ".next",
+        "dist", "out", "target", ".venv", "venv", "__pycache__", ".gradle", ".idea",
+        "Carthage", ".swiftpm", ".cache", "vendor"
+    ]
+    /// 每层最多展示的条目数(再多用占位提示,防超大目录建巨量视图)。
+    static let maxChildren = 300
+
+    /// 目录内容:过滤噪音目录 + 上限;文件夹在前,按名称自然排序;跳过隐藏文件。
     static func children(of dir: URL) -> [URL] {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
-        return items.sorted { a, b in
+        let filtered = items.filter { !skipDirs.contains($0.lastPathComponent) }
+        let sorted = filtered.sorted { a, b in
             let aDir = (try? a.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             let bDir = (try? b.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             if aDir != bDir { return aDir }
             return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
         }
+        return Array(sorted.prefix(maxChildren))
     }
 }
