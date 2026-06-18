@@ -74,6 +74,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "respond":
             if let sid = obj["sid"] as? String, let req = obj["reqId"] as? String,
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
+        case "theme":
+            // 跟随网页主题给原生标题栏条着色,避免深色模式露出白边。
+            let dark = obj["dark"] as? Bool ?? false
+            webView.window?.backgroundColor = dark
+                ? NSColor(calibratedWhite: 0.082, alpha: 1)
+                : NSColor(calibratedWhite: 0.965, alpha: 1)
         case "raiseWindow":
             if let id = obj["id"] as? String { raiseWindow(manualId: id) }
         case "listDir":

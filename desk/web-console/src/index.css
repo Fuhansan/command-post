@@ -2,43 +2,62 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ===== 设计令牌(取自 Claude Design「Coding 终端」稿)===== */
+:root {
+  --bg:#f6f6f4; --bg-elev:#ffffff; --bg-elev2:#fbfbfa; --bg-sunken:#eeeeeb;
+  --text:#1b1b19; --text-dim:#6c6c66; --text-faint:#a0a099;
+  --border:rgba(20,20,16,.08); --border-strong:rgba(20,20,16,.14);
+  --accent:#5562c9; --accent-fg:#ffffff; --accent-soft:#ecedfb;
+  --green:#3f9d6b; --amber:#bd8a36; --red:#c25b54;
+  --term-bg:#1c1c18; --term-border:rgba(255,255,255,.07);
+  --term-text:#e7e7e0; --term-dim:#909086; --term-green:#84d3a4;
+}
+[data-theme="dark"] {
+  --bg:#151513; --bg-elev:#1d1d1a; --bg-elev2:#242421; --bg-sunken:#121210;
+  --text:#ededea; --text-dim:#9c9c94; --text-faint:#6c6c63;
+  --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.17);
+  --accent:#868ef2; --accent-fg:#16160f; --accent-soft:#2c2d4a;
+  --green:#5cbd86; --amber:#cda255; --red:#d6726a;
+  --term-bg:#0f0f0c; --term-border:rgba(255,255,255,.07);
+  --term-text:#e7e7e0; --term-dim:#7e7e74; --term-green:#84d3a4;
+}
+
 html, body, #root { height: 100%; margin: 0; }
 body {
-  font-family: "Hanken Grotesk Variable", -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  font-family: "Geist Variable", "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  color: #14151A;
-  background: #FBFBFC;
+  color: var(--text);
+  background: var(--bg);
   user-select: none;
-  letter-spacing: -0.005em;
+  transition: background .2s ease, color .2s ease;
 }
 .titlebar-pad { padding-top: 8px; }
 
 /* 运行中状态点:柔和脉冲 */
-@keyframes ping-soft { 0% { box-shadow: 0 0 0 0 rgba(22,163,74,0.35); } 70%,100% { box-shadow: 0 0 0 5px rgba(22,163,74,0); } }
-.dot-live { animation: ping-soft 1.8s ease-out infinite; }
+@keyframes pulseDot { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.4; transform:scale(.82); } }
+.dot-live { animation: pulseDot 1.4s ease-in-out infinite; }
 
-/* 对话区极淡顶光,增加纵深 */
-.conv-bg { background:
-  radial-gradient(120% 60% at 50% -10%, rgba(37,99,235,0.035), transparent 60%), #FBFBFC; }
-
-/* 切换会话:整段淡入上滑 */
-@keyframes conv-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+/* 入场动画 */
+@keyframes conv-in { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:none; } }
 .animate-conv { animation: conv-in .28s cubic-bezier(.2,.7,.2,1) both; }
-
-/* 每条消息逐条淡入 */
-@keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes msg-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
 .animate-msg { animation: msg-in .3s cubic-bezier(.2,.7,.2,1) both; }
+@keyframes pop-in { from { opacity:0; transform:translateY(8px) scale(.985); } to { opacity:1; transform:none; } }
+.animate-pop { animation: pop-in .16s ease both; }
+@keyframes fade-in { from { opacity:0; } to { opacity:1; } }
+.animate-fade { animation: fade-in .15s ease both; }
 
 /* 思考中三点 */
-@keyframes typing-dot { 0%,80%,100% { transform: translateY(0); opacity: .35; } 40% { transform: translateY(-3px); opacity: 1; } }
+@keyframes typing-dot { 0%,80%,100% { transform:translateY(0); opacity:.35; } 40% { transform:translateY(-3px); opacity:1; } }
 .typing-dot { animation: typing-dot 1.2s ease-in-out infinite; }
 
-/* 细腻滚动条(像原生 Mac 控制台) */
+/* 细腻滚动条 */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: rgba(20,21,26,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
-::-webkit-scrollbar-thumb:hover { background: rgba(20,21,26,0.26); background-clip: content-box; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* highlight.js 代码块跟随等宽字体 */
-.hljs { font-family: "JetBrains Mono", ui-monospace, monospace; }
+/* highlight.js 跟随等宽字体 */
+.hljs { font-family: "Geist Mono Variable", ui-monospace, monospace; background: transparent !important; }

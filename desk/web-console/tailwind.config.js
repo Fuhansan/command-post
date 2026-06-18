@@ -1,32 +1,34 @@
 /** @type {import('tailwindcss').Config} */
 export default {
+  darkMode: ['selector', '[data-theme="dark"]'],
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"Hanken Grotesk Variable"', '-apple-system', 'BlinkMacSystemFont', '"PingFang SC"', 'sans-serif'],
-        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+        sans: ['"Geist Variable"', '"PingFang SC"', '-apple-system', 'BlinkMacSystemFont', 'sans-serif'],
+        mono: ['"Geist Mono Variable"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
+      // 全部指向 CSS 变量 → 切换 data-theme 即自动换肤
       colors: {
-        ink: '#14151A',       // 近黑(略暖)
-        sub: '#6A6E78',       // 次文字
-        faint: '#9CA0AB',     // 浅灰
-        line: '#E7E8EC',      // 描边
-        panel: '#F4F5F7',     // 侧栏底
-        bg: '#FBFBFC',        // 内容底(近白略冷)
-        brand: '#2563EB',     // 主蓝
-        selbg: '#EEF3FE',     // 选中底
-        selborder: '#B6CDFb', // 选中边
+        bg: 'var(--bg)',
+        elev: 'var(--bg-elev)',
+        elev2: 'var(--bg-elev2)',
+        sunken: 'var(--bg-sunken)',
+        ink: 'var(--text)',
+        dim: 'var(--text-dim)',
+        faint: 'var(--text-faint)',
+        line: 'var(--border)',
+        strong: 'var(--border-strong)',
+        accent: 'var(--accent)',
+        accentfg: 'var(--accent-fg)',
+        accentsoft: 'var(--accent-soft)',
+        ok: 'var(--green)',
+        warn: 'var(--amber)',
+        bad: 'var(--red)',
       },
       boxShadow: {
         card: '0 1px 2px rgba(20,21,26,0.04), 0 1px 3px rgba(20,21,26,0.03)',
-        pop: '0 8px 28px rgba(20,21,26,0.12)',
-      },
-      keyframes: {
-        rise: { '0%': { opacity: '0', transform: 'translateY(6px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
-      },
-      animation: {
-        rise: 'rise .28s cubic-bezier(.2,.7,.2,1) both',
+        pop: '0 12px 32px rgba(0,0,0,0.16)',
       },
     },
   },

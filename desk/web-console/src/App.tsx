@@ -1,10 +1,9 @@
 import { useSyncExternalStore, useState, useMemo, useRef, useEffect } from 'react'
-import type { ReactNode } from 'react'
 import hljs from 'highlight.js'
 import {
-  Sparkles, Cpu, Hand, History as HistoryIcon, Folder, FolderOpen, FileText, File as FileIcon,
-  MessageSquare, BarChart3, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus,
-  RotateCcw, AppWindow, Terminal,
+  Folder, FolderOpen, File as FileIcon, ChevronRight, ChevronDown, ArrowUp, FolderPlus,
+  RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
+  BarChart3, PanelsTopLeft, Search,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
@@ -17,45 +16,39 @@ const HLJS_EXT: Record<string, string> = {
   yml: 'yaml', yaml: 'yaml', xml: 'xml', sql: 'sql', c: 'c', cpp: 'cpp', cc: 'cpp', h: 'cpp',
   hpp: 'cpp', php: 'php', toml: 'ini', ini: 'ini',
 }
-function hljsLang(path: string): string | undefined {
-  return HLJS_EXT[path.split('.').pop()?.toLowerCase() ?? '']
-}
+const hljsLang = (path: string) => HLJS_EXT[path.split('.').pop()?.toLowerCase() ?? '']
 
 function useAgent() { return useSyncExternalStore(subscribe, getState, getState) }
 function useTranscripts() { return useSyncExternalStore(subscribe, getTranscripts, getTranscripts) }
 function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
 function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
 
-const STATUS: Record<string, { label: string; cls: string }> = {
-  starting: { label: '启动中', cls: 'text-amber-600 bg-amber-50' },
-  idle: { label: '就绪', cls: 'text-brand bg-blue-50' },
-  working: { label: '运行中', cls: 'text-green-600 bg-green-50' },
-  waitingInput: { label: '挂起', cls: 'text-gray-500 bg-gray-100' },
-  needsResponse: { label: '待响应', cls: 'text-amber-600 bg-amber-50' },
-  done: { label: '完成', cls: 'text-green-600 bg-green-50' },
-  error: { label: '错误', cls: 'text-red-600 bg-red-50' },
+// ===== 状态 → 圆点 + 文案(对齐设计稿)=====
+type DotMeta = { text: string; color: string; pulse?: boolean; hollow?: boolean }
+function sessionMeta(status: string): DotMeta {
+  switch (status) {
+    case 'working': return { text: '运行中', color: 'var(--accent)', pulse: true }
+    case 'starting': return { text: '启动中', color: 'var(--amber)', pulse: true }
+    case 'needsResponse': return { text: '待响应', color: 'var(--amber)', hollow: true }
+    case 'waitingInput': return { text: '挂起', color: 'var(--text-faint)', hollow: true }
+    case 'idle': return { text: '就绪', color: 'var(--accent)' }
+    case 'error': return { text: '错误', color: 'var(--red)' }
+    default: return { text: '已完成', color: 'var(--green)' }
+  }
 }
-function Pill({ text, cls }: { text: string; cls: string }) {
-  return <span className={`px-2 py-[1px] rounded-full text-[10.5px] font-medium ${cls}`}>{text}</span>
+function manualMeta(state: string): DotMeta {
+  if (state === 'working') return { text: '运行中', color: 'var(--accent)', pulse: true }
+  if (state === 'waiting') return { text: '待确认', color: 'var(--amber)', hollow: true }
+  return { text: '空闲', color: 'var(--text-faint)', hollow: true }
 }
-function StatusPill({ status }: { status: string }) {
-  const s = STATUS[status] ?? { label: status, cls: 'text-gray-500 bg-gray-100' }
-  const live = status === 'working'
-  return (
-    <span className={`inline-flex items-center gap-1.5 px-2 py-[1px] rounded-full text-[10.5px] font-medium ${s.cls}`}>
-      {live && <span className="w-1.5 h-1.5 rounded-full bg-green-500 dot-live" />}
-      {s.label}
-    </span>
-  )
+function Dot({ meta, size = 7 }: { meta: DotMeta; size?: number }) {
+  const base: React.CSSProperties = {
+    width: size, height: size, borderRadius: '50%', flex: 'none', display: 'inline-block',
+  }
+  if (meta.hollow) return <span style={{ ...base, background: 'transparent', border: `1.5px solid ${meta.color}` }} />
+  return <span className={meta.pulse ? 'dot-live' : ''} style={{ ...base, background: meta.color }} />
 }
-function IconBox({ tint, children, size = 32 }: { tint: string; children: ReactNode; size?: number }) {
-  return (
-    <div className="rounded-[9px] flex items-center justify-center shrink-0 ring-1 ring-inset"
-      style={{ width: size, height: size, background: tint + '16', color: tint, borderColor: tint + '22' }}>
-      {children}
-    </div>
-  )
-}
+
 function relTime(ms?: number): string {
   if (!ms) return ''
   const d = new Date(ms), now = new Date()
@@ -73,24 +66,34 @@ type Sel =
   | { kind: 'history'; id: string; workdir: string }
   | null
 
-function Card({ active, tint, icon, title, time, pill, sub, onClick }: {
-  active: boolean; tint: string; icon: ReactNode; title: string; time?: string
-  pill?: ReactNode; sub?: string; onClick: () => void
+// ===== 会话行(列表)=====
+function Row({ title, badge, meta, model, time, active, onClick }: {
+  title: string; badge?: { text: string; color: string }; meta: DotMeta
+  model?: string; time?: string; active: boolean; onClick: () => void
 }) {
   return (
     <button onClick={onClick}
-      className={`w-full text-left flex gap-3 items-start p-3 rounded-xl border animate-rise
-        transition-all duration-150 hover:-translate-y-px
-        ${active ? 'bg-selbg border-selborder shadow-card' : 'bg-card border-line shadow-card hover:shadow-pop'}`}>
-      <IconBox tint={tint}>{icon}</IconBox>
+      className="relative w-full text-left flex gap-2.5 rounded-[10px] mb-0.5 px-3 py-2.5 pl-3.5
+        transition-colors hover:bg-sunken"
+      style={active ? { background: 'var(--accent-soft)' } : undefined}>
+      {active && <span className="absolute left-[3px] top-3 bottom-3 w-[3px] rounded-full" style={{ background: 'var(--accent)' }} />}
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <div className="font-semibold text-[13.5px] text-ink truncate flex-1 tracking-tight">{title || '新会话'}</div>
-          {time && <div className="text-[11px] text-faint shrink-0 font-mono">{time}</div>}
+        <div className="flex items-center gap-1.5">
+          <span className="font-medium text-[13px] text-ink truncate">{title || '新会话'}</span>
+          {badge && (
+            <span className="text-[10px] font-medium px-1.5 py-px rounded shrink-0"
+              style={{ color: badge.color, background: 'var(--bg-sunken)' }}>{badge.text}</span>
+          )}
         </div>
-        <div className="mt-1.5 flex items-center gap-2">
-          {pill}
-          {sub && <span className="text-[11px] text-sub truncate">{sub}</span>}
+        <div className="mt-[5px] flex items-center gap-[7px]">
+          <Dot meta={meta} />
+          <span className="text-[11px] text-dim">{meta.text}</span>
+          {model && <>
+            <span className="text-[11px] text-faint">·</span>
+            <span className="font-mono text-[10.5px] text-faint truncate">{model}</span>
+          </>}
+          <span className="flex-1" />
+          {time && <span className="text-[10.5px] text-faint shrink-0">{time}</span>}
         </div>
       </div>
     </button>
@@ -102,15 +105,18 @@ function NewMenu({ workdir }: { workdir: string }) {
   return (
     <div className="relative">
       <button onClick={() => setOpen((o) => !o)}
-        className="text-[12px] text-brand px-2 py-0.5 rounded-md hover:bg-blue-50">+ 新建</button>
+        className="flex items-center gap-1 pl-1.5 pr-2.5 py-1 rounded-[7px] text-[12px] font-medium text-accentfg transition hover:brightness-110"
+        style={{ background: 'var(--accent)' }}>
+        <Plus size={13} strokeWidth={2.4} />新建
+      </button>
       {open && (
         <>
-          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 mt-1 z-20 bg-white border border-line rounded-lg shadow-lg py-1 w-32">
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 mt-1.5 z-40 w-36 p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
             <button onClick={() => { cmd.continueLast(workdir); setOpen(false) }}
-              className="w-full text-left px-3 py-1.5 text-[12px] hover:bg-gray-50">继续最近</button>
+              className="w-full text-left px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken">继续最近</button>
             <button onClick={() => { cmd.newSession(workdir); setOpen(false) }}
-              className="w-full text-left px-3 py-1.5 text-[12px] hover:bg-gray-50">全新会话</button>
+              className="w-full text-left px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken">全新会话</button>
           </div>
         </>
       )}
@@ -118,21 +124,22 @@ function NewMenu({ workdir }: { workdir: string }) {
   )
 }
 
-// —— 消息渲染 ——
-function UserBubble({ text }: { text: string }) {
-  return (
-    <div className="flex justify-end">
-      <div className="max-w-[80%] px-3 py-2 rounded-xl bg-[#EAF1FE] text-[13px] text-ink whitespace-pre-wrap break-words select-text">{text}</div>
-    </div>
-  )
-}
+// ===== 消息渲染 =====
 function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
-  if (m.kind === 'text' && m.role === 'user') return <UserBubble text={m.text} />
+  if (m.kind === 'text' && m.role === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg"
+          style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{m.text}</div>
+      </div>
+    )
+  }
   if (m.kind === 'text') {
     return (
       <div className="flex gap-2.5">
-        <div className="w-6 h-6 rounded-md bg-blue-50 text-brand flex items-center justify-center text-[11px] shrink-0">✦</div>
-        <div className="text-[13px] text-ink whitespace-pre-wrap break-words select-text leading-relaxed">{m.text}</div>
+        <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0 mt-0.5"
+          style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
+        <div className="flex-1 text-[13.5px] leading-[1.72] text-ink whitespace-pre-wrap break-words select-text">{m.text}</div>
       </div>
     )
   }
@@ -141,37 +148,46 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
     const name = i > 0 ? m.text.slice(0, i) : m.text
     const arg = i > 0 ? m.text.slice(i + 1).trim() : ''
     const isBash = name === 'Bash'
-    return (
-      <div className="flex gap-2.5">
-        <div className="w-6 h-6 rounded-md bg-gray-100 text-sub flex items-center justify-center shrink-0">
-          <Terminal size={12} />
-        </div>
-        <div className="flex-1 rounded-xl border border-line bg-card shadow-card overflow-hidden">
-          <div className="px-3 py-1.5 text-[11.5px] font-semibold text-sub border-b border-line flex items-center gap-1.5">
-            <Terminal size={11} className="text-faint" />{name}
+    if (isBash) {
+      return (
+        <div className="rounded-[11px] overflow-hidden border" style={{ background: 'var(--term-bg)', borderColor: 'var(--term-border)' }}>
+          <div className="flex items-center gap-2 px-3.5 py-2.5 border-b" style={{ borderColor: 'var(--term-border)' }}>
+            <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--term-green)' }} />
+            <span className="text-[12px] font-medium" style={{ color: 'var(--term-text)' }}>{name}</span>
           </div>
           {arg && (
-            isBash
-              ? <pre className="text-[12px] font-mono px-3 py-2.5 bg-[#16171B] text-[#E6E7EA] whitespace-pre-wrap break-words select-text leading-relaxed">
-                  <span className="text-[#7C8190] select-none">$ </span>{arg}
-                </pre>
-              : <pre className="text-[12px] font-mono px-3 py-2.5 bg-panel text-ink whitespace-pre-wrap break-words select-text">{arg}</pre>
+            <pre className="px-4 py-3 font-mono text-[12px] leading-[1.75] overflow-x-auto whitespace-pre-wrap break-words select-text"
+              style={{ color: 'var(--term-text)' }}>
+              <span style={{ color: 'var(--term-dim)' }} className="select-none">$ </span>{arg}
+            </pre>
           )}
         </div>
+      )
+    }
+    return (
+      <div className="rounded-[11px] overflow-hidden border border-line bg-elev">
+        <div className="flex items-center gap-2 px-3.5 py-2.5">
+          <span className="text-[12.5px] font-semibold text-ink">{name}</span>
+        </div>
+        {arg && <pre className="px-4 py-2.5 font-mono text-[12px] leading-relaxed bg-sunken text-dim whitespace-pre-wrap break-words select-text border-t border-line">{arg}</pre>}
       </div>
     )
   }
   if (m.kind === 'permission') {
     const r = m.permState
-    const tone = r == null ? 'border-amber-200 bg-amber-50' : r === 'allow' ? 'border-green-200 bg-green-50' : 'border-red-200 bg-red-50'
+    const tone = r == null ? 'var(--amber)' : r === 'allow' ? 'var(--green)' : 'var(--red)'
+    const label = r == null ? '需要你处理' : r === 'allow' ? '✓ 已允许' : '✕ 已拒绝'
     return (
-      <div className={`rounded-[10px] border p-3 ${tone}`}>
-        <div className="text-[12px] font-semibold mb-1.5">{r == null ? '需要你处理' : r === 'allow' ? '✓ 已允许' : '✕ 已拒绝'}</div>
-        <pre className="text-[12px] font-mono bg-white/70 rounded-lg p-2.5 whitespace-pre-wrap break-words select-text">{m.text}</pre>
+      <div className="rounded-[11px] border p-3.5 animate-pop" style={{ borderColor: tone, background: 'var(--bg-elev2)' }}>
+        <div className="text-[12px] font-semibold mb-2" style={{ color: tone }}>{label}</div>
+        <pre className="font-mono text-[12px] rounded-lg p-2.5 bg-sunken text-ink whitespace-pre-wrap break-words select-text">{m.text}</pre>
         {r == null && onRespond && (
-          <div className="mt-2 flex gap-2">
-            <button onClick={() => onRespond(m.permReqId ?? '', ['deny'])} className="px-3 py-1 rounded-lg text-[12px] border border-line bg-white">拒绝</button>
-            <button onClick={() => onRespond(m.permReqId ?? '', ['allow'])} className="px-3 py-1 rounded-lg text-[12px] text-white bg-brand">允许</button>
+          <div className="mt-2.5 flex gap-2">
+            <button onClick={() => onRespond(m.permReqId ?? '', ['deny'])}
+              className="px-3.5 py-1.5 rounded-[9px] text-[12px] border border-strong text-dim hover:bg-sunken">拒绝</button>
+            <button onClick={() => onRespond(m.permReqId ?? '', ['allow'])}
+              className="px-4 py-1.5 rounded-[9px] text-[12px] font-medium text-accentfg hover:brightness-110"
+              style={{ background: 'var(--accent)' }}>允许</button>
           </div>
         )}
       </div>
@@ -187,33 +203,54 @@ function MsgList({ msgs, onRespond, working }: {
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
   useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }, [ordered.length, working])
   return (
-    <div ref={ref} className="flex-1 overflow-auto px-4 py-4 space-y-3.5 conv-bg">
-      {ordered.map((m) => <div key={m.id} className="animate-msg"><MessageRow m={m} onRespond={onRespond} /></div>)}
-      {working && (
-        <div className="flex gap-2.5 animate-msg">
-          <div className="w-6 h-6 rounded-md bg-blue-50 text-brand flex items-center justify-center shrink-0"><Sparkles size={12} /></div>
-          <div className="flex items-center gap-1 px-1 py-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" />
-            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.15s' }} />
-            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.3s' }} />
+    <div ref={ref} className="flex-1 overflow-y-auto overflow-x-hidden">
+      <div className="max-w-[780px] mx-auto px-7 py-5 space-y-4">
+        {ordered.map((m) => <div key={m.id} className="animate-msg"><MessageRow m={m} onRespond={onRespond} /></div>)}
+        {working && (
+          <div className="flex gap-2.5 animate-msg">
+            <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0"
+              style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
+            <div className="flex items-center gap-1 py-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" />
+              <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.15s' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.3s' }} />
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }
 
-function Header({ title, sub, right }: { title: string; sub?: string; right?: React.ReactNode }) {
+function WorkHeader({ title, meta, model, sub, right }: {
+  title: string; meta?: DotMeta; model?: string; sub?: string; right?: React.ReactNode
+}) {
   return (
-    <div className="px-4 py-2.5 flex items-center gap-2 border-b border-line">
-      <div className="font-semibold text-[14px] text-ink truncate">{title}</div>
-      {sub && <div className="text-[11px] text-faint truncate flex-1">{sub}</div>}
-      <div className="ml-auto flex items-center gap-2">{right}</div>
+    <div className="flex-none flex items-center gap-3 px-5 py-3 border-b border-line">
+      <div className="flex-1 min-w-0">
+        <div className="text-[15px] font-semibold text-ink truncate">{title}</div>
+        <div className="flex items-center gap-2 mt-1">
+          {meta && <Dot meta={meta} size={8} />}
+          {meta && <span className="text-[11.5px] text-dim">{meta.text}</span>}
+          {model && <><span className="text-[11.5px] text-faint">·</span><span className="font-mono text-[11px] text-faint">{model}</span></>}
+          {sub && <><span className="text-[11.5px] text-faint">·</span><span className="text-[11.5px] text-faint truncate">{sub}</span></>}
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5">{right}</div>
     </div>
   )
 }
 
-// —— 文件树 + tab + Monaco ——
+function IconBtn({ title, onClick, children }: { title: string; onClick?: () => void; children: React.ReactNode }) {
+  return (
+    <button title={title} onClick={onClick}
+      className="w-[30px] h-[30px] rounded-lg flex items-center justify-center text-dim hover:text-ink hover:bg-sunken transition-colors">
+      {children}
+    </button>
+  )
+}
+
+// ===== 文件树 / 文件查看 / Tab =====
 function TreeRow({ entry, depth, expanded, toggle, openFile }: {
   entry: Entry; depth: number; expanded: Set<string>
   toggle: (p: string) => void; openFile: (p: string) => void
@@ -223,17 +260,16 @@ function TreeRow({ entry, depth, expanded, toggle, openFile }: {
   const children = dirs[entry.path]
   return (
     <div>
-      <button
-        onClick={() => (entry.isDir ? toggle(entry.path) : openFile(entry.path))}
-        className="w-full text-left flex items-center gap-1.5 py-[3px] pr-1 rounded-md hover:bg-black/[0.04] transition-colors"
+      <button onClick={() => (entry.isDir ? toggle(entry.path) : openFile(entry.path))}
+        className="w-full text-left flex items-center gap-1.5 py-[3px] pr-1 rounded-md hover:bg-sunken transition-colors"
         style={{ paddingLeft: depth * 12 + 4 }}>
         <span className="w-3 flex justify-center text-faint">
           {entry.isDir ? (isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />) : null}
         </span>
         {entry.isDir
-          ? (isOpen ? <FolderOpen size={13} className="text-brand/80 shrink-0" /> : <Folder size={13} className="text-faint shrink-0" />)
+          ? (isOpen ? <FolderOpen size={13} className="shrink-0" style={{ color: 'var(--accent)' }} /> : <Folder size={13} className="text-faint shrink-0" />)
           : <FileIcon size={13} className="text-faint shrink-0" />}
-        <span className="text-[12px] text-ink truncate">{entry.name}</span>
+        <span className="text-[12px] text-dim truncate">{entry.name}</span>
       </button>
       {entry.isDir && isOpen && (children ?? []).map((c) => (
         <TreeRow key={c.path} entry={c} depth={depth + 1} expanded={expanded} toggle={toggle} openFile={openFile} />
@@ -267,10 +303,8 @@ function FileViewer({ path }: { path: string }) {
   const files = useFiles()
   const body = files[path]
   useEffect(() => { if (!body) cmd.loadFile(path) }, [path, body])
-  // highlight.js:超过 200KB 不高亮(避免卡顿),直接纯文本。
   const html = useMemo(() => {
-    if (!body) return null
-    if (body.text.length > 200_000) return null
+    if (!body || body.text.length > 200_000) return null
     try {
       const lang = hljsLang(path)
       return lang && hljs.getLanguage(lang)
@@ -280,15 +314,16 @@ function FileViewer({ path }: { path: string }) {
   }, [body, path])
   return (
     <div className="h-full flex flex-col">
-      <div className="px-4 py-2 border-b border-line flex items-center gap-2">
+      <div className="px-5 py-2.5 border-b border-line flex items-center gap-2">
+        <FileIcon size={13} className="text-faint" />
         <span className="text-[13px] font-semibold text-ink truncate">{path.split('/').pop()}</span>
-        {body?.truncated && <span className="text-[11px] text-amber-600">已截断(仅前 2MB)</span>}
+        {body?.truncated && <span className="text-[11px]" style={{ color: 'var(--amber)' }}>已截断(仅前 2MB)</span>}
       </div>
       <div className="flex-1 min-h-0 overflow-auto">
-        <pre className="text-[12px] font-mono leading-relaxed p-3 m-0 select-text">
+        <pre className="text-[12px] font-mono leading-relaxed p-4 m-0 select-text">
           {html != null
-            ? <code className="hljs !bg-transparent !p-0" dangerouslySetInnerHTML={{ __html: html }} />
-            : <code className="hljs !bg-transparent !p-0">{body?.text ?? '加载中…'}</code>}
+            ? <code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />
+            : <code className="hljs">{body?.text ?? '加载中…'}</code>}
         </pre>
       </div>
     </div>
@@ -300,53 +335,71 @@ function Tab({ label, active, closable, onTap, onClose }: {
 }) {
   return (
     <div onClick={onTap}
-      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer text-[12px] border
-        ${active ? 'bg-selbg border-selborder text-ink font-medium' : 'border-transparent text-sub hover:bg-gray-100'}`}>
+      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer text-[12px] transition-colors
+        ${active ? 'text-ink font-medium' : 'text-dim hover:bg-sunken'}`}
+      style={active ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : undefined}>
       <span className="truncate max-w-[140px]">{label}</span>
       {closable && (
-        <span onClick={(e) => { e.stopPropagation(); onClose?.() }}
-          className="text-faint hover:text-ink rounded p-0.5 hover:bg-black/5"><X size={11} /></span>
+        <span onClick={(e) => { e.stopPropagation(); onClose?.() }} className="text-faint hover:text-ink rounded p-0.5 hover:bg-sunken"><X size={11} /></span>
       )}
     </div>
   )
 }
 
-function Conversation({ s }: { s: Session }) {
+// ===== 输入框 =====
+function Composer({ modelLabel, onSend }: { modelLabel: string; onSend: (t: string) => void }) {
   const [draft, setDraft] = useState('')
-  const submit = () => { const t = draft.trim(); if (!t) return; cmd.sendInput(s.id, t); setDraft('') }
+  const submit = () => { const t = draft.trim(); if (!t) return; onSend(t); setDraft('') }
   return (
-    <div className="flex flex-col h-full">
-      <Header title={s.title || '会话'} sub={s.workdir}
-        right={<button onClick={() => cmd.closeSession(s.id)} className="text-[12px] text-sub px-2 py-1 rounded-md hover:bg-gray-100">结束会话</button>} />
-      <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} working={s.status === 'working'} />
-      <div className="px-3 py-3 border-t border-line flex gap-2 items-end">
+    <div className="flex-none px-7 pb-4 pt-1">
+      <div className="max-w-[780px] mx-auto rounded-[14px] border border-strong bg-elev shadow-card overflow-hidden">
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } }}
-          rows={1} placeholder="输入指令…(Enter 发送,Shift+Enter 换行)"
-          className="flex-1 resize-none text-[13px] px-3 py-2 rounded-xl bg-card border border-line focus:outline-none focus:border-brand focus:ring-4 focus:ring-brand/10 transition-shadow select-text" />
-        <button onClick={submit} disabled={!draft.trim()}
-          className="w-9 h-9 rounded-[10px] bg-brand text-white disabled:bg-faint flex items-center justify-center transition-colors hover:bg-blue-700">
-          <ArrowUp size={16} />
-        </button>
+          rows={1} placeholder="描述你的需求…(Enter 发送,Shift+Enter 换行)"
+          className="w-full resize-none bg-transparent outline-none px-4 pt-3.5 pb-1.5 text-[13px] text-ink select-text placeholder:text-faint" />
+        <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
+          <div className="w-7 h-7 rounded-[7px] flex items-center justify-center text-faint"><Paperclip size={15} /></div>
+          <span className="flex-1" />
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-line text-[11.5px] text-dim">
+            <span className="w-[7px] h-[7px] rounded-full" style={{ background: 'var(--accent)' }} />
+            <span className="font-mono">{modelLabel}</span>
+          </div>
+          <button onClick={submit} disabled={!draft.trim()}
+            className="w-8 h-8 rounded-[9px] flex items-center justify-center text-accentfg disabled:opacity-40 transition hover:brightness-110"
+            style={{ background: 'var(--accent)' }}>
+            <ArrowUp size={16} strokeWidth={2} />
+          </button>
+        </div>
       </div>
+    </div>
+  )
+}
+
+function Conversation({ s }: { s: Session }) {
+  const model = s.agent === 'codex' ? 'Codex' : 'Claude'
+  return (
+    <div className="flex flex-col h-full bg-bg">
+      <WorkHeader title={s.title || '会话'} meta={sessionMeta(s.status)} model={model} sub={s.workdir}
+        right={<IconBtn title="结束会话" onClick={() => cmd.closeSession(s.id)}><X size={16} /></IconBtn>} />
+      <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} working={s.status === 'working'} />
+      <Composer modelLabel={model} onSend={(t) => cmd.sendInput(s.id, t)} />
     </div>
   )
 }
 
 function ManualView({ m, msgs }: { m: Manual; msgs: Msg[] }) {
   return (
-    <div className="flex flex-col h-full">
-      <Header title={m.title} sub={m.cwd} right={
-        <>
-          <Pill text="手动" cls="text-orange-600 bg-orange-50" />
+    <div className="flex flex-col h-full bg-bg">
+      <WorkHeader title={m.title} meta={manualMeta(m.state)} sub={m.cwd}
+        right={
           <button onClick={() => cmd.raiseWindow(m.id)}
-            className="text-[12px] text-white bg-brand px-2.5 py-1 rounded-md flex items-center gap-1.5 hover:bg-blue-700 transition-colors">
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110"
+            style={{ background: 'var(--accent)' }}>
             <AppWindow size={13} /> 唤起 {m.terminal}
           </button>
-        </>
-      } />
+        } />
       <MsgList msgs={msgs} />
-      <div className="px-4 py-2 border-t border-line text-[11px] text-sub">手动会话:在 {m.terminal} 里输入,这里只读。</div>
+      <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {m.terminal} 里输入,这里只读。</div>
     </div>
   )
 }
@@ -355,22 +408,21 @@ function HistoryView({ h, msgs, onResume, resuming }: {
   h: History; msgs: Msg[]; onResume: () => void; resuming: boolean
 }) {
   return (
-    <div className="flex flex-col h-full">
-      <Header title={h.label} sub="历史会话 · 只读" right={
-        <>
-          <Pill text="只读" cls="text-gray-500 bg-gray-100" />
+    <div className="flex flex-col h-full bg-bg">
+      <WorkHeader title={h.label} meta={{ text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }}
+        right={
           <button onClick={onResume} disabled={resuming}
-            className="text-[12px] text-white bg-brand px-2.5 py-1 rounded-md flex items-center gap-1.5 hover:bg-blue-700 disabled:opacity-60 transition-colors">
-            <RotateCcw size={13} className={resuming ? 'animate-spin' : ''} />
-            {resuming ? '恢复中…' : 'Resume'}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60"
+            style={{ background: 'var(--accent)' }}>
+            <RotateCcw size={13} className={resuming ? 'animate-spin' : ''} />{resuming ? '恢复中…' : 'Resume'}
           </button>
-        </>
-      } />
+        } />
       <MsgList msgs={msgs} />
     </div>
   )
 }
 
+// ===== 工作区(控制台)=====
 function ConsolePage() {
   const state = useAgent()
   const transcripts = useTranscripts()
@@ -378,13 +430,13 @@ function ConsolePage() {
   const [sel, setSel] = useState<Sel>(null)
   const [openFiles, setOpenFiles] = useState<string[]>([])
   const [activeFile, setActiveFile] = useState<string | null>(null)
-  const [pendingResume, setPendingResume] = useState<string | null>(null)   // 正在恢复的 claudeId
+  const [pendingResume, setPendingResume] = useState<string | null>(null)
+  const [query, setQuery] = useState('')
+  const [filter, setFilter] = useState<'all' | 'running' | 'done'>('all')
 
-  // 恢复历史:防重复 + 等新会话(同 claudeId)出现后自动跳过去
   const doResume = (workdir: string, id: string) => {
     if (pendingResume) return
-    setPendingResume(id)
-    cmd.resume(workdir, id)
+    setPendingResume(id); cmd.resume(workdir, id)
   }
   useEffect(() => {
     if (!pendingResume) return
@@ -392,13 +444,11 @@ function ConsolePage() {
     if (s) { setSel({ kind: 'session', id: s.id }); setActiveFile(null); setPendingResume(null) }
   }, [state.sessions, pendingResume])
 
-  // 默认/保持选中项目有效
   useEffect(() => {
     if ((!selectedProject || !state.projects.some((p) => p.workdir === selectedProject)) && state.projects.length)
       setSelectedProject(state.projects[0].workdir)
   }, [state.projects, selectedProject])
 
-  // 选中历史/手动 → 拉转录;选中失效则清空
   useEffect(() => {
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
     if (sel?.kind === 'manual' && !transcripts[sel.id]) cmd.loadTranscript('manual', sel.id)
@@ -411,52 +461,88 @@ function ConsolePage() {
   const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd + '/')
   const project = state.projects.find((p) => p.workdir === selectedProject) ?? null
 
-  const selectSession = (s: Sel) => { setSel(s); setActiveFile(null) }
+  // 当前项目的三类会话
+  const consoleSessions = project ? state.sessions.filter((s) => s.workdir === project.workdir) : []
+  const manualList = project ? state.manual.filter((m) => inProject(m.cwd, project.workdir)) : []
+  const liveIds = new Set<string>([
+    ...consoleSessions.map((s) => s.agentSessionId).filter(Boolean) as string[],
+    ...manualList.map((m) => m.id),
+  ])
+  const historyList = project ? project.history.filter((h) => !liveIds.has(h.id)) : []
+
+  const isRunning = {
+    session: (s: Session) => !['done', 'error'].includes(s.status),
+    manual: (m: Manual) => m.state === 'working' || m.state === 'waiting',
+  }
+  const counts = {
+    all: consoleSessions.length + manualList.length + historyList.length,
+    running: consoleSessions.filter(isRunning.session).length + manualList.filter(isRunning.manual).length,
+    done: 0,
+  }
+  counts.done = counts.all - counts.running
+
+  const q = query.trim().toLowerCase()
+  const match = (t: string) => !q || t.toLowerCase().includes(q)
+  const fSessions = consoleSessions.filter((s) => match(s.title)
+    && (filter === 'all' || (filter === 'running' ? isRunning.session(s) : !isRunning.session(s))))
+  const fManual = manualList.filter((m) => match(m.title)
+    && (filter === 'all' || (filter === 'running' ? isRunning.manual(m) : !isRunning.manual(m))))
+  const fHistory = historyList.filter((h) => match(h.label) && filter !== 'running')
+
   const openFile = (p: string) => { setOpenFiles((prev) => (prev.includes(p) ? prev : [...prev, p])); setActiveFile(p) }
   const closeFile = (p: string) => {
     setOpenFiles((prev) => prev.filter((x) => x !== p))
     setActiveFile((cur) => (cur === p ? null : cur))
   }
+  const pick = (s: Sel) => { setSel(s); setActiveFile(null) }
 
   const sessionView = useMemo(() => {
-    if (!sel) return <div className="h-full flex items-center justify-center text-sub text-[13px]">选择或新建一个会话</div>
+    if (!sel) return (
+      <div className="h-full flex flex-col items-center justify-center text-faint gap-3">
+        <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><PanelsTopLeft size={22} /></div>
+        <div className="text-[13px]">选择左侧会话,或点「新建」</div>
+      </div>
+    )
     if (sel.kind === 'session') { const s = state.sessions.find((x) => x.id === sel.id); return s ? <Conversation s={s} /> : null }
     if (sel.kind === 'manual') { const m = state.manual.find((x) => x.id === sel.id); return m ? <ManualView m={m} msgs={transcripts[m.id] ?? []} /> : null }
     const h = state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id)
     const wd = (sel as any).workdir
-    return h ? <HistoryView h={h} msgs={transcripts[h.id] ?? []}
-      onResume={() => doResume(wd, h.id)} resuming={pendingResume === h.id} /> : null
+    return h ? <HistoryView h={h} msgs={transcripts[h.id] ?? []} onResume={() => doResume(wd, h.id)} resuming={pendingResume === h.id} /> : null
   }, [sel, state, transcripts, pendingResume])
+
+  const FILTERS: { k: typeof filter; label: string }[] = [
+    { k: 'all', label: '全部' }, { k: 'running', label: '进行中' }, { k: 'done', label: '已完成' },
+  ]
 
   return (
     <div className="flex h-full flex-1 min-w-0">
-      {/* 列1:项目(可展开成文件夹,目录嵌在项目下) */}
-      <div className="w-[240px] shrink-0 bg-panel border-r border-line flex flex-col">
+      {/* 列1:项目 + 嵌套文件树 */}
+      <div className="w-[230px] shrink-0 bg-elev border-r border-line flex flex-col">
         <div className="titlebar-pad px-3 pb-2 flex items-center justify-between">
-          <span className="text-[11px] font-semibold text-faint tracking-[0.08em] uppercase">项目</span>
-          <button onClick={() => cmd.openProject()} title="打开项目"
-            className="w-6 h-6 flex items-center justify-center text-sub hover:text-brand hover:bg-brand/10 rounded-md transition-colors">
-            <FolderPlus size={14} />
-          </button>
+          <span className="text-[11px] font-semibold text-faint tracking-[0.05em] uppercase">项目</span>
+          <IconBtn title="打开项目" onClick={() => cmd.openProject()}><FolderPlus size={15} /></IconBtn>
         </div>
         <div className="flex-1 overflow-auto px-2 pb-3">
-          {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3 leading-relaxed">点右上角打开一个项目。</div>}
+          {state.projects.length === 0 && <div className="text-[11px] text-dim px-1 py-3 leading-relaxed">点右上角打开一个项目。</div>}
           {state.projects.map((p) => {
             const cnt = state.sessions.filter((s) => s.workdir === p.workdir).length
             const active = p.workdir === selectedProject
             return (
               <div key={p.workdir}>
                 <button onClick={() => { setSelectedProject(p.workdir); setSel(null); setActiveFile(null) }}
-                  className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border transition-colors
-                    ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-black/[0.04]'}`}>
-                  {active ? <FolderOpen size={15} className="text-brand shrink-0" /> : <Folder size={15} className="text-faint shrink-0" />}
+                  className="w-full text-left flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] transition-colors hover:bg-sunken"
+                  style={active ? { background: 'var(--accent-soft)' } : undefined}>
+                  <div className="w-7 h-7 shrink-0 rounded-lg flex items-center justify-center"
+                    style={active ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : { background: 'var(--bg-sunken)', color: 'var(--text-faint)' }}>
+                    {active ? <FolderOpen size={15} /> : <Folder size={15} />}
+                  </div>
                   <div className="min-w-0 flex-1">
                     <div className="text-[12.5px] font-medium text-ink truncate">{p.name}</div>
-                    <div className="text-[10.5px] text-sub">{cnt ? `${cnt} 个会话` : '未打开会话'}</div>
+                    <div className="font-mono text-[10px] text-faint truncate">{cnt ? `${cnt} 个会话` : p.workdir.replace(/^.*\//, '~/…/')}</div>
                   </div>
                 </button>
                 {active && (
-                  <div className="ml-3 mt-0.5 pl-1 border-l border-line">
+                  <div className="ml-3.5 mt-0.5 pl-1 border-l border-line">
                     <FileTree root={p.workdir} openFile={openFile} />
                   </div>
                 )}
@@ -466,24 +552,47 @@ function ConsolePage() {
         </div>
       </div>
 
-      {/* 列2:所选项目的会话 */}
-      <div className="w-[270px] shrink-0 bg-panel border-r border-line flex flex-col">
+      {/* 列2:会话 */}
+      <div className="w-[300px] shrink-0 bg-elev border-r border-line flex flex-col">
         {project ? (
           <>
             <div className="titlebar-pad px-3 pb-2 flex items-center justify-between gap-2">
               <span className="text-[13px] font-semibold text-ink truncate">{project.name}</span>
               <NewMenu workdir={project.workdir} />
             </div>
-            <div className="flex-1 overflow-auto px-2.5 pb-3 space-y-1.5">
-              <SessionList p={project} state={state} sel={sel} setSel={selectSession} inProject={inProject} />
+            {/* 搜索 */}
+            <div className="px-3 pb-2">
+              <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg" style={{ background: 'var(--bg-sunken)' }}>
+                <Search size={13} className="text-faint shrink-0" />
+                <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索会话…"
+                  className="flex-1 bg-transparent outline-none text-[12px] text-ink select-text placeholder:text-faint min-w-0" />
+              </div>
+            </div>
+            {/* 过滤 */}
+            <div className="px-3 pb-2 flex gap-1.5">
+              {FILTERS.map((f) => {
+                const on = filter === f.k
+                return (
+                  <button key={f.k} onClick={() => setFilter(f.k)}
+                    className="px-2.5 py-1 rounded-lg text-[12px] transition-colors"
+                    style={on ? { background: 'var(--accent-soft)', color: 'var(--accent)', fontWeight: 500 }
+                      : { background: 'var(--bg-sunken)', color: 'var(--text-dim)' }}>
+                    {f.label}<span className="ml-1.5 opacity-55">{counts[f.k]}</span>
+                  </button>
+                )
+              })}
+            </div>
+            <div className="flex-1 overflow-auto px-2 pb-3">
+              <SessionList sessions={fSessions} manual={fManual} history={fHistory}
+                empty={counts.all === 0} workdir={project.workdir} sel={sel} setSel={pick} />
             </div>
           </>
-        ) : <div className="titlebar-pad px-3 text-[12px] text-sub">选择左侧项目</div>}
+        ) : <div className="titlebar-pad px-3 text-[12px] text-dim">选择左侧项目</div>}
       </div>
 
       {/* 列3:tab + 内容 */}
-      <div className="flex-1 min-w-0 flex flex-col">
-        <div className="titlebar-pad px-2 pb-1.5 flex items-center gap-1 overflow-x-auto border-b border-line">
+      <div className="flex-1 min-w-0 flex flex-col bg-bg">
+        <div className="titlebar-pad px-2 pb-1.5 flex items-center gap-1 overflow-x-auto border-b border-line bg-elev">
           <Tab label="会话" active={activeFile === null} onTap={() => setActiveFile(null)} />
           {openFiles.map((p) => (
             <Tab key={p} label={p.split('/').pop() ?? p} active={activeFile === p} closable
@@ -500,47 +609,34 @@ function ConsolePage() {
   )
 }
 
-/// 某项目的会话卡列表(console + 手动 + 可恢复历史,去重)。
-function SessionList({ p, state, sel, setSel, inProject }: {
-  p: Project; state: ReturnType<typeof getState>; sel: Sel
-  setSel: (s: Sel) => void; inProject: (cwd: string, wd: string) => boolean
+function SessionList({ sessions, manual, history, empty, workdir, sel, setSel }: {
+  sessions: Session[]; manual: Manual[]; history: History[]; empty: boolean
+  workdir: string; sel: Sel; setSel: (s: Sel) => void
 }) {
-  const consoleSessions = state.sessions.filter((s) => s.workdir === p.workdir)
-  const manual = state.manual.filter((m) => inProject(m.cwd, p.workdir))
-  const liveIds = new Set<string>([
-    ...consoleSessions.map((s) => s.agentSessionId).filter(Boolean) as string[],
-    ...manual.map((m) => m.id),
-  ])
-  const history = p.history.filter((h) => !liveIds.has(h.id))
-  const empty = consoleSessions.length === 0 && manual.length === 0 && history.length === 0
   const [histOpen, setHistOpen] = useState(true)
   return (
     <>
-      {consoleSessions.map((s) => (
-        <Card key={s.id} active={sel?.kind === 'session' && sel.id === s.id}
-          tint={s.agent === 'codex' ? '#7C5CD6' : '#2563EB'}
-          icon={s.agent === 'codex' ? <Cpu size={15} /> : <Sparkles size={15} />}
-          title={s.title} time={relTime(s.startedAt)} pill={<StatusPill status={s.status} />}
-          onClick={() => setSel({ kind: 'session', id: s.id })} />
+      {sessions.map((s) => (
+        <Row key={s.id} active={sel?.kind === 'session' && sel.id === s.id}
+          title={s.title} meta={sessionMeta(s.status)} model={s.agent === 'codex' ? 'Codex' : 'Claude'}
+          time={relTime(s.startedAt)} onClick={() => setSel({ kind: 'session', id: s.id })} />
       ))}
       {manual.map((m) => (
-        <Card key={m.id} active={sel?.kind === 'manual' && sel.id === m.id}
-          tint="#E8810C" icon={<Hand size={15} />} title={m.title} time={relTime(m.lastActivityAt)}
-          pill={<Pill text="手动" cls="text-orange-600 bg-orange-50" />} sub={m.terminal}
-          onClick={() => setSel({ kind: 'manual', id: m.id })} />
+        <Row key={m.id} active={sel?.kind === 'manual' && sel.id === m.id}
+          title={m.title} badge={{ text: '手动', color: 'var(--amber)' }} meta={manualMeta(m.state)}
+          model={m.terminal} time={relTime(m.lastActivityAt)} onClick={() => setSel({ kind: 'manual', id: m.id })} />
       ))}
       {history.length > 0 && (
-        <div className="pt-1.5 space-y-1.5">
+        <div className="pt-1.5">
           <button onClick={() => setHistOpen((o) => !o)}
-            className="w-full flex items-center gap-1 px-1 py-0.5 text-[10.5px] font-semibold text-faint tracking-[0.08em] uppercase hover:text-sub transition-colors">
-            {histOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-            历史会话 · {history.length}
+            className="w-full flex items-center gap-1 px-1 py-1 text-[10.5px] font-semibold text-faint tracking-[0.05em] uppercase hover:text-dim transition-colors">
+            {histOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}历史会话 · {history.length}
           </button>
           {histOpen && history.map((h) => (
-            <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
-              tint="#8B909B" icon={<HistoryIcon size={15} />} title={h.label} time={relTime(h.mtime)}
-              pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
-              onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
+            <Row key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
+              title={h.label} badge={{ text: '历史', color: 'var(--text-faint)' }}
+              meta={{ text: '已结束', color: 'var(--text-faint)', hollow: true }}
+              time={relTime(h.mtime)} onClick={() => setSel({ kind: 'history', id: h.id, workdir })} />
           ))}
         </div>
       )}
@@ -549,50 +645,102 @@ function SessionList({ p, state, sel, setSel, inProject }: {
   )
 }
 
-// —— 顶层导航(多页面:控制台 / 使用统计 / …)——
-function NavRail({ page, setPage }: { page: string; setPage: (p: string) => void }) {
-  const items = [
-    { id: 'console', icon: <MessageSquare size={18} />, label: '控制台' },
-    { id: 'stats', icon: <BarChart3 size={18} />, label: '使用统计' },
-  ]
+// ===== 使用统计(占位,沿用设计语言)=====
+function UsagePage() {
   return (
-    <div className="w-[56px] shrink-0 bg-[#ECEEF1] border-r border-line flex flex-col items-center pt-2 gap-1">
-      <div className="w-9 h-9 mb-1 rounded-xl bg-brand/10 text-brand flex items-center justify-center">
-        <AppWindow size={17} />
+    <div className="flex-1 overflow-y-auto bg-bg">
+      <div className="max-w-[920px] mx-auto px-8 pt-8 pb-12">
+        <div className="text-[20px] font-semibold text-ink">使用统计</div>
+        <div className="text-[12.5px] text-dim mt-1">这个页面之后接入真实数据。</div>
+        <div className="grid grid-cols-4 gap-3.5 mt-6">
+          {[['总 Token', '—'], ['花费', '—'], ['缓存命中', '—'], ['请求数', '—']].map(([l, v]) => (
+            <div key={l} className="p-4 rounded-[13px] border border-line bg-elev">
+              <div className="text-[11.5px] text-dim">{l}</div>
+              <div className="text-[24px] font-semibold mt-2 text-faint">{v}</div>
+            </div>
+          ))}
+        </div>
       </div>
-      {items.map((it) => {
-        const on = page === it.id
-        return (
-          <button key={it.id} onClick={() => setPage(it.id)} title={it.label}
-            className={`relative w-10 h-10 rounded-xl flex items-center justify-center transition-all
-              ${on ? 'bg-white text-brand shadow-card' : 'text-sub hover:bg-white/70 hover:text-ink'}`}>
-            {on && <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-brand" />}
-            {it.icon}
-          </button>
-        )
-      })}
     </div>
   )
 }
 
-function StatsPage() {
+function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light' | 'dark') => void }) {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center text-sub bg-bg">
-      <div className="w-14 h-14 rounded-2xl bg-brand/10 text-brand flex items-center justify-center mb-3">
-        <BarChart3 size={26} />
+    <div className="flex-1 overflow-y-auto bg-bg">
+      <div className="max-w-[640px] mx-auto px-8 pt-8 pb-12">
+        <div className="text-[20px] font-semibold text-ink mb-6">设置</div>
+        <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mb-2.5">外观</div>
+        <div className="border border-line rounded-[13px] bg-elev">
+          <div className="flex items-center px-4 py-4">
+            <div className="flex-1">
+              <div className="text-[13px] font-medium text-ink">主题</div>
+              <div className="text-[11.5px] text-dim mt-0.5">浅色 / 深色外观</div>
+            </div>
+            <div className="flex gap-1 p-[3px] rounded-[9px]" style={{ background: 'var(--bg-sunken)' }}>
+              {(['light', 'dark'] as const).map((t) => (
+                <button key={t} onClick={() => setTheme(t)}
+                  className="px-3.5 py-1.5 rounded-[7px] text-[12px] transition"
+                  style={theme === t ? { background: 'var(--bg-elev)', fontWeight: 500, boxShadow: '0 1px 2px rgba(0,0,0,.1)' } : { color: 'var(--text-dim)' }}>
+                  {t === 'light' ? '浅色' : '深色'}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
-      <div className="text-[15px] font-semibold text-ink tracking-tight">使用统计</div>
-      <div className="text-[12px] mt-1">这个页面之后做(占位)。</div>
+    </div>
+  )
+}
+
+// ===== 左侧导航 =====
+function NavRail({ page, setPage, theme, toggleTheme }: {
+  page: string; setPage: (p: string) => void; theme: string; toggleTheme: () => void
+}) {
+  const items = [
+    { id: 'console', icon: <PanelsTopLeft size={19} />, label: '工作区' },
+    { id: 'usage', icon: <BarChart3 size={19} />, label: '使用统计' },
+    { id: 'settings', icon: <SlidersHorizontal size={19} />, label: '设置' },
+  ]
+  const btn = (on: boolean) => ({
+    width: 38, height: 38, ...(on ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : {}),
+  } as React.CSSProperties)
+  return (
+    <div className="w-[56px] shrink-0 bg-elev border-r border-line flex flex-col items-center pt-3 gap-1">
+      {items.map((it) => {
+        const on = page === it.id
+        return (
+          <button key={it.id} onClick={() => setPage(it.id)} title={it.label}
+            className={`rounded-[10px] flex items-center justify-center transition-colors ${on ? '' : 'text-dim hover:bg-sunken'}`}
+            style={btn(on)}>{it.icon}</button>
+        )
+      })}
+      <div className="flex-1" />
+      <button title="切换主题" onClick={toggleTheme}
+        className="w-[38px] h-[38px] rounded-[10px] flex items-center justify-center text-dim hover:bg-sunken hover:text-ink transition-colors mb-3">
+        {theme === 'dark' ? <Sun size={18} /> : <Moon size={16} />}
+      </button>
     </div>
   )
 }
 
 export default function App() {
   const [page, setPage] = useState('console')
+  const [theme, setThemeState] = useState<'light' | 'dark'>(() =>
+    (localStorage.getItem('theme') as 'light' | 'dark') || 'light')
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+    cmd.setTheme(theme === 'dark')
+  }, [theme])
+  const setTheme = (t: 'light' | 'dark') => setThemeState(t)
+  const toggleTheme = () => setThemeState((t) => (t === 'dark' ? 'light' : 'dark'))
   return (
     <div className="flex h-full">
-      <NavRail page={page} setPage={setPage} />
-      {page === 'console' ? <ConsolePage /> : <StatsPage />}
+      <NavRail page={page} setPage={setPage} theme={theme} toggleTheme={toggleTheme} />
+      {page === 'console' ? <ConsolePage />
+        : page === 'usage' ? <UsagePage />
+        : <SettingsPage theme={theme} setTheme={setTheme} />}
     </div>
   )
 }

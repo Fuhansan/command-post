@@ -52,4 +52,5 @@ export const cmd = {
     send({ action: 'loadTranscript', kind, id, workdir }),
   listDir: (path: string) => send({ action: 'listDir', path }),
   loadFile: (path: string) => send({ action: 'loadFile', path }),
+  setTheme: (dark: boolean) => send({ action: 'theme', dark }),
 }
