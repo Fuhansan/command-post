@@ -26,6 +26,7 @@ struct AgentSession: Identifiable, Equatable {
     var messages: [AgentMessage]
     var pending: [PendingRequest]     // 待你响应(权限/选项合一)
     var agentSessionId: String?       // agent 报告的 session_id(供 resume)
+    var startedAt: Date = Date()      // 会话开始时间(列表展示相对时间)
 
     static func == (l: AgentSession, r: AgentSession) -> Bool {
         l.id == r.id && l.status == r.status && l.messages == r.messages &&
@@ -37,6 +38,7 @@ struct AgentSession: Identifiable, Equatable {
 struct HistoryEntry: Identifiable, Equatable {
     let id: String       // claude session_id(= 转录文件名)
     let label: String    // 首句,做标签
+    var mtime: Date = .distantPast   // 转录最后修改时间(列表展示相对时间)
 }
 
 // MARK: - 会话管理器
@@ -246,7 +248,9 @@ final class AgentSessionManager: ObservableObject {
             metas.append((String(f.dropLast(6)), full, mtime))
         }
         return metas.sorted { $0.mtime > $1.mtime }.prefix(limit).map {
-            HistoryEntry(id: $0.id, label: firstUserPrompt(path: $0.full).map { String($0.prefix(48)) } ?? $0.id)
+            HistoryEntry(id: $0.id,
+                         label: firstUserPrompt(path: $0.full).map { String($0.prefix(48)) } ?? $0.id,
+                         mtime: $0.mtime)
         }
     }
 

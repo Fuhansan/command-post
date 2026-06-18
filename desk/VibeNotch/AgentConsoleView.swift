@@ -148,12 +148,12 @@ struct AgentConsoleRootView: View {
                     startInline(proj)
                 } else {
                     ScrollView {
-                        VStack(spacing: 4) {
+                        VStack(spacing: 8) {
                             ForEach(consoleSessions) { sessionCard($0) }
                             ForEach(manualSessions) { manualCard($0) }
                             ForEach(history, id: \.id) { historyCard($0, proj) }
                         }
-                        .padding(8)
+                        .padding(10)
                     }
                 }
             } else {
@@ -166,46 +166,58 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 会话卡外壳:按类型给「框色 + 标签」—— 一眼区分 Claude / Codex / 手动。
-    private func cardShell<S: View>(selected: Bool, tint: Color, tag: String, tagIcon: String,
-                                    title: String, @ViewBuilder status: () -> S) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
-                Spacer(minLength: 4)
-                HStack(spacing: 3) {
-                    Image(systemName: tagIcon).font(.system(size: 8, weight: .bold))
-                    Text(tag).font(.system(size: 10, weight: .semibold))
-                }
-                .foregroundStyle(tint)
-                .padding(.horizontal, 6).padding(.vertical, 2)
-                .background(tint.opacity(0.14)).clipShape(Capsule())
+    /// 干净白卡外壳(对齐设计图):标题 + 状态行(点+文字+可选标签)+ 右侧相对时间;选中=蓝框浅蓝底。
+    private func cleanCard<S: View>(selected: Bool, title: String, time: String,
+                                    @ViewBuilder status: () -> S) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
+            HStack(spacing: 5) {
+                status()
+                Spacer(minLength: 6)
+                Text(time).font(.system(size: 11)).foregroundStyle(CT.faint)
             }
-            status()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10).padding(.vertical, 9)
-        .background(tint.opacity(selected ? 0.14 : 0.05))
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(selected ? CT.sel : CT.bg)
         .overlay(RoundedRectangle(cornerRadius: 9)
-            .stroke(tint.opacity(selected ? 0.65 : 0.22), lineWidth: selected ? 1.5 : 1))
+            .stroke(selected ? CT.accent : CT.hairline, lineWidth: selected ? 1.5 : 1))
         .clipShape(RoundedRectangle(cornerRadius: 9))
         .contentShape(Rectangle())
     }
 
-    /// 会话卡(console):Claude=蓝 / Codex=靛。
+    /// 类型小标签(非默认会话才显示:Codex / 手动 / 历史)。
+    private func typeChip(_ text: String, _ color: Color) -> some View {
+        Text(text).font(.system(size: 9, weight: .semibold)).foregroundStyle(color)
+            .padding(.horizontal, 5).padding(.vertical, 1.5)
+            .background(color.opacity(0.13)).clipShape(Capsule())
+    }
+
+    /// 相对时间:今天=HH:mm,昨天,N 天前,更早=MM-dd。
+    private func relTime(_ d: Date) -> String {
+        guard d > .distantPast else { return "" }
+        let cal = Calendar.current
+        if cal.isDateInToday(d) {
+            let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
+        }
+        if cal.isDateInYesterday(d) { return "昨天" }
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: d),
+                                      to: cal.startOfDay(for: Date())).day ?? 0
+        if days < 7 { return "\(days) 天前" }
+        let f = DateFormatter(); f.dateFormat = "MM-dd"; return f.string(from: d)
+    }
+
+    /// 会话卡(console)。
     private func sessionCard(_ s: AgentSession) -> some View {
         let sel = selectedSessionId == s.id
         let needsResp = !s.pending.isEmpty
             || s.messages.contains { $0.kind == .permission && $0.permState == nil }
-        let tint: Color = s.agent == .codex ? CT.indigo : CT.accent
-        let tag = s.agent == .codex ? "Codex" : "Claude"
         return Button { selectedSessionId = s.id } label: {
-            cardShell(selected: sel, tint: tint, tag: tag, tagIcon: "sparkle", title: s.title) {
-                HStack(spacing: 5) {
-                    Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
-                    Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
-                    if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
-                }
+            cleanCard(selected: sel, title: s.title, time: relTime(s.startedAt)) {
+                Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
+                Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
+                if s.agent == .codex { typeChip("Codex", CT.indigo) }
+                if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
             }
         }
         .buttonStyle(.plain)
@@ -217,31 +229,34 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 手动会话卡:橙色框 +「手动」标签 —— 你在 IDE/终端里自己跑的,只读 + 可唤起窗口。
+    /// 手动会话卡:橙色「手动」标签 —— 你在 IDE/终端里自己跑的,只读 + 可唤起窗口。
     private func manualCard(_ e: SessionEntry) -> some View {
         let sel = selectedSessionId == e.id
+        let dot: Color = {
+            switch e.state {
+            case .working: return CT.success
+            case .waiting: return CT.orange
+            default:       return CT.faint
+            }
+        }()
         return Button { selectedSessionId = e.id } label: {
-            cardShell(selected: sel, tint: CT.orange, tag: "手动", tagIcon: "hand.raised.fill",
-                      title: manualTitle(e)) {
-                HStack(spacing: 5) {
-                    Image(systemName: "desktopcomputer").font(.system(size: 9)).foregroundStyle(CT.sub)
-                    Text(e.terminal.displayName).font(.system(size: 11)).foregroundStyle(CT.sub)
-                }
+            cleanCard(selected: sel, title: manualTitle(e), time: relTime(e.lastActivityAt)) {
+                Circle().fill(dot).frame(width: 6, height: 6)
+                Text(e.terminal.displayName).font(.system(size: 11)).foregroundStyle(CT.sub)
+                typeChip("手动", CT.orange)
             }
         }
         .buttonStyle(.plain)
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
-    /// 历史会话卡:灰色框 +「历史」标签 —— 已结束、可恢复;点击 --resume 拉起。
+    /// 历史会话卡:灰「历史」标签 —— 已结束、可恢复;点击 --resume 拉起。
     private func historyCard(_ h: HistoryEntry, _ proj: String) -> some View {
         Button { start(proj, resume: h.id) } label: {
-            cardShell(selected: false, tint: CT.faint, tag: "历史",
-                      tagIcon: "clock.arrow.circlepath", title: h.label) {
-                HStack(spacing: 5) {
-                    Image(systemName: "arrow.uturn.backward").font(.system(size: 9)).foregroundStyle(CT.sub)
-                    Text("点按恢复 · \(h.id.prefix(8))").font(.system(size: 11)).foregroundStyle(CT.sub)
-                }
+            cleanCard(selected: false, title: h.label, time: relTime(h.mtime)) {
+                Circle().fill(CT.faint).frame(width: 6, height: 6)
+                Text("已结束").font(.system(size: 11)).foregroundStyle(CT.sub)
+                typeChip("历史", CT.faint)
             }
         }
         .buttonStyle(.plain)
