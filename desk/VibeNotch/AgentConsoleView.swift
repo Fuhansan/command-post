@@ -76,11 +76,10 @@ struct AgentConsoleRootView: View {
                 Text("项目").font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(CT.faint).textCase(.uppercase).tracking(0.5)
                 Spacer()
-                Button(action: openProject) {
-                    Image(systemName: "plus").font(.system(size: 12, weight: .semibold)).foregroundStyle(CT.sub)
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain).help("打开项目")
+                Image(systemName: "plus").font(.system(size: 12, weight: .semibold)).foregroundStyle(CT.sub)
+                    .frame(width: 22, height: 22).contentShape(Rectangle())
+                    .onTapGesture { openProject() }
+                    .help("打开项目")
             }
             .padding(.horizontal, 14).padding(.top, topInset + 8).padding(.bottom, 6)
 
@@ -263,10 +262,12 @@ struct AgentConsoleRootView: View {
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
-    /// 历史会话卡:灰「历史」标签 —— 已结束、可恢复;点击 --resume 拉起。
+    /// 历史会话卡:灰「历史」标签 —— 已结束、可恢复。点击=选中只读浏览(不重启),
+    /// 进去后点屏幕才恢复。
     private func historyCard(_ h: HistoryEntry, _ proj: String) -> some View {
-        Button { start(proj, resume: h.id) } label: {
-            cleanCard(selected: false, title: h.label, time: relTime(h.mtime)) {
+        let sel = selectedSessionId == h.id
+        return Button { selectedSessionId = h.id } label: {
+            cleanCard(selected: sel, title: h.label, time: relTime(h.mtime)) {
                 Circle().fill(CT.faint).frame(width: 6, height: 6)
                 Text("已结束").font(.system(size: 11)).foregroundStyle(CT.sub)
                 typeChip("历史", CT.faint)
@@ -335,6 +336,9 @@ struct AgentConsoleRootView: View {
             conversation(s)
         } else if let sid = selectedSessionId, let e = store.sessions.first(where: { $0.id == sid }) {
             manualPane(e)
+        } else if let sid = selectedSessionId, let proj = selectedProject,
+                  let h = (manager.historyByProject[proj] ?? []).first(where: { $0.id == sid }) {
+            historyBrowsePane(h, proj)
         } else {
             VStack(spacing: 10) {
                 Image(systemName: selectedProject == nil ? "folder" : "bubble.left.and.bubble.right")
@@ -408,6 +412,62 @@ struct AgentConsoleRootView: View {
             AgentMessage(id: "mh\(i)", role: t.role, kind: t.kind, text: t.text, ord: i)
         }
         manualTranscript[e.id] = msgs
+    }
+
+    // MARK: - 历史会话:只读浏览 + 点击屏幕恢复
+
+    private func historyBrowsePane(_ h: HistoryEntry, _ proj: String) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(h.label).font(.system(size: 14, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
+                    Text("历史会话 · 只读").font(.system(size: 11)).foregroundStyle(CT.sub)
+                }
+                Spacer()
+                Label("只读", systemImage: "lock.fill").font(.system(size: 11)).foregroundStyle(CT.faint)
+            }
+            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
+            .background(CT.bg)
+            Divider().overlay(CT.hairline)
+            ZStack(alignment: .bottom) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(manualTranscript[h.id] ?? []) { m in messageRow(m, sid: h.id) }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16).padding(.vertical, 14)
+                }
+                .defaultScrollAnchor(.bottom)
+                .background(CT.bg)
+                // 锁层:轻微变暗 + 捕获点击恢复;滚轮滚动穿透,不挡浏览。
+                Color.black.opacity(0.025).contentShape(Rectangle())
+                    .onTapGesture { start(proj, resume: h.id) }
+                // 浮动提示(不拦点击,点击由上面的锁层处理)
+                HStack(spacing: 6) {
+                    Image(systemName: "lock.open.fill").font(.system(size: 11))
+                    Text("点击任意处恢复会话").font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(CT.accent).clipShape(Capsule())
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                .padding(.bottom, 18)
+                .allowsHitTesting(false)
+            }
+        }
+        .task(id: h.id) { await loadHistoryTranscript(h, proj) }
+    }
+
+    /// 后台解析历史转录 → 只读对话(复用 manualTranscript 缓存,按 id 键)。
+    private func loadHistoryTranscript(_ h: HistoryEntry, _ proj: String) async {
+        guard manualTranscript[h.id] == nil else { return }
+        let path = AgentSessionManager.historyTranscriptPath(workdir: proj, id: h.id)
+        let parsed = await Task.detached(priority: .userInitiated) {
+            AgentSessionManager.parseTranscriptFile(path: path)
+        }.value
+        manualTranscript[h.id] = parsed.enumerated().map { i, t in
+            AgentMessage(id: "mh\(i)", role: t.role, kind: t.kind, text: t.text, ord: i)
+        }
     }
 
     private func start(_ proj: String, resume: String? = nil, continueLast: Bool = false) {

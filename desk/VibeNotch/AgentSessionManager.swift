@@ -197,6 +197,12 @@ final class AgentSessionManager: ObservableObject {
         return parseTranscriptFile(path: path)
     }
 
+    /// 某项目下某会话 id 的转录路径(供桌面历史只读浏览)。
+    nonisolated static func historyTranscriptPath(workdir: String, id: String) -> String {
+        let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        return NSString(string: "~/.claude/projects/\(enc)/\(id).jsonl").expandingTildeInPath
+    }
+
     /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
     nonisolated static func parseTranscriptFile(path: String)
         -> [(role: String, kind: AgentMessage.Kind, text: String)] {
@@ -375,8 +381,9 @@ final class AgentSessionManager: ObservableObject {
         managed[sid]?.driver.stop()
         managed[sid] = nil
         sessions.removeAll { $0.id == sid }
-        // 结束的会话会成为/更新历史条目 → 让该项目历史缓存失效,下次进开始面板重算。
-        if let wd { invalidateHistory(wd) }
+        // 结束的会话会成为历史条目。**重载**历史(不是清空)—— 清空会让历史卡瞬间全没;
+        // force 重载保留旧值、后台解析完再替换,结束的会话随即作为历史卡回到列表。
+        if let wd { loadHistoryList(for: wd, force: true) }
     }
 
     // MARK: - 事件 → 模型
