@@ -100,18 +100,26 @@ final class PairingController: ObservableObject {
             do {
                 let code = try await Self.fetchCode()
                 self.state = .waiting(code: code)
-                // 轮询认领结果(2s 间隔,10 分钟由服务端过期)
+                // 轮询认领结果(2s 间隔,10 分钟由服务端过期)。
+                // 瞬时网络错误(切节点/抖动)不放弃,只有「码过期」才停 —— 否则一抖动就废了整次配对。
                 while !Task.isCancelled {
                     try await Task.sleep(nanoseconds: 2_000_000_000)
-                    if let result = try await Self.poll(code: code) {
-                        AgentCredentials.save(account: result.account, token: result.token)
-                        self.state = .done(account: result.account)
+                    do {
+                        if let result = try await Self.poll(code: code) {
+                            AgentCredentials.save(account: result.account, token: result.token)
+                            self.state = .done(account: result.account)
+                            return
+                        }
+                    } catch let e as NSError where e.domain == "pair.expired" {
+                        self.state = .failed("配对码已过期,请重新配对")
                         return
+                    } catch {
+                        continue   // 网络瞬断:继续等下一次轮询
                     }
                 }
             } catch {
-                vlog("pair 失败: \(error)  (api=\(Self.api))")
-                self.state = .failed("配对失败: \(error.localizedDescription)")
+                vlog("pair 取码失败: \(error)  (api=\(Self.api))")
+                self.state = .failed("取码失败(连不到服务器): \(error.localizedDescription)")
             }
         }
     }
@@ -136,7 +144,7 @@ final class PairingController: ObservableObject {
         let (data, resp) = try await URLSession.direct.data(
             from: URL(string: "\(api)/poll?code=\(code)")!)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-            throw NSError(domain: "pair", code: 1,
+            throw NSError(domain: "pair.expired", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "配对码已过期,请重新开始"])
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
