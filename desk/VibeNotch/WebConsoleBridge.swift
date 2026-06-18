@@ -170,6 +170,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         return [
             "id": e.id, "title": title, "cwd": e.cwd,
             "terminal": e.terminal.displayName,
+            "agent": "claude",   // hook 会话均为 Claude Code(codex 走控制台 driver)
             "state": manualState(e.state),
             "lastActivityAt": e.lastActivityAt.timeIntervalSince1970 * 1000,
         ]

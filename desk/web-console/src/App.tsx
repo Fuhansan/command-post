@@ -532,13 +532,13 @@ function ConsolePage({ query }: { query: string }) {
               </div>
               <div className="flex-1 overflow-auto px-2 pb-3">
                 {fSessions.map((s) => <Row key={s.id} active={sel?.kind === 'session' && sel.id === s.id} title={s.title} meta={sessionMeta(s.status)} model={s.agent === 'codex' ? 'Codex' : 'Claude'} time={relTime(s.startedAt)} onClick={() => pick({ kind: 'session', id: s.id })} />)}
-                {fManual.map((m) => <Row key={m.id} active={sel?.kind === 'manual' && sel.id === m.id} title={m.title} badge={{ text: '手动', color: 'var(--amber)' }} meta={manualMeta(m.state)} model={m.terminal} time={relTime(m.lastActivityAt)} onClick={() => pick({ kind: 'manual', id: m.id })} />)}
+                {fManual.map((m) => <Row key={m.id} active={sel?.kind === 'manual' && sel.id === m.id} title={m.title} badge={{ text: '手动', color: 'var(--amber)' }} meta={manualMeta(m.state)} model={`${m.agent === 'codex' ? 'Codex' : 'Claude'} · ${m.terminal}`} time={relTime(m.lastActivityAt)} onClick={() => pick({ kind: 'manual', id: m.id })} />)}
                 {fHistory.length > 0 && (
                   <div className="pt-1.5">
                     <button onClick={() => setHistOpen((o) => !o)} className="w-full flex items-center gap-1 px-1 py-1 text-[10.5px] font-semibold text-faint tracking-[0.05em] uppercase hover:text-dim transition-colors">
                       {histOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}历史会话 · {fHistory.length}
                     </button>
-                    {histOpen && fHistory.map((h) => <Row key={h.id} active={sel?.kind === 'history' && sel.id === h.id} title={h.label} badge={{ text: '历史', color: 'var(--text-faint)' }} meta={{ text: '已结束', color: 'var(--text-faint)', hollow: true }} time={relTime(h.mtime)} onClick={() => pick({ kind: 'history', id: h.id, workdir: project.workdir })} />)}
+                    {histOpen && fHistory.map((h) => <Row key={h.id} active={sel?.kind === 'history' && sel.id === h.id} title={h.label} badge={{ text: '历史', color: 'var(--text-faint)' }} meta={{ text: '已结束', color: 'var(--text-faint)', hollow: true }} model="Claude" time={relTime(h.mtime)} onClick={() => pick({ kind: 'history', id: h.id, workdir: project.workdir })} />)}
                   </div>
                 )}
                 {counts.all === 0 && <div className="text-[11px] text-faint px-1 pb-1">未打开会话</div>}
