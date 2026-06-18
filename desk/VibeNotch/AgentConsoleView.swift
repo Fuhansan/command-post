@@ -11,6 +11,7 @@ struct AgentConsoleRootView: View {
     @State private var projectsCollapsed = false
     @State private var draft: String = ""
     @State private var manualTranscript: [String: [AgentMessage]] = [:]   // 手动会话只读对话缓存
+    private let topInset: CGFloat = 28   // 统一标题栏:各栏内容顶部留出标题栏高度(背景延伸到顶)
 
     /// 某 cwd 是否属于该项目(等于或在其子目录下)。
     private func inProject(_ cwd: String, _ proj: String) -> Bool {
@@ -81,7 +82,7 @@ struct AgentConsoleRootView: View {
                 }
                 .buttonStyle(.plain).help("打开项目")
             }
-            .padding(.horizontal, 14).padding(.top, 16).padding(.bottom, 6)
+            .padding(.horizontal, 14).padding(.top, topInset + 8).padding(.bottom, 6)
 
             ScrollView {
                 VStack(spacing: 2) {
@@ -150,7 +151,7 @@ struct AgentConsoleRootView: View {
                 Spacer()
                 if let proj = selectedProject { newSessionMenu(proj) }
             }
-            .padding(.horizontal, 12).padding(.vertical, 10)
+            .padding(.horizontal, 12).padding(.top, topInset + 6).padding(.bottom, 10)
             Divider().overlay(CT.hairline)
             if let proj = selectedProject {
                 let consoleSessions = manager.sessions.filter { $0.workdir == proj }
@@ -370,8 +371,9 @@ struct AgentConsoleRootView: View {
                     Label("唤起 \(e.terminal.displayName)", systemImage: "arrow.up.forward.app")
                 }.controlSize(.small).buttonStyle(.borderedProminent)
             }
-            .padding(8)
-            Divider()
+            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
+            .background(CT.bg)
+            Divider().overlay(CT.hairline)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(manualTranscript[e.id] ?? []) { m in messageRow(m, sid: e.id) }
@@ -457,7 +459,7 @@ struct AgentConsoleRootView: View {
                 } label: { Image(systemName: "ellipsis").foregroundStyle(CT.sub) }
                     .menuStyle(.borderlessButton).fixedSize()
             }
-            .padding(.horizontal, 14).padding(.vertical, 10)
+            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
             .background(CT.bg)
             Divider().overlay(CT.hairline)
             ScrollViewReader { proxy in

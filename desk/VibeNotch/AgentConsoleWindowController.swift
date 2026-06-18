@@ -22,10 +22,13 @@ final class AgentConsoleWindowController: NSObject, NSWindowDelegate {
         guard let manager, let store else { return }
         let host = NSHostingController(rootView: AgentConsoleRootView(manager: manager, store: store))
         let w = NSWindow(contentViewController: host)
-        w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        w.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         w.title = "Agent 控制台(stream-json)"
+        // 统一标题栏:透明 + 隐藏标题 + 内容全尺寸 → 侧栏背景延伸到顶(红绿灯浮在侧栏上)。
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
         w.isReleasedWhenClosed = false
-        w.setContentSize(NSSize(width: 860, height: 540))
+        w.setContentSize(NSSize(width: 900, height: 580))
         w.center()
         w.delegate = self
         window = w
