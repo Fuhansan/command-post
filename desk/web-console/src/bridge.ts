@@ -1,4 +1,4 @@
-import { setState, setTranscript } from './store'
+import { setState, setTranscript, setDir, setFile } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -19,6 +19,12 @@ function installReceiver() {
           break
         case 'transcript':
           setTranscript(msg.payload.id, msg.payload.messages)
+          break
+        case 'dirList':
+          setDir(msg.payload.path, msg.payload.entries)
+          break
+        case 'fileContent':
+          setFile(msg.payload.path, { text: msg.payload.text, truncated: msg.payload.truncated })
           break
         default:
           console.warn('未知推送', msg.type)
@@ -43,4 +49,6 @@ export const cmd = {
   raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),
   loadTranscript: (kind: 'manual' | 'history', id: string, workdir?: string) =>
     send({ action: 'loadTranscript', kind, id, workdir }),
+  listDir: (path: string) => send({ action: 'listDir', path }),
+  loadFile: (path: string) => send({ action: 'loadFile', path }),
 }

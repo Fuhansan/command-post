@@ -1,10 +1,14 @@
 import { useSyncExternalStore, useState, useMemo, useRef, useEffect } from 'react'
-import { subscribe, getState, getTranscripts } from './store'
+import Editor from '@monaco-editor/react'
+import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
-import type { Session, Msg, Manual, History, Project } from './types'
+import { langOf } from './monacoSetup'
+import type { Session, Msg, Manual, History, Project, Entry } from './types'
 
 function useAgent() { return useSyncExternalStore(subscribe, getState, getState) }
 function useTranscripts() { return useSyncExternalStore(subscribe, getTranscripts, getTranscripts) }
+function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
+function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
 
 const STATUS: Record<string, { label: string; cls: string }> = {
   starting: { label: '启动中', cls: 'text-amber-600 bg-amber-50' },
@@ -155,10 +159,88 @@ function MsgList({ msgs, onRespond }: { msgs: Msg[]; onRespond?: (r: string, c: 
 
 function Header({ title, sub, right }: { title: string; sub?: string; right?: React.ReactNode }) {
   return (
-    <div className="titlebar-pad px-4 pb-2.5 flex items-center gap-2 border-b border-line">
+    <div className="px-4 py-2.5 flex items-center gap-2 border-b border-line">
       <div className="font-semibold text-[14px] text-ink truncate">{title}</div>
       {sub && <div className="text-[11px] text-faint truncate flex-1">{sub}</div>}
       <div className="ml-auto flex items-center gap-2">{right}</div>
+    </div>
+  )
+}
+
+// —— 文件树 + tab + Monaco ——
+function TreeRow({ entry, depth, expanded, toggle, openFile }: {
+  entry: Entry; depth: number; expanded: Set<string>
+  toggle: (p: string) => void; openFile: (p: string) => void
+}) {
+  const dirs = useDirs()
+  const isOpen = expanded.has(entry.path)
+  const children = dirs[entry.path]
+  return (
+    <div>
+      <button
+        onClick={() => (entry.isDir ? toggle(entry.path) : openFile(entry.path))}
+        className="w-full text-left flex items-center gap-1.5 py-[3px] pr-1 rounded hover:bg-gray-100"
+        style={{ paddingLeft: depth * 12 + 4 }}>
+        <span className="w-2.5 text-[9px] text-faint">{entry.isDir ? (isOpen ? '▾' : '▸') : ''}</span>
+        <span className="text-[11px]">{entry.isDir ? '📁' : '📄'}</span>
+        <span className="text-[12px] text-ink truncate">{entry.name}</span>
+      </button>
+      {entry.isDir && isOpen && (children ?? []).map((c) => (
+        <TreeRow key={c.path} entry={c} depth={depth + 1} expanded={expanded} toggle={toggle} openFile={openFile} />
+      ))}
+    </div>
+  )
+}
+
+function FileTree({ root, openFile }: { root: string; openFile: (p: string) => void }) {
+  const dirs = useDirs()
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  useEffect(() => { if (!dirs[root]) cmd.listDir(root) }, [root, dirs])
+  const toggle = (p: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(p)) next.delete(p)
+      else { next.add(p); if (!dirs[p]) cmd.listDir(p) }
+      return next
+    })
+  }
+  return (
+    <div>
+      {(dirs[root] ?? []).map((e) => (
+        <TreeRow key={e.path} entry={e} depth={0} expanded={expanded} toggle={toggle} openFile={openFile} />
+      ))}
+    </div>
+  )
+}
+
+function FileViewer({ path }: { path: string }) {
+  const files = useFiles()
+  const body = files[path]
+  useEffect(() => { if (!body) cmd.loadFile(path) }, [path, body])
+  return (
+    <div className="h-full flex flex-col">
+      <div className="px-4 py-2 border-b border-line flex items-center gap-2">
+        <span className="text-[13px] font-semibold text-ink truncate">{path.split('/').pop()}</span>
+        {body?.truncated && <span className="text-[11px] text-amber-600">已截断(仅前 2MB)</span>}
+      </div>
+      <div className="flex-1 min-h-0">
+        <Editor height="100%" theme="vs" language={langOf(path)} value={body?.text ?? '加载中…'}
+          options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12, scrollBeyondLastLine: false,
+            wordWrap: 'off', renderWhitespace: 'none', lineNumbersMinChars: 3 }} />
+      </div>
+    </div>
+  )
+}
+
+function Tab({ label, active, closable, onTap, onClose }: {
+  label: string; active: boolean; closable?: boolean; onTap: () => void; onClose?: () => void
+}) {
+  return (
+    <div onClick={onTap}
+      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg cursor-pointer text-[12px] border
+        ${active ? 'bg-selbg border-selborder text-ink font-medium' : 'border-transparent text-sub hover:bg-gray-100'}`}>
+      <span className="truncate max-w-[140px]">{label}</span>
+      {closable && <span onClick={(e) => { e.stopPropagation(); onClose?.() }} className="text-faint hover:text-ink">✕</span>}
     </div>
   )
 }
@@ -218,14 +300,14 @@ export default function App() {
   const state = useAgent()
   const transcripts = useTranscripts()
   const [sel, setSel] = useState<Sel>(null)
+  const [openFiles, setOpenFiles] = useState<string[]>([])
+  const [activeFile, setActiveFile] = useState<string | null>(null)
 
   // 选中历史/手动 → 拉转录(只读浏览)
   useEffect(() => {
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
     if (sel?.kind === 'manual' && !transcripts[sel.id]) cmd.loadTranscript('manual', sel.id)
   }, [sel, transcripts])
-
-  // 选中失效则清空
   useEffect(() => {
     if (sel?.kind === 'session' && !state.sessions.some((s) => s.id === sel.id)) setSel(null)
     if (sel?.kind === 'manual' && !state.manual.some((m) => m.id === sel.id)) setSel(null)
@@ -233,32 +315,71 @@ export default function App() {
 
   const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd + '/')
 
-  const right = useMemo(() => {
-    if (!sel) return null
+  // 文件树根 = 当前选中会话所属项目;默认第一个项目
+  const treeRoot = useMemo(() => {
+    if (sel?.kind === 'session') return state.sessions.find((s) => s.id === sel.id)?.workdir
+    if (sel?.kind === 'history') return sel.workdir
+    if (sel?.kind === 'manual') {
+      const m = state.manual.find((x) => x.id === sel.id)
+      return m ? (state.projects.find((p) => inProject(m.cwd, p.workdir))?.workdir ?? m.cwd) : undefined
+    }
+    return state.projects[0]?.workdir
+  }, [sel, state])
+
+  const selectSession = (s: Sel) => { setSel(s); setActiveFile(null) }
+  const openFile = (p: string) => {
+    setOpenFiles((prev) => (prev.includes(p) ? prev : [...prev, p]))
+    setActiveFile(p)
+  }
+  const closeFile = (p: string) => {
+    setOpenFiles((prev) => prev.filter((x) => x !== p))
+    setActiveFile((cur) => (cur === p ? null : cur))
+  }
+
+  const sessionView = useMemo(() => {
+    if (!sel) return <div className="h-full flex items-center justify-center text-sub text-[13px]">选择或新建一个会话</div>
     if (sel.kind === 'session') { const s = state.sessions.find((x) => x.id === sel.id); return s ? <Conversation s={s} /> : null }
     if (sel.kind === 'manual') { const m = state.manual.find((x) => x.id === sel.id); return m ? <ManualView m={m} msgs={transcripts[m.id] ?? []} /> : null }
-    if (sel.kind === 'history') {
-      const h = state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id)
-      return h ? <HistoryView h={h} workdir={sel.workdir} msgs={transcripts[h.id] ?? []} /> : null
-    }
-    return null
+    const h = state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id)
+    return h ? <HistoryView h={h} workdir={(sel as any).workdir} msgs={transcripts[h.id] ?? []} /> : null
   }, [sel, state, transcripts])
 
   return (
     <div className="flex h-full">
-      <div className="w-[300px] shrink-0 bg-panel border-r border-line flex flex-col">
+      {/* 左:项目 + 会话 + 目录 */}
+      <div className="w-[280px] shrink-0 bg-panel border-r border-line flex flex-col">
         <div className="titlebar-pad px-4 pb-2 text-[11px] font-semibold text-faint tracking-wide">项目</div>
-        <div className="flex-1 overflow-auto px-2.5 pb-3 space-y-3">
+        <div className="overflow-auto px-2.5 pb-3 space-y-3 max-h-[45%]">
           {state.projects.length === 0 && (
             <div className="text-[12px] text-sub px-2 py-4">在电脑 VibeNotch「打开项目」后,这里会出现项目与会话。</div>
           )}
           {state.projects.map((p) => (
-            <ProjectGroup key={p.workdir} p={p} state={state} sel={sel} setSel={setSel} inProject={inProject} />
+            <ProjectGroup key={p.workdir} p={p} state={state} sel={sel} setSel={selectSession} inProject={inProject} />
           ))}
         </div>
+        {treeRoot && (
+          <>
+            <div className="px-4 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line">
+              目录 · {treeRoot.split('/').pop()}
+            </div>
+            <div className="flex-1 overflow-auto px-2 pb-3">
+              <FileTree root={treeRoot} openFile={openFile} />
+            </div>
+          </>
+        )}
       </div>
-      <div className="flex-1 min-w-0">
-        {right ?? <div className="h-full flex items-center justify-center text-sub text-[13px]">选择或新建一个会话</div>}
+      {/* 右:tab 栏 + 内容 */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        <div className="titlebar-pad px-2 pb-1.5 flex items-center gap-1 overflow-x-auto border-b border-line">
+          <Tab label="会话" active={activeFile === null} onTap={() => setActiveFile(null)} />
+          {openFiles.map((p) => (
+            <Tab key={p} label={p.split('/').pop() ?? p} active={activeFile === p} closable
+              onTap={() => setActiveFile(p)} onClose={() => closeFile(p)} />
+          ))}
+        </div>
+        <div className="flex-1 min-h-0">
+          {activeFile ? <FileViewer path={activeFile} /> : sessionView}
+        </div>
       </div>
     </div>
   )

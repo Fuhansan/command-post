@@ -25,6 +25,9 @@ export interface Session {
   pending: Pending[]
 }
 
+export interface Entry { name: string; path: string; isDir: boolean }
+export interface FileBody { text: string; truncated: boolean }
+
 export interface History { id: string; label: string; mtime: number }
 export interface Project { workdir: string; name: string; history: History[] }
 

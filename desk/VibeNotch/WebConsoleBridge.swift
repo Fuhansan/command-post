@@ -69,6 +69,15 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
         case "raiseWindow":
             if let id = obj["id"] as? String { raiseWindow(manualId: id) }
+        case "listDir":
+            if let path = obj["path"] as? String {
+                let entries = DirCache.children(URL(fileURLWithPath: path)).map {
+                    ["name": $0.url.lastPathComponent, "path": $0.url.path, "isDir": $0.isDir] as [String: Any]
+                }
+                pushJSON(type: "dirList", payload: ["path": path, "entries": entries])
+            }
+        case "loadFile":
+            if let path = obj["path"] as? String { loadFile(path: path) }
         case "loadTranscript":
             // 历史/手动会话只读浏览:解析转录,推回消息。
             guard let id = obj["id"] as? String, let kind = obj["kind"] as? String else { return }
@@ -90,6 +99,21 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
               let appPid = ProcessUtils.findTerminal(startPid: start).pid,
               let app = NSRunningApplication(processIdentifier: appPid) else { return }
         app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private func loadFile(path: String) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let url = URL(fileURLWithPath: path)
+            var text = "(无法读取)"; var truncated = false
+            if let data = try? Data(contentsOf: url) {
+                if data.prefix(8000).contains(0) { text = "(二进制文件,无法预览)" }
+                else if data.count > 2_000_000 {
+                    text = String(decoding: data.prefix(2_000_000), as: UTF8.self); truncated = true
+                } else { text = String(decoding: data, as: UTF8.self) }
+            }
+            let t = text, tr = truncated
+            await MainActor.run { self?.pushJSON(type: "fileContent", payload: ["path": path, "text": t, "truncated": tr]) }
+        }
     }
 
     private func loadTranscript(id: String, path: String?) {
