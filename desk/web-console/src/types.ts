@@ -19,6 +19,7 @@ export interface Session {
   workdir: string
   agent: string          // claude | codex
   status: string         // starting|idle|working|waitingInput|needsResponse|done|error
+  model?: string         // 当前模型(完整 id,如 claude-opus-4-8)
   agentSessionId?: string
   startedAt?: number
   messages: Msg[]
@@ -45,4 +46,16 @@ export interface AppState {
   projects: Project[]
   sessions: Session[]
   manual: Manual[]
+}
+
+export interface UsageTotals {
+  input: number; output: number; cacheRead: number; cacheCreation: number
+  tokens: number; requests: number; cost: number; cacheHit: number
+}
+export interface UsageModel { name: string; tokens: number; requests: number; cost: number }
+export interface UsageData {
+  days: number
+  totals: UsageTotals
+  daily: { day: string; tokens: number }[]
+  models: UsageModel[]
 }

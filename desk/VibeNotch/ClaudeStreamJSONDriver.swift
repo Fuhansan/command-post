@@ -31,6 +31,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     private var outBuffer = Data()
     /// 记录最近一次 assistant 文本块的 msgId,便于 messageComplete 配对。
     private var lastAssistantMsgId: String?
+    private var lastModel: String?
 
     /// default = 权限走 PreToolUse hook(Path A,控制台默认);bypassPermissions = 全放行(测试用)。
     private let permissionMode: String
@@ -44,7 +45,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
 
     // MARK: - 生命周期
 
-    func start(workdir: String, resume: String?, continueLast: Bool) async throws {
+    func start(workdir: String, resume: String?, continueLast: Bool, model: String?) async throws {
         guard let bin = Self.claudeBinary() else {
             emit.yield(.error("找不到 claude 可执行文件"))
             throw DriverError.binaryNotFound
@@ -54,6 +55,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
                     "--output-format", "stream-json",
                     "--verbose",
                     "--permission-mode", permissionMode]
+        if let model, !model.isEmpty { args += ["--model", model] }
         if continueLast { args += ["--continue"] }
         else if let resume, !resume.isEmpty { args += ["--resume", resume] }
 
@@ -174,6 +176,9 @@ final class ClaudeStreamJSONDriver: AgentDriver {
 
     private func handleAssistant(_ o: [String: Any]) {
         guard let msg = o["message"] as? [String: Any] else { return }
+        if let m = msg["model"] as? String, m != lastModel, m != "<synthetic>" {
+            lastModel = m; emit.yield(.model(m))
+        }
         let msgId = (msg["id"] as? String) ?? UUID().uuidString
         guard let blocks = msg["content"] as? [[String: Any]] else { return }
         for b in blocks {

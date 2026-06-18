@@ -84,6 +84,7 @@ struct FileEditInfo: Equatable {
 enum SessionEvent {
     case status(SessionStatus)
     case sessionId(String)                                  // 供 --resume
+    case model(String)                                      // 当前模型(从流里读到)
     case messageDelta(msgId: String, role: String, text: String)  // AI 文本(可流式拼接)
     case messageComplete(msgId: String)
     case toolCall(ToolCallInfo)                             // 工具调用展示
@@ -126,7 +127,8 @@ protocol AgentDriver: AnyObject {
     var events: AsyncStream<SessionEvent> { get }
 
     /// 启动会话。resume 非空 → 恢复指定会话(--resume);continueLast → 继续该目录最近会话(--continue)。
-    func start(workdir: String, resume: String?, continueLast: Bool) async throws
+    /// model 非空 → 指定模型(--model,如 opus/sonnet/haiku)。
+    func start(workdir: String, resume: String?, continueLast: Bool, model: String?) async throws
     /// 发用户输入(文本 + 图片)。
     func send(_ input: UserInput)
     /// 回答一个待决项(权限放行/拒绝、或选择题选项)。optionIds 取自 PendingRequest.options。

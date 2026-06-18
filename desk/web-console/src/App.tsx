@@ -5,7 +5,7 @@ import {
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
   BarChart3, PanelsTopLeft, Search, Copy, FileText, Check, Server, MoreHorizontal,
 } from 'lucide-react'
-import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles } from './store'
+import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage } from './store'
 import { cmd } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry } from './types'
 
@@ -24,6 +24,7 @@ function useTranscripts() { return useSyncExternalStore(subscribe, getTranscript
 function useTranscriptMeta() { return useSyncExternalStore(subscribe, getTranscriptMeta, getTranscriptMeta) }
 function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
 function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
+function useUsage() { return useSyncExternalStore(subscribe, getUsage, getUsage) }
 
 // ===== 状态 → 圆点 + 文案 =====
 type DotMeta = { text: string; color: string; pulse?: boolean; hollow?: boolean }
@@ -228,13 +229,28 @@ function WorkHeader({ title, meta, model, sub, right }: { title: string; meta?: 
   )
 }
 
+// 完整模型 id → 短标签
+function modelLabel(m?: string): string {
+  if (!m) return '默认'
+  const s = m.toLowerCase()
+  if (s.includes('opus')) return 'Opus'
+  if (s.includes('sonnet')) return 'Sonnet'
+  if (s.includes('haiku')) return 'Haiku'
+  return m
+}
+const MODELS: { alias: string; label: string }[] = [
+  { alias: 'opus', label: 'Opus' }, { alias: 'sonnet', label: 'Sonnet' }, { alias: 'haiku', label: 'Haiku' },
+]
+
 // ===== 输入框 =====
-function Composer({ modelLabel, onSend }: { modelLabel: string; onSend: (t: string) => void }) {
+function Composer({ sid, model, onSend }: { sid: string; model?: string; onSend: (t: string) => void }) {
   const [draft, setDraft] = useState('')
+  const [menu, setMenu] = useState(false)
+  const cur = modelLabel(model)
   const submit = () => { const t = draft.trim(); if (!t) return; onSend(t); setDraft('') }
   return (
     <div className="flex-none px-7 pb-[18px] pt-1">
-      <div className="max-w-[780px] mx-auto rounded-[14px] border border-strong bg-elev shadow-card overflow-hidden">
+      <div className="max-w-[780px] mx-auto rounded-[14px] border border-strong bg-elev shadow-card relative">
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } }}
           rows={1} placeholder="描述你的需求,或输入 / 调用快捷命令…"
@@ -243,10 +259,32 @@ function Composer({ modelLabel, onSend }: { modelLabel: string; onSend: (t: stri
           <div className="w-7 h-7 rounded-[7px] flex items-center justify-center text-faint"><Paperclip size={15} /></div>
           <div className="w-7 h-7 rounded-[7px] flex items-center justify-center text-faint font-mono text-[14px]">/</div>
           <span className="flex-1" />
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-line text-[11.5px] text-dim">
+          {/* 模型切换 */}
+          <button onClick={() => setMenu((o) => !o)}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-line text-[11.5px] text-dim hover:bg-sunken transition-colors">
             <span className="w-[7px] h-[7px] rounded-full" style={{ background: 'var(--accent)' }} />
-            <span className="font-mono">{modelLabel}</span>
-          </div>
+            <span className="font-mono">{cur}</span>
+            <ChevronDown size={12} />
+          </button>
+          {menu && (
+            <>
+              <div className="fixed inset-0 z-30" onClick={() => setMenu(false)} />
+              <div className="absolute right-12 bottom-12 z-40 min-w-[150px] p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
+                {MODELS.map((m) => {
+                  const on = m.label === cur
+                  return (
+                    <button key={m.alias} onClick={() => { setMenu(false); if (!on) cmd.switchModel(sid, m.alias) }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] text-ink hover:bg-sunken"
+                      style={on ? { background: 'var(--bg-sunken)' } : undefined}>
+                      <span className="font-mono flex-1 text-left">{m.label}</span>
+                      {on && <Check size={14} style={{ color: 'var(--accent)' }} />}
+                    </button>
+                  )
+                })}
+                <div className="text-[10px] text-faint px-2.5 pt-1 pb-0.5 leading-snug">切换=用新模型 resume,会短暂重连</div>
+              </div>
+            </>
+          )}
           <button onClick={submit} disabled={!draft.trim()}
             className="w-8 h-8 rounded-[9px] flex items-center justify-center text-accentfg disabled:opacity-40 transition hover:brightness-110" style={{ background: 'var(--accent)' }}>
             <ArrowUp size={16} strokeWidth={2} />
@@ -258,16 +296,15 @@ function Composer({ modelLabel, onSend }: { modelLabel: string; onSend: (t: stri
 }
 
 function Conversation({ s }: { s: Session }) {
-  const model = s.agent === 'codex' ? 'Codex' : 'Claude'
   return (
     <div className="flex flex-col h-full bg-bg">
-      <WorkHeader title={s.title || '会话'} meta={sessionMeta(s.status)} model={model} sub={s.workdir}
+      <WorkHeader title={s.title || '会话'} meta={sessionMeta(s.status)} model={modelLabel(s.model)} sub={s.workdir}
         right={<>
           <IconBtn title="更多"><MoreHorizontal size={16} /></IconBtn>
           <IconBtn title="结束会话" onClick={() => cmd.closeSession(s.id)}><X size={16} /></IconBtn>
         </>} />
       <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} working={s.status === 'working'} />
-      <Composer modelLabel={model} onSend={(t) => cmd.sendInput(s.id, t)} />
+      <Composer sid={s.id} model={s.model} onSend={(t) => cmd.sendInput(s.id, t)} />
     </div>
   )
 }
@@ -601,29 +638,90 @@ function ConsolePage({ query }: { query: string }) {
   )
 }
 
-// ===== 使用统计(占位,真实数据待接)=====
+// ===== 使用统计(扫本地 .jsonl,花费按内置单价表估算)=====
+const fmtTok = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`
+const fmtUsd = (c: number) => `$${c.toFixed(c < 10 ? 2 : 1)}`
+const MODEL_COLORS = ['var(--accent)', '#7d9bd4', '#b9c0e8', '#9aa0ad']
+
 function UsagePage() {
+  const usage = useUsage()
+  const [days, setDays] = useState(14)
+  useEffect(() => { cmd.loadUsage(days) }, [days])
+  const t = usage?.totals
+  const maxBar = Math.max(1, ...(usage?.daily ?? []).map((d) => d.tokens))
+  const totalTok = Math.max(1, t?.tokens ?? 1)
+  const RANGES: { d: number; label: string }[] = [{ d: 14, label: '14 天' }, { d: 30, label: '30 天' }, { d: 0, label: '全部' }]
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
       <div className="max-w-[920px] mx-auto px-8 pt-8 pb-12">
-        <div className="text-[20px] font-semibold text-ink">使用统计</div>
-        <div className="text-[12.5px] text-dim mt-1">真实 token / 花费数据待接入。</div>
-        <div className="grid grid-cols-4 gap-3.5 mt-6">
-          {[['总 Token', '—'], ['花费', '—'], ['缓存命中', '—'], ['请求数', '—']].map(([l, v]) => (
-            <div key={l} className="p-4 rounded-[13px] border border-line bg-elev">
-              <div className="text-[11.5px] text-dim">{l}</div>
-              <div className="text-[24px] font-semibold mt-2 text-faint">{v}</div>
-            </div>
-          ))}
-        </div>
-        <div className="mt-4.5 p-5 rounded-[13px] border border-line bg-elev">
-          <div className="text-[13px] font-semibold text-ink mb-4">每日 Token 消耗</div>
-          <div className="flex items-end gap-2 h-[140px]">
-            {Array.from({ length: 14 }, (_, i) => i).map((i) => (
-              <div key={i} className="flex-1 rounded-t-[5px]" style={{ height: '8px', background: 'var(--bg-sunken)' }} />
+        <div className="flex items-end justify-between mb-5">
+          <div>
+            <div className="text-[20px] font-semibold text-ink">使用统计</div>
+            <div className="text-[12.5px] text-dim mt-1">扫描本地 Claude 转录 · 花费为单价表估算</div>
+          </div>
+          <div className="flex gap-1 p-[3px] rounded-[9px]" style={{ background: 'var(--bg-sunken)' }}>
+            {RANGES.map((r) => (
+              <button key={r.d} onClick={() => setDays(r.d)} className="px-3 py-1.5 rounded-[7px] text-[12px] transition"
+                style={days === r.d ? { background: 'var(--bg-elev)', fontWeight: 500, boxShadow: '0 1px 2px rgba(0,0,0,.08)' } : { color: 'var(--text-dim)' }}>
+                {r.label}
+              </button>
             ))}
           </div>
         </div>
+
+        {!usage ? <div className="text-[13px] text-faint py-16 text-center">统计中…</div> : (
+          <>
+            <div className="grid grid-cols-4 gap-3.5">
+              {[
+                { l: '总 Token', v: fmtTok(t!.tokens), s: `输入 ${fmtTok(t!.input)} · 输出 ${fmtTok(t!.output)}` },
+                { l: '花费(估算)', v: fmtUsd(t!.cost), s: '按内置单价表' },
+                { l: '缓存命中', v: `${(t!.cacheHit * 100).toFixed(0)}%`, s: `读取 ${fmtTok(t!.cacheRead)}` },
+                { l: '请求数', v: t!.requests.toLocaleString(), s: days > 0 ? `近 ${days} 天` : '全部' },
+              ].map((c) => (
+                <div key={c.l} className="p-4 rounded-[13px] border border-line bg-elev">
+                  <div className="text-[11.5px] text-dim">{c.l}</div>
+                  <div className="text-[24px] font-semibold mt-2 text-ink tracking-tight">{c.v}</div>
+                  <div className="text-[11px] text-faint mt-1 truncate">{c.s}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 p-5 rounded-[13px] border border-line bg-elev">
+              <div className="text-[13px] font-semibold text-ink mb-4">每日 Token 消耗</div>
+              <div className="flex items-end gap-1.5 h-[150px]">
+                {usage.daily.map((b, i) => (
+                  <div key={i} className="flex-1 flex flex-col items-center gap-1.5 h-full justify-end" title={`${b.day}: ${fmtTok(b.tokens)}`}>
+                    <div className="w-full rounded-t-[5px] transition-all" style={{ height: `${Math.max(2, (b.tokens / maxBar) * 100)}%`, background: i === usage.daily.length - 1 ? 'var(--accent)' : 'var(--accent-soft)' }} />
+                    <span className="text-[9px] text-faint">{b.day}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-4 p-5 rounded-[13px] border border-line bg-elev">
+              <div className="text-[13px] font-semibold text-ink mb-4">按模型分布</div>
+              {usage.models.length === 0 && <div className="text-[12px] text-faint">本范围无数据。</div>}
+              {usage.models.map((m, i) => (
+                <div key={m.name} className="flex items-center gap-3.5 py-2">
+                  <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: MODEL_COLORS[i] ?? 'var(--text-faint)' }} />
+                  <span className="font-mono text-[12px] w-[150px] shrink-0 truncate">{modelLabel(m.name)}</span>
+                  <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-sunken)' }}>
+                    <div className="h-full rounded-full" style={{ width: `${(m.tokens / totalTok) * 100}%`, background: MODEL_COLORS[i] ?? 'var(--text-faint)' }} />
+                  </div>
+                  <span className="text-[12px] text-dim w-[80px] text-right shrink-0">{fmtTok(m.tokens)}</span>
+                  <span className="text-[12px] text-faint w-[64px] text-right shrink-0">{fmtUsd(m.cost)}</span>
+                </div>
+              ))}
+              <div className="flex items-center gap-3.5 pt-3 mt-1 border-t border-line">
+                <span className="w-2.5 h-2.5 shrink-0" />
+                <span className="text-[12px] font-semibold text-ink w-[150px] shrink-0">汇总</span>
+                <span className="flex-1" />
+                <span className="text-[12px] font-semibold text-ink w-[80px] text-right shrink-0">{fmtTok(t!.tokens)}</span>
+                <span className="text-[12px] font-semibold text-ink w-[64px] text-right shrink-0">{fmtUsd(t!.cost)}</span>
+              </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

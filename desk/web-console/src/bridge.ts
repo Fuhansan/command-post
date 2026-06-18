@@ -1,4 +1,4 @@
-import { setState, setTranscript, setDir, setFile } from './store'
+import { setState, setTranscript, setDir, setFile, setUsage } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -27,6 +27,9 @@ function installReceiver() {
         case 'fileContent':
           setFile(msg.payload.path, { text: msg.payload.text, truncated: msg.payload.truncated })
           break
+        case 'usage':
+          setUsage(msg.payload)
+          break
         default:
           console.warn('未知推送', msg.type)
       }
@@ -45,6 +48,7 @@ export const cmd = {
   continueLast: (workdir: string) => send({ action: 'newSession', workdir, continueLast: true }),
   resume: (workdir: string, id: string) => send({ action: 'newSession', workdir, resume: id }),
   closeSession: (sid: string) => send({ action: 'closeSession', sid }),
+  switchModel: (sid: string, model: string) => send({ action: 'switchModel', sid, model }),
   sendInput: (sid: string, text: string) => send({ action: 'send', sid, text }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
@@ -54,5 +58,6 @@ export const cmd = {
     send({ action: 'loadTranscript', kind, id, workdir, beforeByte }),
   listDir: (path: string) => send({ action: 'listDir', path }),
   loadFile: (path: string) => send({ action: 'loadFile', path }),
+  loadUsage: (days: number) => send({ action: 'loadUsage', days }),
   setTheme: (dark: boolean) => send({ action: 'theme', dark }),
 }

@@ -27,10 +27,12 @@ struct AgentSession: Identifiable, Equatable {
     var pending: [PendingRequest]     // 待你响应(权限/选项合一)
     var agentSessionId: String?       // agent 报告的 session_id(供 resume)
     var startedAt: Date = Date()      // 会话开始时间(列表展示相对时间)
+    var model: String? = nil          // 当前模型(从流里读到 / 用户切换)
 
     static func == (l: AgentSession, r: AgentSession) -> Bool {
         l.id == r.id && l.status == r.status && l.messages == r.messages &&
-        l.pending == r.pending && l.title == r.title && l.agentSessionId == r.agentSessionId
+        l.pending == r.pending && l.title == r.title && l.agentSessionId == r.agentSessionId &&
+        l.model == r.model
     }
 }
 
@@ -139,7 +141,7 @@ final class AgentSessionManager: ObservableObject {
         }
         managed[sid] = m
         Task {
-            do { try await driver.start(workdir: workdir, resume: resume, continueLast: continueLast) }
+            do { try await driver.start(workdir: workdir, resume: resume, continueLast: continueLast, model: nil) }
             catch { await self.apply(.error("启动失败: \(error)"), to: sid) }
         }
         // 历史回填:不依赖 init —— claude 在 stream-json 下要等首条输入才吐 init,
@@ -428,6 +430,30 @@ final class AgentSessionManager: ObservableObject {
         if let wd { loadHistoryList(for: wd, force: true) }
     }
 
+    /// 会话中途切模型:停掉当前 driver,用新模型 `--resume` 当前会话重起(上下文保留,短暂重连)。
+    /// 没有 agentSessionId(还没开聊)时则直接以新模型重起,消息此时为空,无损。
+    func switchModel(_ sid: String, to model: String) {
+        guard let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+        let s = sessions[idx]
+        if s.model == model { return }
+        let resumeId = s.agentSessionId
+        vlog("console switchModel: sid=\(sid) -> \(model) resume=\(resumeId ?? "-")")
+        managed[sid]?.consumeTask?.cancel()
+        managed[sid]?.driver.stop()
+        let driver = makeDriver(s.agent)
+        sessions[idx].model = model
+        sessions[idx].status = .starting
+        var m = Managed(driver: driver, consumeTask: nil)
+        m.consumeTask = Task { [weak self] in
+            for await ev in driver.events { await self?.apply(ev, to: sid) }
+        }
+        managed[sid] = m
+        Task {
+            do { try await driver.start(workdir: s.workdir, resume: resumeId, continueLast: false, model: model) }
+            catch { await self.apply(.error("切换模型失败: \(error)"), to: sid) }
+        }
+    }
+
     // MARK: - 事件 → 模型
 
     private func apply(_ ev: SessionEvent, to sid: String) {
@@ -437,6 +463,8 @@ final class AgentSessionManager: ObservableObject {
         case .sessionId(let aid):
             mutate(sid) { $0.agentSessionId = aid }
             loadHistory(sessionId: aid, into: sid)   // resume/continue 时把历史读回来(空会话无害)
+        case .model(let m):
+            mutate(sid) { $0.model = m }
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {

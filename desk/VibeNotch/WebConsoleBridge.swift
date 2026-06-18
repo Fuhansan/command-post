@@ -69,6 +69,10 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                                     continueLast: obj["continueLast"] as? Bool ?? false)
         case "closeSession":
             if let sid = obj["sid"] as? String { manager?.closeSession(sid) }
+        case "switchModel":
+            if let sid = obj["sid"] as? String, let model = obj["model"] as? String {
+                manager?.switchModel(sid, to: model)
+            }
         case "send":
             if let sid = obj["sid"] as? String, let text = obj["text"] as? String { manager?.send(sid, text: text) }
         case "respond":
@@ -89,6 +93,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                     ["name": $0.url.lastPathComponent, "path": $0.url.path, "isDir": $0.isDir] as [String: Any]
                 }
                 pushJSON(type: "dirList", payload: ["path": path, "entries": entries])
+            }
+        case "loadUsage":
+            let days = (obj["days"] as? NSNumber)?.intValue ?? 14
+            Task { [weak self] in
+                let payload = await UsageScanner.shared.aggregate(days: days)
+                await MainActor.run { self?.pushJSON(type: "usage", payload: payload) }
             }
         case "loadFile":
             if let path = obj["path"] as? String { loadFile(path: path) }
@@ -194,6 +204,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         return [
             "id": s.id, "title": title, "workdir": s.workdir,
             "agent": s.agent.rawValue, "status": statusKey(s.status),
+            "model": s.model ?? "",
             "agentSessionId": s.agentSessionId ?? "",
             "startedAt": s.startedAt.timeIntervalSince1970 * 1000,
             "messages": s.messages.map { msgDTO($0) },

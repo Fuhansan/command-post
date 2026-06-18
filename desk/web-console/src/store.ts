@@ -1,8 +1,9 @@
-import type { AppState, Msg, Entry, FileBody } from './types'
+import type { AppState, Msg, Entry, FileBody, UsageData } from './types'
 
 export interface TranscriptMeta { earliest: number; hasEarlier: boolean }
 
 let state: AppState = { projects: [], sessions: [], manual: [] }
+let usage: UsageData | null = null
 let transcripts: Record<string, Msg[]> = {}
 let transcriptMeta: Record<string, TranscriptMeta> = {}
 let dirs: Record<string, Entry[]> = {}
@@ -26,6 +27,8 @@ export function setTranscript(id: string, messages: Msg[], meta?: TranscriptMeta
   if (meta) transcriptMeta = { ...transcriptMeta, [id]: meta }
   notify()
 }
+export function getUsage() { return usage }
+export function setUsage(u: UsageData) { usage = u; notify() }
 export function getDirs() { return dirs }
 export function setDir(path: string, entries: Entry[]) { dirs = { ...dirs, [path]: entries }; notify() }
 export function getFiles() { return files }
