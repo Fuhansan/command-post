@@ -321,7 +321,7 @@ function HistoryView({ h, msgs, onResume, resuming }: {
   )
 }
 
-export default function App() {
+function ConsolePage() {
   const state = useAgent()
   const transcripts = useTranscripts()
   const [selectedProject, setSelectedProject] = useState<string | null>(null)
@@ -379,42 +379,39 @@ export default function App() {
   }, [sel, state, transcripts, pendingResume])
 
   return (
-    <div className="flex h-full">
-      {/* 列1:项目 + 目录 */}
-      <div className="w-[230px] shrink-0 bg-panel border-r border-line flex flex-col">
+    <div className="flex h-full flex-1 min-w-0">
+      {/* 列1:项目(可展开成文件夹,目录嵌在项目下) */}
+      <div className="w-[240px] shrink-0 bg-panel border-r border-line flex flex-col">
         <div className="titlebar-pad px-3 pb-2 flex items-center justify-between">
           <span className="text-[11px] font-semibold text-faint tracking-wide">项目</span>
           <button onClick={() => cmd.openProject()} title="打开项目"
             className="w-5 h-5 flex items-center justify-center text-sub hover:text-ink rounded">＋</button>
         </div>
-        <div className="overflow-auto px-2 pb-2 space-y-0.5" style={{ maxHeight: '45%' }}>
+        <div className="flex-1 overflow-auto px-2 pb-3">
           {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3">点上方「＋」打开一个项目</div>}
           {state.projects.map((p) => {
             const cnt = state.sessions.filter((s) => s.workdir === p.workdir).length
             const active = p.workdir === selectedProject
             return (
-              <button key={p.workdir} onClick={() => { setSelectedProject(p.workdir); setSel(null); setActiveFile(null) }}
-                className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border
-                  ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-gray-100'}`}>
-                <span className="text-[13px]">📁</span>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[12.5px] font-medium text-ink truncate">{p.name}</div>
-                  <div className="text-[10.5px] text-sub">{cnt ? `${cnt} 个会话` : '未打开会话'}</div>
-                </div>
-              </button>
+              <div key={p.workdir}>
+                <button onClick={() => { setSelectedProject(p.workdir); setSel(null); setActiveFile(null) }}
+                  className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border
+                    ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-gray-100'}`}>
+                  <span className="text-[13px]">{active ? '📂' : '📁'}</span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[12.5px] font-medium text-ink truncate">{p.name}</div>
+                    <div className="text-[10.5px] text-sub">{cnt ? `${cnt} 个会话` : '未打开会话'}</div>
+                  </div>
+                </button>
+                {active && (
+                  <div className="ml-3 mt-0.5 pl-1 border-l border-line">
+                    <FileTree root={p.workdir} openFile={openFile} />
+                  </div>
+                )}
+              </div>
             )
           })}
         </div>
-        {project && (
-          <>
-            <div className="px-3 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line truncate">
-              目录 · {project.name}
-            </div>
-            <div className="flex-1 overflow-auto px-2 pb-3">
-              <FileTree root={project.workdir} openFile={openFile} />
-            </div>
-          </>
-        )}
       </div>
 
       {/* 列2:所选项目的会话 */}
@@ -484,5 +481,44 @@ function SessionList({ p, state, sel, setSel, inProject }: {
       ))}
       {empty && <div className="text-[11px] text-faint px-1 pb-1">未打开会话</div>}
     </>
+  )
+}
+
+// —— 顶层导航(多页面:控制台 / 使用统计 / …)——
+function NavRail({ page, setPage }: { page: string; setPage: (p: string) => void }) {
+  const items = [
+    { id: 'console', glyph: '💬', label: '控制台' },
+    { id: 'stats', glyph: '📊', label: '使用统计' },
+  ]
+  return (
+    <div className="w-[52px] shrink-0 bg-[#ECEEF1] border-r border-line flex flex-col items-center pt-2 gap-1.5">
+      {items.map((it) => (
+        <button key={it.id} onClick={() => setPage(it.id)} title={it.label}
+          className={`w-9 h-9 rounded-xl flex items-center justify-center text-[16px]
+            ${page === it.id ? 'bg-white shadow-sm' : 'hover:bg-white/60'}`}>
+          {it.glyph}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function StatsPage() {
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center text-sub">
+      <div className="text-[40px] mb-2">📊</div>
+      <div className="text-[14px] font-semibold text-ink">使用统计</div>
+      <div className="text-[12px] mt-1">这个页面之后做(占位)。</div>
+    </div>
+  )
+}
+
+export default function App() {
+  const [page, setPage] = useState('console')
+  return (
+    <div className="flex h-full">
+      <NavRail page={page} setPage={setPage} />
+      {page === 'console' ? <ConsolePage /> : <StatsPage />}
+    </div>
   )
 }

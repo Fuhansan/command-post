@@ -175,8 +175,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
 
     private func sessionDTO(_ s: AgentSession) -> [String: Any] {
-        [
-            "id": s.id, "title": s.title, "workdir": s.workdir,
+        // 标题用首条用户消息(s.title 是目录名,不能当会话标题);没有则「新会话」。
+        let title = s.messages.first { $0.kind == .text && $0.role == "user" }
+            .map { String($0.text.prefix(40)) } ?? "新会话"
+        return [
+            "id": s.id, "title": title, "workdir": s.workdir,
             "agent": s.agent.rawValue, "status": statusKey(s.status),
             "agentSessionId": s.agentSessionId ?? "",
             "startedAt": s.startedAt.timeIntervalSince1970 * 1000,
