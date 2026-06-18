@@ -70,47 +70,59 @@ struct AgentConsoleRootView: View {
     // MARK: - 左:项目栏(可收缩)
 
     private var projectsRail: some View {
-        VStack(spacing: 0) {
-            Button(action: openProject) {
-                Label("打开项目", systemImage: "folder.badge.plus")
-                    .font(.system(size: 13, weight: .medium)).frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent).controlSize(.large)
-            .padding(10)
-
+        VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("项目").font(.system(size: 11, weight: .semibold)).foregroundStyle(CT.faint)
+                Text("项目").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(CT.faint).textCase(.uppercase).tracking(0.5)
                 Spacer()
-            }
-            .padding(.horizontal, 14).padding(.bottom, 4)
-
-            List(selection: $selectedProject) {
-                ForEach(manager.projects, id: \.self) { proj in
-                    projectRow(proj).tag(proj)
+                Button(action: openProject) {
+                    Image(systemName: "plus").font(.system(size: 12, weight: .semibold)).foregroundStyle(CT.sub)
+                        .frame(width: 22, height: 22)
                 }
+                .buttonStyle(.plain).help("打开项目")
             }
-            .listStyle(.sidebar).scrollContentBackground(.hidden)
+            .padding(.horizontal, 14).padding(.top, 16).padding(.bottom, 6)
+
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(manager.projects, id: \.self) { projectRow($0) }
+                }
+                .padding(.horizontal, 8)
+            }
+            Spacer(minLength: 0)
         }
         .background(CT.panel)
     }
 
     private func projectRow(_ proj: String) -> some View {
+        let sel = selectedProject == proj
         let sessions = manager.sessions.filter { $0.workdir == proj }
         let needsResp = sessions.contains { !$0.pending.isEmpty
             || $0.messages.contains { $0.kind == .permission && $0.permState == nil } }
         let working = sessions.contains { $0.status == .working || $0.status == .starting }
-        let dot: Color = sessions.isEmpty ? CT.faint : (working ? CT.accent : CT.success)
-        return VStack(alignment: .leading, spacing: 3) {
-            Text((proj as NSString).lastPathComponent)
-                .font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
-            HStack(spacing: 5) {
-                Circle().fill(dot).frame(width: 6, height: 6)
-                Text(sessions.isEmpty ? "未打开会话" : "\(sessions.count) 个会话")
-                    .font(.system(size: 11)).foregroundStyle(CT.sub)
-                if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+        let dot: Color = sessions.isEmpty ? CT.faint : (working ? CT.success : CT.accent)
+        return Button { selectedProject = proj } label: {
+            HStack(spacing: 9) {
+                Image(systemName: "folder.fill").font(.system(size: 12))
+                    .foregroundStyle(sel ? CT.accent : CT.faint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text((proj as NSString).lastPathComponent)
+                        .font(.system(size: 13, weight: .medium)).foregroundStyle(CT.text).lineLimit(1)
+                    HStack(spacing: 5) {
+                        Circle().fill(dot).frame(width: 5, height: 5)
+                        Text(sessions.isEmpty ? "未打开会话" : "\(sessions.count) 个会话")
+                            .font(.system(size: 11)).foregroundStyle(CT.sub)
+                        if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
+                    }
+                }
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 8).padding(.vertical, 7)
+            .background(sel ? CT.sel : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 3)
+        .buttonStyle(.plain)
         .contextMenu {
             Button("关闭项目") {
                 manager.closeProject(proj)
