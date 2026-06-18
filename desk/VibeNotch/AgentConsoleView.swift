@@ -11,6 +11,11 @@ struct AgentConsoleRootView: View {
     @State private var projectsCollapsed = false
     @State private var draft: String = ""
     @State private var manualTranscript: [String: [AgentMessage]] = [:]   // 手动会话只读对话缓存
+    // IDEA 式标签页:会话 + 打开的文件;左栏文件树展开态。
+    @State private var openFiles: [URL] = []
+    @State private var activeTab: ConsoleTab = .session
+    @State private var expandedDirs: Set<String> = []
+    @State private var fileCache: [String: String] = [:]   // 文件内容缓存
     private let topInset: CGFloat = 28   // 统一标题栏:各栏内容顶部留出标题栏高度(背景延伸到顶)
 
     /// 某 cwd 是否属于该项目(等于或在其子目录下)。
@@ -36,7 +41,7 @@ struct AgentConsoleRootView: View {
                     projectsRail.frame(minWidth: 180, maxWidth: 240)
                 }
                 sessionColumn.frame(minWidth: 240, maxWidth: 340)
-                conversationPane.frame(minWidth: 460)
+                rightPane.frame(minWidth: 460)
             }
             Divider().overlay(CT.hairline)
             statusBar
@@ -88,6 +93,27 @@ struct AgentConsoleRootView: View {
                     ForEach(manager.projects, id: \.self) { projectRow($0) }
                 }
                 .padding(.horizontal, 8)
+            }
+            .frame(maxHeight: 200)
+
+            if let proj = selectedProject {
+                Divider().overlay(CT.hairline).padding(.vertical, 6)
+                HStack(spacing: 4) {
+                    Text("目录").font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CT.faint).textCase(.uppercase).tracking(0.5)
+                    Text((proj as NSString).lastPathComponent)
+                        .font(.system(size: 11)).foregroundStyle(CT.sub).lineLimit(1)
+                    Spacer()
+                }
+                .padding(.horizontal, 14).padding(.bottom, 4)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(FileTreeRow.children(of: URL(fileURLWithPath: proj)), id: \.self) { url in
+                            FileTreeRow(url: url, depth: 0, expanded: $expandedDirs, onOpen: openFile)
+                        }
+                    }
+                    .padding(.horizontal, 6).padding(.bottom, 8)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -328,6 +354,95 @@ struct AgentConsoleRootView: View {
         .task(id: proj) { manager.loadHistoryList(for: proj) }
     }
 
+    // MARK: - 右:标签页(会话 + 文件,IDEA 式)
+
+    private var rightPane: some View {
+        VStack(spacing: 0) {
+            tabBar
+            Divider().overlay(CT.hairline)
+            switch activeTab {
+            case .session:        conversationPane
+            case .file(let url):  fileViewer(url)
+            }
+        }
+        .background(CT.bg)
+    }
+
+    private var tabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                tabChip(title: "会话", icon: "bubble.left.and.bubble.right",
+                        active: activeTab == .session, closable: false,
+                        onTap: { activeTab = .session }, onClose: {})
+                ForEach(openFiles, id: \.self) { url in
+                    tabChip(title: url.lastPathComponent, icon: "doc.text",
+                            active: activeTab == .file(url), closable: true,
+                            onTap: { activeTab = .file(url) }, onClose: { closeFile(url) })
+                }
+            }
+            .padding(.horizontal, 8).padding(.top, topInset).padding(.bottom, 4)
+        }
+    }
+
+    private func tabChip(title: String, icon: String, active: Bool, closable: Bool,
+                         onTap: @escaping () -> Void, onClose: @escaping () -> Void) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).font(.system(size: 10)).foregroundStyle(active ? CT.accent : CT.sub)
+            Text(title).font(.system(size: 12, weight: active ? .semibold : .regular))
+                .foregroundStyle(active ? CT.text : CT.sub).lineLimit(1)
+            if closable {
+                Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).foregroundStyle(CT.faint)
+                    .frame(width: 12, height: 12).contentShape(Rectangle()).onTapGesture { onClose() }
+            }
+        }
+        .padding(.horizontal, 9).padding(.vertical, 5)
+        .background(active ? CT.sel : Color.clear)
+        .overlay(RoundedRectangle(cornerRadius: 7)
+            .stroke(active ? CT.accent.opacity(0.4) : Color.clear, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .contentShape(Rectangle()).onTapGesture { onTap() }
+    }
+
+    private func fileViewer(_ url: URL) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "doc.text").font(.system(size: 12)).foregroundStyle(CT.sub)
+                Text(url.lastPathComponent).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text)
+                Text(url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .font(.system(size: 11)).foregroundStyle(CT.faint).lineLimit(1).truncationMode(.middle)
+                Spacer()
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10).background(CT.bg)
+            Divider().overlay(CT.hairline)
+            ScrollView([.vertical, .horizontal]) {
+                Text(fileCache[url.path] ?? "加载中…")
+                    .font(.system(size: 12, design: .monospaced)).foregroundStyle(CT.text)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+            }
+            .background(CT.bg)
+        }
+        .task(id: url) { await loadFile(url) }
+    }
+
+    private func openFile(_ url: URL) {
+        if !openFiles.contains(url) { openFiles.append(url) }
+        activeTab = .file(url)
+    }
+    private func closeFile(_ url: URL) {
+        openFiles.removeAll { $0 == url }
+        if activeTab == .file(url) { activeTab = openFiles.last.map { .file($0) } ?? .session }
+    }
+    private func loadFile(_ url: URL) async {
+        guard fileCache[url.path] == nil else { return }
+        let content = await Task.detached(priority: .userInitiated) { () -> String in
+            guard let data = try? Data(contentsOf: url) else { return "(无法读取)" }
+            if data.count > 2_000_000 { return "(文件过大 \(data.count / 1024)KB,暂不预览)" }
+            return String(data: data, encoding: .utf8) ?? "(二进制文件,无法以文本预览)"
+        }.value
+        fileCache[url.path] = content
+    }
+
     // MARK: - 右:对话
 
     @ViewBuilder
@@ -375,7 +490,7 @@ struct AgentConsoleRootView: View {
                     Label("唤起 \(e.terminal.displayName)", systemImage: "arrow.up.forward.app")
                 }.controlSize(.small).buttonStyle(.borderedProminent)
             }
-            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 10)
             .background(CT.bg)
             Divider().overlay(CT.hairline)
             ScrollView {
@@ -426,7 +541,7 @@ struct AgentConsoleRootView: View {
                 Spacer()
                 Label("只读", systemImage: "lock.fill").font(.system(size: 11)).foregroundStyle(CT.faint)
             }
-            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 10)
             .background(CT.bg)
             Divider().overlay(CT.hairline)
             ZStack(alignment: .bottom) {
@@ -522,7 +637,7 @@ struct AgentConsoleRootView: View {
                 } label: { Image(systemName: "ellipsis").foregroundStyle(CT.sub) }
                     .menuStyle(.borderlessButton).fixedSize()
             }
-            .padding(.horizontal, 14).padding(.top, topInset + 6).padding(.bottom, 10)
+            .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 10)
             .background(CT.bg)
             Divider().overlay(CT.hairline)
             ScrollViewReader { proxy in
@@ -713,6 +828,9 @@ struct AgentConsoleRootView: View {
     }
 }
 
+/// 右侧标签页:会话 或 某个文件。
+enum ConsoleTab: Hashable { case session; case file(URL) }
+
 /// 控制台浅色配色(对齐高保真设计)。
 private enum CT {
     static func hex(_ v: UInt32) -> Color {
@@ -732,4 +850,60 @@ private enum CT {
     static let success  = hex(0x16A34A)   // 绿
     static let indigo   = hex(0x7C5CD6)   // Codex 会话类型色
     static let orange   = hex(0xE8810C)   // 手动会话类型色
+}
+
+/// 文件树一行(递归):文件夹可展开,文件点击 → onOpen。用 AnyView 断递归类型。
+struct FileTreeRow: View {
+    let url: URL
+    let depth: Int
+    @Binding var expanded: Set<String>
+    let onOpen: (URL) -> Void
+
+    private var isDir: Bool { (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
+    private var isOpen: Bool { expanded.contains(url.path) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                if isDir {
+                    if isOpen { expanded.remove(url.path) } else { expanded.insert(url.path) }
+                } else { onOpen(url) }
+            } label: {
+                HStack(spacing: 5) {
+                    if isDir {
+                        Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .semibold)).foregroundStyle(CT.faint).frame(width: 9)
+                    } else {
+                        Color.clear.frame(width: 9, height: 1)
+                    }
+                    Image(systemName: isDir ? "folder.fill" : "doc")
+                        .font(.system(size: 11)).foregroundStyle(isDir ? CT.accent.opacity(0.85) : CT.sub)
+                    Text(url.lastPathComponent).font(.system(size: 12)).foregroundStyle(CT.text).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, CGFloat(depth) * 12 + 4).padding(.vertical, 3).padding(.trailing, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).focusEffectDisabled()
+
+            if isDir && isOpen {
+                ForEach(FileTreeRow.children(of: url), id: \.self) { child in
+                    AnyView(FileTreeRow(url: child, depth: depth + 1, expanded: $expanded, onOpen: onOpen))
+                }
+            }
+        }
+    }
+
+    /// 目录内容:文件夹在前,按名称自然排序;跳过隐藏文件。
+    static func children(of dir: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
+        return items.sorted { a, b in
+            let aDir = (try? a.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            let bDir = (try? b.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if aDir != bDir { return aDir }
+            return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+        }
+    }
 }
