@@ -3,8 +3,8 @@ import type { ReactNode } from 'react'
 import hljs from 'highlight.js'
 import {
   Sparkles, Cpu, Hand, History as HistoryIcon, Folder, FolderOpen, FileText, File as FileIcon,
-  MessageSquare, BarChart3, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus, Unlock,
-  Lock, AppWindow, Terminal,
+  MessageSquare, BarChart3, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus,
+  RotateCcw, AppWindow, Terminal,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
@@ -343,16 +343,18 @@ function HistoryView({ h, msgs, onResume, resuming }: {
   h: History; msgs: Msg[]; onResume: () => void; resuming: boolean
 }) {
   return (
-    <div className="flex flex-col h-full relative">
-      <Header title={h.label} sub="历史会话 · 只读" right={<Pill text="只读" cls="text-gray-500 bg-gray-100" />} />
-      <div className="flex-1 relative bg-panel/40 min-h-0">
-        <MsgList msgs={msgs} />
-        <button onClick={onResume} disabled={resuming}
-          className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-brand text-white text-[12px] font-medium shadow-pop disabled:opacity-60 flex items-center gap-1.5 transition-transform hover:scale-[1.03]">
-          {resuming ? <Lock size={13} /> : <Unlock size={13} />}
-          {resuming ? '正在恢复…' : '恢复会话'}
-        </button>
-      </div>
+    <div className="flex flex-col h-full">
+      <Header title={h.label} sub="历史会话 · 只读" right={
+        <>
+          <Pill text="只读" cls="text-gray-500 bg-gray-100" />
+          <button onClick={onResume} disabled={resuming}
+            className="text-[12px] text-white bg-brand px-2.5 py-1 rounded-md flex items-center gap-1.5 hover:bg-blue-700 disabled:opacity-60 transition-colors">
+            <RotateCcw size={13} className={resuming ? 'animate-spin' : ''} />
+            {resuming ? '恢复中…' : 'Resume'}
+          </button>
+        </>
+      } />
+      <MsgList msgs={msgs} />
     </div>
   )
 }
