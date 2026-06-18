@@ -27,8 +27,11 @@ final class WebConsoleWindowController: NSObject, NSWindowDelegate {
         w.titlebarAppearsTransparent = true
         w.titleVisibility = .hidden
         w.isReleasedWhenClosed = false
+        w.backgroundColor = NSColor(calibratedWhite: 0.965, alpha: 1)   // 与侧栏一致,顶部留白看着自然
         if let content = w.contentView {
-            bridge.webView.frame = content.bounds
+            // 顶部留 28pt 给原生标题栏(可拖动窗口);webview 从下方开始,不盖住拖拽区。
+            let inset: CGFloat = 28
+            bridge.webView.frame = NSRect(x: 0, y: 0, width: content.bounds.width, height: content.bounds.height - inset)
             bridge.webView.autoresizingMask = [.width, .height]
             content.addSubview(bridge.webView)
         }

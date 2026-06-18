@@ -304,15 +304,17 @@ function ManualView({ m, msgs }: { m: Manual; msgs: Msg[] }) {
   )
 }
 
-function HistoryView({ h, workdir, msgs }: { h: History; workdir: string; msgs: Msg[] }) {
+function HistoryView({ h, msgs, onResume, resuming }: {
+  h: History; msgs: Msg[]; onResume: () => void; resuming: boolean
+}) {
   return (
     <div className="flex flex-col h-full relative">
       <Header title={h.label} sub="历史会话 · 只读" right={<Pill text="只读" cls="text-gray-500 bg-gray-100" />} />
-      <div className="flex-1 relative bg-panel/40" onClick={() => cmd.resume(workdir, h.id)}>
+      <div className="flex-1 relative bg-panel/40 min-h-0">
         <MsgList msgs={msgs} />
-        <button onClick={(e) => { e.stopPropagation(); cmd.resume(workdir, h.id) }}
-          className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3.5 py-2 rounded-full bg-brand text-white text-[12px] font-medium shadow-lg">
-          🔓 点击恢复会话
+        <button onClick={onResume} disabled={resuming}
+          className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full bg-brand text-white text-[12px] font-medium shadow-lg disabled:opacity-60">
+          {resuming ? '正在恢复…' : '🔓 恢复会话'}
         </button>
       </div>
     </div>
@@ -326,6 +328,19 @@ export default function App() {
   const [sel, setSel] = useState<Sel>(null)
   const [openFiles, setOpenFiles] = useState<string[]>([])
   const [activeFile, setActiveFile] = useState<string | null>(null)
+  const [pendingResume, setPendingResume] = useState<string | null>(null)   // 正在恢复的 claudeId
+
+  // 恢复历史:防重复 + 等新会话(同 claudeId)出现后自动跳过去
+  const doResume = (workdir: string, id: string) => {
+    if (pendingResume) return
+    setPendingResume(id)
+    cmd.resume(workdir, id)
+  }
+  useEffect(() => {
+    if (!pendingResume) return
+    const s = state.sessions.find((x) => x.agentSessionId === pendingResume)
+    if (s) { setSel({ kind: 'session', id: s.id }); setActiveFile(null); setPendingResume(null) }
+  }, [state.sessions, pendingResume])
 
   // 默认/保持选中项目有效
   useEffect(() => {
@@ -358,19 +373,21 @@ export default function App() {
     if (sel.kind === 'session') { const s = state.sessions.find((x) => x.id === sel.id); return s ? <Conversation s={s} /> : null }
     if (sel.kind === 'manual') { const m = state.manual.find((x) => x.id === sel.id); return m ? <ManualView m={m} msgs={transcripts[m.id] ?? []} /> : null }
     const h = state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id)
-    return h ? <HistoryView h={h} workdir={(sel as any).workdir} msgs={transcripts[h.id] ?? []} /> : null
-  }, [sel, state, transcripts])
+    const wd = (sel as any).workdir
+    return h ? <HistoryView h={h} msgs={transcripts[h.id] ?? []}
+      onResume={() => doResume(wd, h.id)} resuming={pendingResume === h.id} /> : null
+  }, [sel, state, transcripts, pendingResume])
 
   return (
     <div className="flex h-full">
-      {/* 列1:项目 */}
-      <div className="w-[180px] shrink-0 bg-panel border-r border-line flex flex-col">
+      {/* 列1:项目 + 目录 */}
+      <div className="w-[230px] shrink-0 bg-panel border-r border-line flex flex-col">
         <div className="titlebar-pad px-3 pb-2 flex items-center justify-between">
           <span className="text-[11px] font-semibold text-faint tracking-wide">项目</span>
           <button onClick={() => cmd.openProject()} title="打开项目"
             className="w-5 h-5 flex items-center justify-center text-sub hover:text-ink rounded">＋</button>
         </div>
-        <div className="flex-1 overflow-auto px-2 pb-2 space-y-0.5">
+        <div className="overflow-auto px-2 pb-2 space-y-0.5" style={{ maxHeight: '45%' }}>
           {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3">点上方「＋」打开一个项目</div>}
           {state.projects.map((p) => {
             const cnt = state.sessions.filter((s) => s.workdir === p.workdir).length
@@ -388,9 +405,19 @@ export default function App() {
             )
           })}
         </div>
+        {project && (
+          <>
+            <div className="px-3 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line truncate">
+              目录 · {project.name}
+            </div>
+            <div className="flex-1 overflow-auto px-2 pb-3">
+              <FileTree root={project.workdir} openFile={openFile} />
+            </div>
+          </>
+        )}
       </div>
 
-      {/* 列2:所选项目的会话 + 目录 */}
+      {/* 列2:所选项目的会话 */}
       <div className="w-[270px] shrink-0 bg-panel border-r border-line flex flex-col">
         {project ? (
           <>
@@ -398,12 +425,8 @@ export default function App() {
               <span className="text-[13px] font-semibold text-ink truncate">{project.name}</span>
               <NewMenu workdir={project.workdir} />
             </div>
-            <div className="overflow-auto px-2.5 pb-2 space-y-1.5" style={{ maxHeight: '48%' }}>
+            <div className="flex-1 overflow-auto px-2.5 pb-3 space-y-1.5">
               <SessionList p={project} state={state} sel={sel} setSel={selectSession} inProject={inProject} />
-            </div>
-            <div className="px-3 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line">目录</div>
-            <div className="flex-1 overflow-auto px-2 pb-3">
-              <FileTree root={project.workdir} openFile={openFile} />
             </div>
           </>
         ) : <div className="titlebar-pad px-3 text-[12px] text-sub">选择左侧项目</div>}

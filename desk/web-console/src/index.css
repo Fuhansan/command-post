@@ -10,5 +10,5 @@ body {
   background: #FFFFFF;
   user-select: none;
 }
-/* 顶部留出标题栏高度(统一标题栏,红绿灯在上面) */
-.titlebar-pad { padding-top: 28px; }
+/* webview 已从原生标题栏下方开始,这里只需少量呼吸空间 */
+.titlebar-pad { padding-top: 8px; }
