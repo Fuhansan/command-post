@@ -229,14 +229,19 @@ function WorkHeader({ title, meta, model, sub, right }: { title: string; meta?: 
   )
 }
 
-// 完整模型 id → 短标签
+// claude-opus-4-8 → "Opus 4.8";opus → "Opus"
+function modelFamily(m?: string): 'opus' | 'sonnet' | 'haiku' | null {
+  if (!m) return null
+  const s = m.toLowerCase()
+  return s.includes('opus') ? 'opus' : s.includes('sonnet') ? 'sonnet' : s.includes('haiku') ? 'haiku' : null
+}
 function modelLabel(m?: string): string {
   if (!m) return '默认'
-  const s = m.toLowerCase()
-  if (s.includes('opus')) return 'Opus'
-  if (s.includes('sonnet')) return 'Sonnet'
-  if (s.includes('haiku')) return 'Haiku'
-  return m
+  const fam = modelFamily(m)
+  if (!fam) return m
+  const name = fam.charAt(0).toUpperCase() + fam.slice(1)
+  const ver = m.toLowerCase().match(/(\d+)-(\d+)/)   // claude-opus-4-8 → 4-8
+  return ver ? `${name} ${ver[1]}.${ver[2]}` : name
 }
 const MODELS: { alias: string; label: string }[] = [
   { alias: 'opus', label: 'Opus' }, { alias: 'sonnet', label: 'Sonnet' }, { alias: 'haiku', label: 'Haiku' },
@@ -271,12 +276,12 @@ function Composer({ sid, model, onSend }: { sid: string; model?: string; onSend:
               <div className="fixed inset-0 z-30" onClick={() => setMenu(false)} />
               <div className="absolute right-12 bottom-12 z-40 min-w-[150px] p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
                 {MODELS.map((m) => {
-                  const on = m.label === cur
+                  const on = modelFamily(model) === m.alias
                   return (
                     <button key={m.alias} onClick={() => { setMenu(false); if (!on) cmd.switchModel(sid, m.alias) }}
                       className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] text-ink hover:bg-sunken"
                       style={on ? { background: 'var(--bg-sunken)' } : undefined}>
-                      <span className="font-mono flex-1 text-left">{m.label}</span>
+                      <span className="font-mono flex-1 text-left">{on ? cur : m.label}</span>
                       {on && <Check size={14} style={{ color: 'var(--accent)' }} />}
                     </button>
                   )
@@ -493,10 +498,10 @@ function ConsolePage({ query }: { query: string }) {
   const state = useAgent()
   const transcripts = useTranscripts()
   const tmeta = useTranscriptMeta()
-  const [selectedProject, setSelectedProject] = useState<string | null>(null)
+  const [selectedProject, setSelectedProject] = useState<string | null>(() => localStorage.getItem('console.project'))
   const [sel, setSel] = useState<Sel>(null)
-  const [openFile, setOpenFile] = useState<string | null>(null)
-  const [listTab, setListTab] = useState<'sessions' | 'files'>('sessions')
+  const [openFile, setOpenFile] = useState<string | null>(() => localStorage.getItem('console.file'))
+  const [listTab, setListTab] = useState<'sessions' | 'files'>(() => (localStorage.getItem('console.tab') as 'sessions' | 'files') || 'sessions')
   const [filter, setFilter] = useState<'all' | 'running' | 'done'>('all')
   const [pendingResume, setPendingResume] = useState<string | null>(null)
 
@@ -511,6 +516,11 @@ function ConsolePage({ query }: { query: string }) {
     if ((!selectedProject || !state.projects.some((p) => p.workdir === selectedProject)) && state.projects.length)
       setSelectedProject(state.projects[0].workdir)
   }, [state.projects, selectedProject])
+
+  // 记住上次选择(切页面/重启都不丢)
+  useEffect(() => { if (selectedProject) localStorage.setItem('console.project', selectedProject) }, [selectedProject])
+  useEffect(() => { if (openFile) localStorage.setItem('console.file', openFile); else localStorage.removeItem('console.file') }, [openFile])
+  useEffect(() => { localStorage.setItem('console.tab', listTab) }, [listTab])
 
   useEffect(() => {
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
@@ -847,10 +857,13 @@ export default function App() {
       <TitleBar query={query} setQuery={setQuery} theme={theme} toggleTheme={toggleTheme} />
       <div className="flex flex-1 min-h-0">
         <NavRail page={page} setPage={setPage} />
-        {page === 'console' ? <ConsolePage query={query} />
-          : page === 'usage' ? <UsagePage />
-          : page === 'providers' ? <ProvidersPage />
-          : <SettingsPage theme={theme} setTheme={setTheme} />}
+        {/* 控制台常驻不卸载,切页面回来仍记得选中的项目/文件/树展开 */}
+        <div className="flex flex-1 min-w-0" style={{ display: page === 'console' ? 'flex' : 'none' }}>
+          <ConsolePage query={query} />
+        </div>
+        {page === 'usage' && <UsagePage />}
+        {page === 'providers' && <ProvidersPage />}
+        {page === 'settings' && <SettingsPage theme={theme} setTheme={setTheme} />}
       </div>
     </div>
   )
