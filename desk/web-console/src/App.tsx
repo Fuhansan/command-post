@@ -180,13 +180,25 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
   return null
 }
 
-function MsgList({ msgs, onRespond }: { msgs: Msg[]; onRespond?: (r: string, c: string[]) => void }) {
+function MsgList({ msgs, onRespond, working }: {
+  msgs: Msg[]; onRespond?: (r: string, c: string[]) => void; working?: boolean
+}) {
   const ref = useRef<HTMLDivElement>(null)
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
-  useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }, [ordered.length])
+  useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }, [ordered.length, working])
   return (
     <div ref={ref} className="flex-1 overflow-auto px-4 py-4 space-y-3.5 conv-bg">
-      {ordered.map((m) => <MessageRow key={m.id} m={m} onRespond={onRespond} />)}
+      {ordered.map((m) => <div key={m.id} className="animate-msg"><MessageRow m={m} onRespond={onRespond} /></div>)}
+      {working && (
+        <div className="flex gap-2.5 animate-msg">
+          <div className="w-6 h-6 rounded-md bg-blue-50 text-brand flex items-center justify-center shrink-0"><Sparkles size={12} /></div>
+          <div className="flex items-center gap-1 px-1 py-2">
+            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" />
+            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.15s' }} />
+            <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" style={{ animationDelay: '.3s' }} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -306,7 +318,7 @@ function Conversation({ s }: { s: Session }) {
     <div className="flex flex-col h-full">
       <Header title={s.title || '会话'} sub={s.workdir}
         right={<button onClick={() => cmd.closeSession(s.id)} className="text-[12px] text-sub px-2 py-1 rounded-md hover:bg-gray-100">结束会话</button>} />
-      <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} />
+      <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} working={s.status === 'working'} />
       <div className="px-3 py-3 border-t border-line flex gap-2 items-end">
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } }}
@@ -479,7 +491,9 @@ function ConsolePage() {
           ))}
         </div>
         <div className="flex-1 min-h-0">
-          {activeFile ? <FileViewer path={activeFile} /> : sessionView}
+          <div key={activeFile ?? (sel ? sel.kind + sel.id : 'empty')} className="h-full animate-conv">
+            {activeFile ? <FileViewer path={activeFile} /> : sessionView}
+          </div>
         </div>
       </div>
     </div>

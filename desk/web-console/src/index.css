@@ -22,6 +22,18 @@ body {
 .conv-bg { background:
   radial-gradient(120% 60% at 50% -10%, rgba(37,99,235,0.035), transparent 60%), #FBFBFC; }
 
+/* 切换会话:整段淡入上滑 */
+@keyframes conv-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.animate-conv { animation: conv-in .28s cubic-bezier(.2,.7,.2,1) both; }
+
+/* 每条消息逐条淡入 */
+@keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.animate-msg { animation: msg-in .3s cubic-bezier(.2,.7,.2,1) both; }
+
+/* 思考中三点 */
+@keyframes typing-dot { 0%,80%,100% { transform: translateY(0); opacity: .35; } 40% { transform: translateY(-3px); opacity: 1; } }
+.typing-dot { animation: typing-dot 1.2s ease-in-out infinite; }
+
 /* 细腻滚动条(像原生 Mac 控制台) */
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: rgba(20,21,26,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
