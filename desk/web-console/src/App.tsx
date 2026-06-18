@@ -7,7 +7,7 @@ import {
   BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff,
   Activity, DollarSign, Boxes, Database,
 } from 'lucide-react'
-import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage } from './store'
+import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn } from './store'
 import { cmd } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry, UsageData } from './types'
 
@@ -27,6 +27,7 @@ function useTranscriptMeta() { return useSyncExternalStore(subscribe, getTranscr
 function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
 function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
 function useUsage() { return useSyncExternalStore(subscribe, getUsage, getUsage) }
+function useConn() { return useSyncExternalStore(subscribe, getConn, getConn) }
 
 // ===== 状态 → 圆点 + 文案 =====
 type DotMeta = { text: string; color: string; pulse?: boolean; hollow?: boolean }
@@ -920,12 +921,79 @@ function ProvidersPage() {
   )
 }
 
+const CONN_DOT: Record<string, string> = {
+  online: 'var(--green)', connecting: 'var(--amber)', offline: 'var(--text-faint)',
+  unpaired: 'var(--text-faint)', suspended: 'var(--amber)', rejected: 'var(--red)',
+}
+function ConnSection() {
+  const conn = useConn()
+  const [host, setHost] = useState('')
+  const [editing, setEditing] = useState(false)
+  useEffect(() => { if (!editing && conn) setHost(conn.host) }, [conn?.host, editing])
+  if (!conn) return null
+  const p = conn.pair
+  const pairing = p.phase === 'fetching' || p.phase === 'waiting'
+  const dot = CONN_DOT[conn.state] ?? 'var(--text-faint)'
+  return (
+    <>
+      <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mb-2.5">连接手机</div>
+      <div className="border border-line rounded-[13px] bg-elev mb-6">
+        {/* 服务器地址 */}
+        <div className="flex items-center px-4 py-4 border-b border-line">
+          <div className="flex-1 min-w-0">
+            <div className="text-[13px] font-medium text-ink">中转服务器地址</div>
+            <div className="text-[11.5px] text-dim mt-0.5">手机和电脑连同一台服务器(WS 8090 / HTTP 8080)</div>
+          </div>
+          <input value={host} onFocus={() => setEditing(true)} onChange={(e) => setHost(e.target.value)}
+            onBlur={() => setEditing(false)} placeholder="如 8.159.151.118"
+            className="w-[170px] text-[12.5px] font-mono px-2.5 py-1.5 rounded-lg bg-sunken text-ink outline-none select-text mr-2" />
+          <button onClick={() => { cmd.setHost(host.trim()); setEditing(false) }}
+            className="text-[12.5px] px-3 py-1.5 rounded-lg text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}>保存</button>
+        </div>
+        {/* 连接状态 */}
+        <div className="flex items-center gap-2.5 px-4 py-3.5 border-b border-line">
+          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: dot }} />
+          <span className="text-[12.5px] text-dim flex-1">{conn.text}</span>
+          {conn.paired && conn.account && <span className="font-mono text-[11px] text-faint truncate max-w-[180px]">{conn.account}</span>}
+        </div>
+        {/* 配对区 */}
+        <div className="px-4 py-4">
+          {p.phase === 'waiting' ? (
+            <div className="flex flex-col items-center gap-3 py-2">
+              <div className="text-[11.5px] text-dim">在手机 App「设备」页输入此配对码(10 分钟内有效)</div>
+              <div className="font-mono text-[34px] font-semibold tracking-[0.25em] text-ink" style={{ paddingLeft: '0.25em' }}>{p.code}</div>
+              <button onClick={() => cmd.pairCancel()} className="text-[12.5px] text-dim px-3 py-1.5 rounded-lg border border-strong hover:bg-sunken">取消</button>
+            </div>
+          ) : p.phase === 'fetching' ? (
+            <div className="text-[12.5px] text-dim py-1">正在获取配对码…</div>
+          ) : (
+            <div className="flex items-center gap-2.5">
+              <div className="flex-1 min-w-0">
+                {conn.paired
+                  ? <><div className="text-[13px] font-medium text-ink">已配对</div><div className="text-[11.5px] text-dim mt-0.5">手机已绑定到 {conn.account}</div></>
+                  : <><div className="text-[13px] font-medium text-ink">未配对</div><div className="text-[11.5px] text-dim mt-0.5">点「配对手机」生成配对码,在手机上输入完成绑定</div></>}
+                {p.phase === 'failed' && p.error && <div className="text-[11.5px] mt-1" style={{ color: 'var(--red)' }}>{p.error}</div>}
+              </div>
+              {conn.paired && <button onClick={() => cmd.unpair()} className="text-[12.5px] px-3 py-1.5 rounded-lg hover:bg-sunken" style={{ color: 'var(--red)' }}>退出登录</button>}
+              <button onClick={() => cmd.pairStart()} disabled={pairing}
+                className="text-[12.5px] px-3.5 py-1.5 rounded-lg text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}>
+                {conn.paired ? '重新配对' : '配对手机'}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  )
+}
+
 function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light' | 'dark') => void }) {
   const state = useAgent()
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
       <div className="max-w-[640px] mx-auto px-8 pt-8 pb-12">
         <div className="text-[20px] font-semibold text-ink mb-6">设置</div>
+        <ConnSection />
         <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mb-2.5">外观</div>
         <div className="border border-line rounded-[13px] bg-elev">
           <div className="flex items-center px-4 py-4">

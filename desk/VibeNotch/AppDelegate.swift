@@ -657,6 +657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openWebConsole() {
         WebConsoleWindowController.shared.manager = agentManager
         WebConsoleWindowController.shared.store = store
+        WebConsoleWindowController.shared.relayAgent = relayAgent
         WebConsoleWindowController.shared.show()
     }
 

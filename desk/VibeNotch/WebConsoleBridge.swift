@@ -9,13 +9,16 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     let webView: WKWebView
     private weak var manager: AgentSessionManager?
     private weak var store: SessionStore?
+    private weak var relayAgent: RelayAgent?
+    private let pairing = PairingController()
     private var cancellables = Set<AnyCancellable>()
     private var ready = false
     private var pushScheduled = false
 
-    init(manager: AgentSessionManager, store: SessionStore) {
+    init(manager: AgentSessionManager, store: SessionStore, relayAgent: RelayAgent?) {
         self.manager = manager
         self.store = store
+        self.relayAgent = relayAgent
         let cfg = WKWebViewConfiguration()
         let ucc = WKUserContentController()
         cfg.userContentController = ucc
@@ -34,6 +37,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         manager.$projects.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
         manager.$historyByProject.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
         store.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
+        relayAgent?.$connState.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
+        pairing.$state.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
     }
 
     private func loadFrontend() {
@@ -54,7 +59,17 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
               let action = obj["action"] as? String else { return }
         switch action {
         case "ready":
-            ready = true; pushState()
+            ready = true; pushState(); pushConn()
+        case "setHost":
+            if let host = obj["host"] as? String { AgentServer.host = host; pushConn() }
+        case "pairStart":
+            pairing.start()
+        case "pairCancel":
+            pairing.cancel(); pushConn()
+        case "unpair":
+            AgentCredentials.clear()
+            NotificationCenter.default.post(name: .relayCredentialsChanged, object: nil)
+            pushConn()
         case "openProject":
             let panel = NSOpenPanel()
             panel.canChooseDirectories = true
@@ -189,6 +204,47 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         let manual = (store?.sessions ?? []).compactMap { manualDTO($0) }
         let hidden = meta.hiddenEntries().map { ["key": $0.key, "title": $0.title] }
         pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions, "manual": manual, "hidden": hidden])
+    }
+
+    // MARK: - 连接 / 配对
+
+    private func pushConn() {
+        guard ready else { return }
+        let st = relayAgent?.connState ?? .offline
+        pushJSON(type: "conn", payload: [
+            "host": AgentServer.host,
+            "paired": RelayAgent.isPaired,
+            "account": AgentCredentials.account ?? "",
+            "state": connKey(st),
+            "text": connText(st),
+            "pair": pairDTO(pairing.state),
+        ])
+    }
+    private func connKey(_ s: RelayAgent.ConnState) -> String {
+        switch s {
+        case .unpaired: return "unpaired"; case .connecting: return "connecting"
+        case .online: return "online"; case .suspendedByPhone: return "suspended"
+        case .rejected: return "rejected"; case .offline: return "offline"
+        }
+    }
+    private func connText(_ s: RelayAgent.ConnState) -> String {
+        switch s {
+        case .online:           return "已连接中转服务器"
+        case .connecting:       return "连接中…"
+        case .suspendedByPhone: return "已被手机端断开 —— 在手机「设备」页点「重连」恢复"
+        case .rejected(let c):  return "被服务器拒绝(\(c)),请重新配对"
+        case .unpaired:         return "未配对,离线"
+        case .offline:          return "离线,自动重连中…"
+        }
+    }
+    private func pairDTO(_ s: PairingController.State) -> [String: Any] {
+        switch s {
+        case .idle:               return ["phase": "idle"]
+        case .fetching:           return ["phase": "fetching"]
+        case .waiting(let code):  return ["phase": "waiting", "code": code]
+        case .done(let account):  return ["phase": "done", "account": account]
+        case .failed(let msg):    return ["phase": "failed", "error": msg]
+        }
     }
 
     /// 会话的稳定 key:优先 claude session_id(跨重启/与历史统一),没有则用内部 id。

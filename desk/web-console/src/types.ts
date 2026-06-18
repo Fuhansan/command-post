@@ -44,6 +44,9 @@ export interface Manual {
   lastActivityAt: number
 }
 
+export interface PairState { phase: 'idle' | 'fetching' | 'waiting' | 'done' | 'failed'; code?: string; account?: string; error?: string }
+export interface Conn { host: string; paired: boolean; account: string; state: string; text: string; pair: PairState }
+
 export interface HiddenEntry { key: string; title: string }
 export interface AppState {
   projects: Project[]
