@@ -3,8 +3,8 @@ import type { ReactNode } from 'react'
 import hljs from 'highlight.js'
 import {
   Sparkles, Cpu, Hand, History as HistoryIcon, Folder, FolderOpen, FileText, File as FileIcon,
-  MessageSquare, BarChart3, Plus, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus, Unlock,
-  Lock, AppWindow,
+  MessageSquare, BarChart3, X, ChevronRight, ChevronDown, ArrowUp, FolderPlus, Unlock,
+  Lock, AppWindow, Terminal,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
@@ -40,7 +40,13 @@ function Pill({ text, cls }: { text: string; cls: string }) {
 }
 function StatusPill({ status }: { status: string }) {
   const s = STATUS[status] ?? { label: status, cls: 'text-gray-500 bg-gray-100' }
-  return <Pill text={s.label} cls={s.cls} />
+  const live = status === 'working'
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-[1px] rounded-full text-[10.5px] font-medium ${s.cls}`}>
+      {live && <span className="w-1.5 h-1.5 rounded-full bg-green-500 dot-live" />}
+      {s.label}
+    </span>
+  )
 }
 function IconBox({ tint, children, size = 32 }: { tint: string; children: ReactNode; size?: number }) {
   return (
@@ -134,12 +140,23 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
     const i = m.text.indexOf(':')
     const name = i > 0 ? m.text.slice(0, i) : m.text
     const arg = i > 0 ? m.text.slice(i + 1).trim() : ''
+    const isBash = name === 'Bash'
     return (
       <div className="flex gap-2.5">
-        <div className="w-6 h-6 rounded-md bg-gray-100 text-sub flex items-center justify-center text-[11px] shrink-0">⌘</div>
-        <div className="flex-1 rounded-[10px] border border-line p-2.5">
-          <div className="text-[12px] font-semibold text-ink mb-1.5">{name}</div>
-          {arg && <pre className="text-[12px] font-mono bg-panel rounded-lg p-2.5 whitespace-pre-wrap break-words select-text">{arg}</pre>}
+        <div className="w-6 h-6 rounded-md bg-gray-100 text-sub flex items-center justify-center shrink-0">
+          <Terminal size={12} />
+        </div>
+        <div className="flex-1 rounded-xl border border-line bg-card shadow-card overflow-hidden">
+          <div className="px-3 py-1.5 text-[11.5px] font-semibold text-sub border-b border-line flex items-center gap-1.5">
+            <Terminal size={11} className="text-faint" />{name}
+          </div>
+          {arg && (
+            isBash
+              ? <pre className="text-[12px] font-mono px-3 py-2.5 bg-[#16171B] text-[#E6E7EA] whitespace-pre-wrap break-words select-text leading-relaxed">
+                  <span className="text-[#7C8190] select-none">$ </span>{arg}
+                </pre>
+              : <pre className="text-[12px] font-mono px-3 py-2.5 bg-panel text-ink whitespace-pre-wrap break-words select-text">{arg}</pre>
+          )}
         </div>
       </div>
     )
@@ -168,7 +185,7 @@ function MsgList({ msgs, onRespond }: { msgs: Msg[]; onRespond?: (r: string, c: 
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
   useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }, [ordered.length])
   return (
-    <div ref={ref} className="flex-1 overflow-auto px-4 py-4 space-y-3.5">
+    <div ref={ref} className="flex-1 overflow-auto px-4 py-4 space-y-3.5 conv-bg">
       {ordered.map((m) => <MessageRow key={m.id} m={m} onRespond={onRespond} />)}
     </div>
   )
@@ -294,7 +311,7 @@ function Conversation({ s }: { s: Session }) {
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } }}
           rows={1} placeholder="输入指令…(Enter 发送,Shift+Enter 换行)"
-          className="flex-1 resize-none text-[13px] px-3 py-2 rounded-[10px] bg-panel border border-line focus:outline-none focus:border-brand select-text" />
+          className="flex-1 resize-none text-[13px] px-3 py-2 rounded-xl bg-card border border-line focus:outline-none focus:border-brand focus:ring-4 focus:ring-brand/10 transition-shadow select-text" />
         <button onClick={submit} disabled={!draft.trim()}
           className="w-9 h-9 rounded-[10px] bg-brand text-white disabled:bg-faint flex items-center justify-center transition-colors hover:bg-blue-700">
           <ArrowUp size={16} />
@@ -480,6 +497,7 @@ function SessionList({ p, state, sel, setSel, inProject }: {
   ])
   const history = p.history.filter((h) => !liveIds.has(h.id))
   const empty = consoleSessions.length === 0 && manual.length === 0 && history.length === 0
+  const [histOpen, setHistOpen] = useState(true)
   return (
     <>
       {consoleSessions.map((s) => (
@@ -495,12 +513,21 @@ function SessionList({ p, state, sel, setSel, inProject }: {
           pill={<Pill text="手动" cls="text-orange-600 bg-orange-50" />} sub={m.terminal}
           onClick={() => setSel({ kind: 'manual', id: m.id })} />
       ))}
-      {history.map((h) => (
-        <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
-          tint="#8B909B" icon={<HistoryIcon size={15} />} title={h.label} time={relTime(h.mtime)}
-          pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
-          onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
-      ))}
+      {history.length > 0 && (
+        <div className="pt-1.5 space-y-1.5">
+          <button onClick={() => setHistOpen((o) => !o)}
+            className="w-full flex items-center gap-1 px-1 py-0.5 text-[10.5px] font-semibold text-faint tracking-[0.08em] uppercase hover:text-sub transition-colors">
+            {histOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            历史会话 · {history.length}
+          </button>
+          {histOpen && history.map((h) => (
+            <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
+              tint="#8B909B" icon={<HistoryIcon size={15} />} title={h.label} time={relTime(h.mtime)}
+              pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
+              onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
+          ))}
+        </div>
+      )}
       {empty && <div className="text-[11px] text-faint px-1 pb-1">未打开会话</div>}
     </>
   )
