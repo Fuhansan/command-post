@@ -55,6 +55,13 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         switch action {
         case "ready":
             ready = true; pushState()
+        case "openProject":
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.prompt = "打开项目"
+            if panel.runModal() == .OK, let url = panel.url { manager?.openProject(url.path) }
         case "newSession":
             guard let wd = obj["workdir"] as? String, !wd.isEmpty else { return }
             _ = manager?.newSession(agent: .claude, workdir: wd,

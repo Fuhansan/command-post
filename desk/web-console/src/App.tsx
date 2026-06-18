@@ -1,9 +1,19 @@
 import { useSyncExternalStore, useState, useMemo, useRef, useEffect } from 'react'
-import Editor from '@monaco-editor/react'
+import hljs from 'highlight.js'
 import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
-import { langOf } from './monacoSetup'
 import type { Session, Msg, Manual, History, Project, Entry } from './types'
+
+const HLJS_EXT: Record<string, string> = {
+  ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript', mjs: 'javascript',
+  swift: 'swift', py: 'python', rb: 'ruby', go: 'go', rs: 'rust', java: 'java', kt: 'kotlin',
+  json: 'json', md: 'markdown', html: 'xml', css: 'css', scss: 'scss', sh: 'bash', bash: 'bash',
+  yml: 'yaml', yaml: 'yaml', xml: 'xml', sql: 'sql', c: 'c', cpp: 'cpp', cc: 'cpp', h: 'cpp',
+  hpp: 'cpp', php: 'php', toml: 'ini', ini: 'ini',
+}
+function hljsLang(path: string): string | undefined {
+  return HLJS_EXT[path.split('.').pop()?.toLowerCase() ?? '']
+}
 
 function useAgent() { return useSyncExternalStore(subscribe, getState, getState) }
 function useTranscripts() { return useSyncExternalStore(subscribe, getTranscripts, getTranscripts) }
@@ -217,16 +227,29 @@ function FileViewer({ path }: { path: string }) {
   const files = useFiles()
   const body = files[path]
   useEffect(() => { if (!body) cmd.loadFile(path) }, [path, body])
+  // highlight.js:超过 200KB 不高亮(避免卡顿),直接纯文本。
+  const html = useMemo(() => {
+    if (!body) return null
+    if (body.text.length > 200_000) return null
+    try {
+      const lang = hljsLang(path)
+      return lang && hljs.getLanguage(lang)
+        ? hljs.highlight(body.text, { language: lang, ignoreIllegals: true }).value
+        : hljs.highlightAuto(body.text).value
+    } catch { return null }
+  }, [body, path])
   return (
     <div className="h-full flex flex-col">
       <div className="px-4 py-2 border-b border-line flex items-center gap-2">
         <span className="text-[13px] font-semibold text-ink truncate">{path.split('/').pop()}</span>
         {body?.truncated && <span className="text-[11px] text-amber-600">已截断(仅前 2MB)</span>}
       </div>
-      <div className="flex-1 min-h-0">
-        <Editor height="100%" theme="vs" language={langOf(path)} value={body?.text ?? '加载中…'}
-          options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12, scrollBeyondLastLine: false,
-            wordWrap: 'off', renderWhitespace: 'none', lineNumbersMinChars: 3 }} />
+      <div className="flex-1 min-h-0 overflow-auto">
+        <pre className="text-[12px] font-mono leading-relaxed p-3 m-0 select-text">
+          {html != null
+            ? <code className="hljs !bg-transparent !p-0" dangerouslySetInnerHTML={{ __html: html }} />
+            : <code className="hljs !bg-transparent !p-0">{body?.text ?? '加载中…'}</code>}
+        </pre>
       </div>
     </div>
   )
@@ -299,11 +322,18 @@ function HistoryView({ h, workdir, msgs }: { h: History; workdir: string; msgs: 
 export default function App() {
   const state = useAgent()
   const transcripts = useTranscripts()
+  const [selectedProject, setSelectedProject] = useState<string | null>(null)
   const [sel, setSel] = useState<Sel>(null)
   const [openFiles, setOpenFiles] = useState<string[]>([])
   const [activeFile, setActiveFile] = useState<string | null>(null)
 
-  // 选中历史/手动 → 拉转录(只读浏览)
+  // 默认/保持选中项目有效
+  useEffect(() => {
+    if ((!selectedProject || !state.projects.some((p) => p.workdir === selectedProject)) && state.projects.length)
+      setSelectedProject(state.projects[0].workdir)
+  }, [state.projects, selectedProject])
+
+  // 选中历史/手动 → 拉转录;选中失效则清空
   useEffect(() => {
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
     if (sel?.kind === 'manual' && !transcripts[sel.id]) cmd.loadTranscript('manual', sel.id)
@@ -314,23 +344,10 @@ export default function App() {
   }, [state, sel])
 
   const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd + '/')
-
-  // 文件树根 = 当前选中会话所属项目;默认第一个项目
-  const treeRoot = useMemo(() => {
-    if (sel?.kind === 'session') return state.sessions.find((s) => s.id === sel.id)?.workdir
-    if (sel?.kind === 'history') return sel.workdir
-    if (sel?.kind === 'manual') {
-      const m = state.manual.find((x) => x.id === sel.id)
-      return m ? (state.projects.find((p) => inProject(m.cwd, p.workdir))?.workdir ?? m.cwd) : undefined
-    }
-    return state.projects[0]?.workdir
-  }, [sel, state])
+  const project = state.projects.find((p) => p.workdir === selectedProject) ?? null
 
   const selectSession = (s: Sel) => { setSel(s); setActiveFile(null) }
-  const openFile = (p: string) => {
-    setOpenFiles((prev) => (prev.includes(p) ? prev : [...prev, p]))
-    setActiveFile(p)
-  }
+  const openFile = (p: string) => { setOpenFiles((prev) => (prev.includes(p) ? prev : [...prev, p])); setActiveFile(p) }
   const closeFile = (p: string) => {
     setOpenFiles((prev) => prev.filter((x) => x !== p))
     setActiveFile((cur) => (cur === p ? null : cur))
@@ -346,29 +363,53 @@ export default function App() {
 
   return (
     <div className="flex h-full">
-      {/* 左:项目 + 会话 + 目录 */}
-      <div className="w-[280px] shrink-0 bg-panel border-r border-line flex flex-col">
-        <div className="titlebar-pad px-4 pb-2 text-[11px] font-semibold text-faint tracking-wide">项目</div>
-        <div className="overflow-auto px-2.5 pb-3 space-y-3 max-h-[45%]">
-          {state.projects.length === 0 && (
-            <div className="text-[12px] text-sub px-2 py-4">在电脑 VibeNotch「打开项目」后,这里会出现项目与会话。</div>
-          )}
-          {state.projects.map((p) => (
-            <ProjectGroup key={p.workdir} p={p} state={state} sel={sel} setSel={selectSession} inProject={inProject} />
-          ))}
+      {/* 列1:项目 */}
+      <div className="w-[180px] shrink-0 bg-panel border-r border-line flex flex-col">
+        <div className="titlebar-pad px-3 pb-2 flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-faint tracking-wide">项目</span>
+          <button onClick={() => cmd.openProject()} title="打开项目"
+            className="w-5 h-5 flex items-center justify-center text-sub hover:text-ink rounded">＋</button>
         </div>
-        {treeRoot && (
+        <div className="flex-1 overflow-auto px-2 pb-2 space-y-0.5">
+          {state.projects.length === 0 && <div className="text-[11px] text-sub px-1 py-3">点上方「＋」打开一个项目</div>}
+          {state.projects.map((p) => {
+            const cnt = state.sessions.filter((s) => s.workdir === p.workdir).length
+            const active = p.workdir === selectedProject
+            return (
+              <button key={p.workdir} onClick={() => { setSelectedProject(p.workdir); setSel(null); setActiveFile(null) }}
+                className={`w-full text-left flex items-center gap-2 px-2 py-1.5 rounded-lg border
+                  ${active ? 'bg-selbg border-selborder' : 'border-transparent hover:bg-gray-100'}`}>
+                <span className="text-[13px]">📁</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[12.5px] font-medium text-ink truncate">{p.name}</div>
+                  <div className="text-[10.5px] text-sub">{cnt ? `${cnt} 个会话` : '未打开会话'}</div>
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* 列2:所选项目的会话 + 目录 */}
+      <div className="w-[270px] shrink-0 bg-panel border-r border-line flex flex-col">
+        {project ? (
           <>
-            <div className="px-4 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line">
-              目录 · {treeRoot.split('/').pop()}
+            <div className="titlebar-pad px-3 pb-2 flex items-center justify-between gap-2">
+              <span className="text-[13px] font-semibold text-ink truncate">{project.name}</span>
+              <NewMenu workdir={project.workdir} />
             </div>
+            <div className="overflow-auto px-2.5 pb-2 space-y-1.5" style={{ maxHeight: '48%' }}>
+              <SessionList p={project} state={state} sel={sel} setSel={selectSession} inProject={inProject} />
+            </div>
+            <div className="px-3 pt-2 pb-1.5 text-[11px] font-semibold text-faint tracking-wide border-t border-line">目录</div>
             <div className="flex-1 overflow-auto px-2 pb-3">
-              <FileTree root={treeRoot} openFile={openFile} />
+              <FileTree root={project.workdir} openFile={openFile} />
             </div>
           </>
-        )}
+        ) : <div className="titlebar-pad px-3 text-[12px] text-sub">选择左侧项目</div>}
       </div>
-      {/* 右:tab 栏 + 内容 */}
+
+      {/* 列3:tab + 内容 */}
       <div className="flex-1 min-w-0 flex flex-col">
         <div className="titlebar-pad px-2 pb-1.5 flex items-center gap-1 overflow-x-auto border-b border-line">
           <Tab label="会话" active={activeFile === null} onTap={() => setActiveFile(null)} />
@@ -385,7 +426,8 @@ export default function App() {
   )
 }
 
-function ProjectGroup({ p, state, sel, setSel, inProject }: {
+/// 某项目的会话卡列表(console + 手动 + 可恢复历史,去重)。
+function SessionList({ p, state, sel, setSel, inProject }: {
   p: Project; state: ReturnType<typeof getState>; sel: Sel
   setSel: (s: Sel) => void; inProject: (cwd: string, wd: string) => boolean
 }) {
@@ -397,34 +439,27 @@ function ProjectGroup({ p, state, sel, setSel, inProject }: {
   ])
   const history = p.history.filter((h) => !liveIds.has(h.id))
   const empty = consoleSessions.length === 0 && manual.length === 0 && history.length === 0
-
   return (
-    <div>
-      <div className="flex items-center justify-between px-1 mb-1.5">
-        <div className="text-[12px] font-semibold text-ink truncate">{p.name}</div>
-        <NewMenu workdir={p.workdir} />
-      </div>
-      <div className="space-y-1.5">
-        {consoleSessions.map((s) => (
-          <Card key={s.id} active={sel?.kind === 'session' && sel.id === s.id}
-            tint={s.agent === 'codex' ? '#7C5CD6' : '#2563EB'} glyph={s.agent === 'codex' ? 'Cx' : 'CC'}
-            title={s.title} time={relTime(s.startedAt)} pill={<StatusPill status={s.status} />}
-            onClick={() => setSel({ kind: 'session', id: s.id })} />
-        ))}
-        {manual.map((m) => (
-          <Card key={m.id} active={sel?.kind === 'manual' && sel.id === m.id}
-            tint="#E8810C" glyph="✋" title={m.title} time={relTime(m.lastActivityAt)}
-            pill={<Pill text="手动" cls="text-orange-600 bg-orange-50" />} sub={m.terminal}
-            onClick={() => setSel({ kind: 'manual', id: m.id })} />
-        ))}
-        {history.map((h) => (
-          <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
-            tint="#9CA3AF" glyph="◷" title={h.label} time={relTime(h.mtime)}
-            pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
-            onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
-        ))}
-        {empty && <div className="text-[11px] text-faint px-1 pb-1">未打开会话</div>}
-      </div>
-    </div>
+    <>
+      {consoleSessions.map((s) => (
+        <Card key={s.id} active={sel?.kind === 'session' && sel.id === s.id}
+          tint={s.agent === 'codex' ? '#7C5CD6' : '#2563EB'} glyph={s.agent === 'codex' ? 'Cx' : 'CC'}
+          title={s.title} time={relTime(s.startedAt)} pill={<StatusPill status={s.status} />}
+          onClick={() => setSel({ kind: 'session', id: s.id })} />
+      ))}
+      {manual.map((m) => (
+        <Card key={m.id} active={sel?.kind === 'manual' && sel.id === m.id}
+          tint="#E8810C" glyph="✋" title={m.title} time={relTime(m.lastActivityAt)}
+          pill={<Pill text="手动" cls="text-orange-600 bg-orange-50" />} sub={m.terminal}
+          onClick={() => setSel({ kind: 'manual', id: m.id })} />
+      ))}
+      {history.map((h) => (
+        <Card key={h.id} active={sel?.kind === 'history' && sel.id === h.id}
+          tint="#9CA3AF" glyph="◷" title={h.label} time={relTime(h.mtime)}
+          pill={<Pill text="历史" cls="text-gray-500 bg-gray-100" />} sub="已结束"
+          onClick={() => setSel({ kind: 'history', id: h.id, workdir: p.workdir })} />
+      ))}
+      {empty && <div className="text-[11px] text-faint px-1 pb-1">未打开会话</div>}
+    </>
   )
 }

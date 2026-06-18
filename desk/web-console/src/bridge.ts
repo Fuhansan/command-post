@@ -39,6 +39,7 @@ export function ready() { send({ action: 'ready' }) }
 
 // —— 命令封装 ——
 export const cmd = {
+  openProject: () => send({ action: 'openProject' }),
   newSession: (workdir: string) => send({ action: 'newSession', workdir }),
   continueLast: (workdir: string) => send({ action: 'newSession', workdir, continueLast: true }),
   resume: (workdir: string, id: string) => send({ action: 'newSession', workdir, resume: id }),

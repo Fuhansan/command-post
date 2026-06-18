@@ -2,7 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
-import './monacoSetup'
+import 'highlight.js/styles/github.css'
 import { ready } from './bridge'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
