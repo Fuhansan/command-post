@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: #1F2937;
+  background: #FFFFFF;
+  user-select: none;
+}
+/* 顶部留出标题栏高度(统一标题栏,红绿灯在上面) */
+.titlebar-pad { padding-top: 28px; }

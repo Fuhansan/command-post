@@ -584,6 +584,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 action: #selector(openAgentConsole), keyEquivalent: "")
             return mi
         }())
+        // Web 控制台(WKWebView + React)
+        menu.addItem({
+            let mi = NSMenuItem(title: "Agent 控制台(Web)",
+                                action: #selector(openWebConsole), keyEquivalent: "")
+            return mi
+        }())
 
         menu.addItem(.separator())
 
@@ -646,6 +652,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openAgentConsole() {
         AgentConsoleWindowController.shared.show()
+    }
+
+    @objc private func openWebConsole() {
+        WebConsoleWindowController.shared.manager = agentManager
+        WebConsoleWindowController.shared.store = store
+        WebConsoleWindowController.shared.show()
     }
 
     @objc private func openSettings() {

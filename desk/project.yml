@@ -26,6 +26,10 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: VibeNotch
+      # Web 控制台前端产物(React+Tailwind 构建)→ 作为文件夹引用打进 Resources/dist
+      - path: web-console/dist
+        type: folder
+        buildPhase: resources
     info:
       path: VibeNotch/Info.plist
       properties:
