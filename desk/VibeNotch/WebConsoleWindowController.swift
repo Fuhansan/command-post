@@ -27,7 +27,7 @@ final class WebConsoleWindowController: NSObject, NSWindowDelegate {
         w.titlebarAppearsTransparent = true
         w.titleVisibility = .hidden
         w.isReleasedWhenClosed = false
-        w.backgroundColor = NSColor(calibratedWhite: 0.965, alpha: 1)   // 与侧栏一致,顶部留白看着自然
+        w.backgroundColor = NSColor(calibratedWhite: 1.0, alpha: 1)   // 与网页顶栏同色,标题栏条连成一条
         if let content = w.contentView {
             // 顶部留 28pt 给原生标题栏(可拖动窗口);webview 从下方开始,不盖住拖拽区。
             let inset: CGFloat = 28

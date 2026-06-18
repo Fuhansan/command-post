@@ -77,9 +77,10 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "theme":
             // 跟随网页主题给原生标题栏条着色,避免深色模式露出白边。
             let dark = obj["dark"] as? Bool ?? false
+            // 与网页顶栏(--bg-elev)同色,让原生标题栏条和顶栏连成一条。
             webView.window?.backgroundColor = dark
-                ? NSColor(calibratedWhite: 0.082, alpha: 1)
-                : NSColor(calibratedWhite: 0.965, alpha: 1)
+                ? NSColor(calibratedWhite: 0.114, alpha: 1)
+                : NSColor(calibratedWhite: 1.0, alpha: 1)
         case "raiseWindow":
             if let id = obj["id"] as? String { raiseWindow(manualId: id) }
         case "listDir":
