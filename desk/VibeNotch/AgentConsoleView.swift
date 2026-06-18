@@ -161,28 +161,47 @@ struct AgentConsoleRootView: View {
         .background(CT.panel)
     }
 
-    /// 会话卡(console):标题 + 状态点;选中高亮。
+    /// 会话卡外壳:按类型给「框色 + 标签」—— 一眼区分 Claude / Codex / 手动。
+    private func cardShell<S: View>(selected: Bool, tint: Color, tag: String, tagIcon: String,
+                                    title: String, @ViewBuilder status: () -> S) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(CT.text).lineLimit(1)
+                Spacer(minLength: 4)
+                HStack(spacing: 3) {
+                    Image(systemName: tagIcon).font(.system(size: 8, weight: .bold))
+                    Text(tag).font(.system(size: 10, weight: .semibold))
+                }
+                .foregroundStyle(tint)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(tint.opacity(0.14)).clipShape(Capsule())
+            }
+            status()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10).padding(.vertical, 9)
+        .background(tint.opacity(selected ? 0.14 : 0.05))
+        .overlay(RoundedRectangle(cornerRadius: 9)
+            .stroke(tint.opacity(selected ? 0.65 : 0.22), lineWidth: selected ? 1.5 : 1))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .contentShape(Rectangle())
+    }
+
+    /// 会话卡(console):Claude=蓝 / Codex=靛。
     private func sessionCard(_ s: AgentSession) -> some View {
         let sel = selectedSessionId == s.id
         let needsResp = !s.pending.isEmpty
             || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+        let tint: Color = s.agent == .codex ? CT.indigo : CT.accent
+        let tag = s.agent == .codex ? "Codex" : "Claude"
         return Button { selectedSessionId = s.id } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(s.title).font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(CT.text).lineLimit(1)
+            cardShell(selected: sel, tint: tint, tag: tag, tagIcon: "sparkle", title: s.title) {
                 HStack(spacing: 5) {
                     Circle().fill(statusColor(s.status)).frame(width: 6, height: 6)
                     Text(statusText(s.status)).font(.system(size: 11)).foregroundStyle(CT.sub)
                     if needsResp { Text("· 待响应").font(.system(size: 11)).foregroundStyle(.orange) }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10).padding(.vertical, 9)
-            .background(sel ? CT.sel : Color.clear)
-            .overlay(RoundedRectangle(cornerRadius: 8)
-                .stroke(sel ? CT.accent.opacity(0.35) : Color.clear, lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -193,25 +212,17 @@ struct AgentConsoleRootView: View {
         }
     }
 
-    /// 手动会话卡:打「手动」标签 —— 你在 IDE/终端里自己跑的,选中后只读 + 可唤起窗口。
+    /// 手动会话卡:橙色框 +「手动」标签 —— 你在 IDE/终端里自己跑的,只读 + 可唤起窗口。
     private func manualCard(_ e: SessionEntry) -> some View {
         let sel = selectedSessionId == e.id
         return Button { selectedSessionId = e.id } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(manualTitle(e)).font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(CT.text).lineLimit(1)
+            cardShell(selected: sel, tint: CT.orange, tag: "手动", tagIcon: "hand.raised.fill",
+                      title: manualTitle(e)) {
                 HStack(spacing: 5) {
-                    Image(systemName: "hand.raised.fill").font(.system(size: 9)).foregroundStyle(.orange)
-                    Text("手动 · \(e.terminal.displayName)").font(.system(size: 11)).foregroundStyle(CT.sub)
+                    Image(systemName: "desktopcomputer").font(.system(size: 9)).foregroundStyle(CT.sub)
+                    Text(e.terminal.displayName).font(.system(size: 11)).foregroundStyle(CT.sub)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10).padding(.vertical, 9)
-            .background(sel ? CT.sel : Color.clear)
-            .overlay(RoundedRectangle(cornerRadius: 8)
-                .stroke(sel ? CT.accent.opacity(0.35) : Color.clear, lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
@@ -615,4 +626,6 @@ private enum CT {
     static let userBubble = hex(0xEAF1FE)  // 用户气泡
     static let toolBg   = hex(0xF3F4F6)   // 代码/工具底
     static let success  = hex(0x16A34A)   // 绿
+    static let indigo   = hex(0x7C5CD6)   // Codex 会话类型色
+    static let orange   = hex(0xE8810C)   // 手动会话类型色
 }
