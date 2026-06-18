@@ -3,7 +3,7 @@ import hljs from 'highlight.js'
 import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
-  BarChart3, PanelsTopLeft, Search, Copy, FileText, Check, Server, MoreHorizontal,
+  BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage } from './store'
 import { cmd } from './bridge'
@@ -494,7 +494,7 @@ function NewBtn({ workdir }: { workdir: string }) {
 }
 
 // ===== 工作区 =====
-function ConsolePage({ query }: { query: string }) {
+function ConsolePage() {
   const state = useAgent()
   const transcripts = useTranscripts()
   const tmeta = useTranscriptMeta()
@@ -543,11 +543,9 @@ function ConsolePage({ query }: { query: string }) {
   const counts = { all: consoleSessions.length + manualList.length + historyList.length, running: consoleSessions.filter(isRunning.session).length + manualList.filter(isRunning.manual).length, done: 0 }
   counts.done = counts.all - counts.running
 
-  const q = query.trim().toLowerCase()
-  const match = (t: string) => !q || t.toLowerCase().includes(q)
-  const fSessions = consoleSessions.filter((s) => match(s.title) && (filter === 'all' || (filter === 'running' ? isRunning.session(s) : !isRunning.session(s))))
-  const fManual = manualList.filter((m) => match(m.title) && (filter === 'all' || (filter === 'running' ? isRunning.manual(m) : !isRunning.manual(m))))
-  const fHistory = historyList.filter((h) => match(h.label) && filter !== 'running')
+  const fSessions = consoleSessions.filter((s) => filter === 'all' || (filter === 'running' ? isRunning.session(s) : !isRunning.session(s)))
+  const fManual = manualList.filter((m) => filter === 'all' || (filter === 'running' ? isRunning.manual(m) : !isRunning.manual(m)))
+  const fHistory = historyList.filter(() => filter !== 'running')
 
   const pick = (s: Sel) => { setSel(s); setOpenFile(null) }
 
@@ -794,17 +792,10 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
 }
 
 // ===== 顶栏 =====
-function TitleBar({ query, setQuery, theme, toggleTheme }: { query: string; setQuery: (s: string) => void; theme: string; toggleTheme: () => void }) {
+function TitleBar({ theme, toggleTheme }: { theme: string; toggleTheme: () => void }) {
   return (
     <div className="flex-none h-10 flex items-center gap-3 px-3.5 border-b border-line bg-elev">
-      <div className="flex-1 flex justify-center">
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg w-[280px] max-w-full" style={{ background: 'var(--bg-sunken)' }}>
-          <Search size={13} className="text-faint shrink-0" />
-          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索会话…"
-            className="flex-1 bg-transparent outline-none text-[12px] text-ink select-text placeholder:text-faint min-w-0" />
-          <span className="font-mono text-[10.5px] px-1.5 py-px rounded border border-line text-faint">⌘K</span>
-        </div>
-      </div>
+      <div className="flex-1" />
       <div className="flex items-center gap-1.5 shrink-0">
         <button title="切换主题" onClick={toggleTheme} className="w-[30px] h-[30px] rounded-lg flex items-center justify-center text-dim hover:text-ink hover:bg-sunken transition-colors">
           {theme === 'dark' ? <Sun size={16} /> : <Moon size={15} />}
@@ -843,7 +834,6 @@ function NavRail({ page, setPage }: { page: string; setPage: (p: string) => void
 
 export default function App() {
   const [page, setPage] = useState('console')
-  const [query, setQuery] = useState('')
   const [theme, setThemeState] = useState<'light' | 'dark'>(() => (localStorage.getItem('theme') as 'light' | 'dark') || 'light')
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -854,12 +844,12 @@ export default function App() {
   const toggleTheme = () => setThemeState((t) => (t === 'dark' ? 'light' : 'dark'))
   return (
     <div className="flex flex-col h-full">
-      <TitleBar query={query} setQuery={setQuery} theme={theme} toggleTheme={toggleTheme} />
+      <TitleBar theme={theme} toggleTheme={toggleTheme} />
       <div className="flex flex-1 min-h-0">
         <NavRail page={page} setPage={setPage} />
         {/* 控制台常驻不卸载,切页面回来仍记得选中的项目/文件/树展开 */}
         <div className="flex flex-1 min-w-0" style={{ display: page === 'console' ? 'flex' : 'none' }}>
-          <ConsolePage query={query} />
+          <ConsolePage />
         </div>
         {page === 'usage' && <UsagePage />}
         {page === 'providers' && <ProvidersPage />}
