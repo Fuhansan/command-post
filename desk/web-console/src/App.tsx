@@ -229,23 +229,24 @@ function WorkHeader({ title, meta, model, sub, right }: { title: string; meta?: 
   )
 }
 
-// claude-opus-4-8 → "Opus 4.8";opus → "Opus"
+// 可切换的模型(alias 给 --model;label 是带版本的展示名)
+const MODELS: { alias: 'opus' | 'sonnet' | 'haiku'; label: string }[] = [
+  { alias: 'opus', label: 'Opus 4.8' }, { alias: 'sonnet', label: 'Sonnet 4.6' }, { alias: 'haiku', label: 'Haiku 4.5' },
+]
 function modelFamily(m?: string): 'opus' | 'sonnet' | 'haiku' | null {
   if (!m) return null
   const s = m.toLowerCase()
   return s.includes('opus') ? 'opus' : s.includes('sonnet') ? 'sonnet' : s.includes('haiku') ? 'haiku' : null
 }
+// claude-opus-4-8 → "Opus 4.8";别名 sonnet → 用 MODELS 里的带版本名
 function modelLabel(m?: string): string {
   if (!m) return '默认'
   const fam = modelFamily(m)
   if (!fam) return m
-  const name = fam.charAt(0).toUpperCase() + fam.slice(1)
   const ver = m.toLowerCase().match(/(\d+)-(\d+)/)   // claude-opus-4-8 → 4-8
-  return ver ? `${name} ${ver[1]}.${ver[2]}` : name
+  if (ver) return `${fam.charAt(0).toUpperCase() + fam.slice(1)} ${ver[1]}.${ver[2]}`
+  return MODELS.find((x) => x.alias === fam)?.label ?? (fam.charAt(0).toUpperCase() + fam.slice(1))
 }
-const MODELS: { alias: string; label: string }[] = [
-  { alias: 'opus', label: 'Opus' }, { alias: 'sonnet', label: 'Sonnet' }, { alias: 'haiku', label: 'Haiku' },
-]
 
 // ===== 输入框 =====
 function Composer({ sid, model, onSend }: { sid: string; model?: string; onSend: (t: string) => void }) {
@@ -281,7 +282,7 @@ function Composer({ sid, model, onSend }: { sid: string; model?: string; onSend:
                     <button key={m.alias} onClick={() => { setMenu(false); if (!on) cmd.switchModel(sid, m.alias) }}
                       className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] text-ink hover:bg-sunken"
                       style={on ? { background: 'var(--bg-sunken)' } : undefined}>
-                      <span className="font-mono flex-1 text-left">{on ? cur : m.label}</span>
+                      <span className="font-mono flex-1 text-left">{m.label}</span>
                       {on && <Check size={14} style={{ color: 'var(--accent)' }} />}
                     </button>
                   )
