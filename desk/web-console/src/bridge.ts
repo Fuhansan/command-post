@@ -18,7 +18,8 @@ function installReceiver() {
           setState(msg.payload)
           break
         case 'transcript':
-          setTranscript(msg.payload.id, msg.payload.messages)
+          setTranscript(msg.payload.id, msg.payload.messages,
+            { earliest: msg.payload.earliest ?? 0, hasEarlier: !!msg.payload.hasEarlier })
           break
         case 'dirList':
           setDir(msg.payload.path, msg.payload.entries)
@@ -48,8 +49,9 @@ export const cmd = {
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
   raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),
-  loadTranscript: (kind: 'manual' | 'history', id: string, workdir?: string) =>
-    send({ action: 'loadTranscript', kind, id, workdir }),
+  // beforeByte 省略=取末尾一窗;传值=加载该字节偏移之前的一窗(更早消息)。
+  loadTranscript: (kind: 'manual' | 'history', id: string, workdir?: string, beforeByte?: number) =>
+    send({ action: 'loadTranscript', kind, id, workdir, beforeByte }),
   listDir: (path: string) => send({ action: 'listDir', path }),
   loadFile: (path: string) => send({ action: 'loadFile', path }),
   setTheme: (dark: boolean) => send({ action: 'theme', dark }),

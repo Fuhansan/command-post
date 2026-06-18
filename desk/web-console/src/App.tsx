@@ -1,11 +1,11 @@
-import { useSyncExternalStore, useState, useMemo, useRef, useEffect } from 'react'
+import { useSyncExternalStore, useState, useMemo, useRef, useEffect, useLayoutEffect } from 'react'
 import hljs from 'highlight.js'
 import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
   BarChart3, PanelsTopLeft, Search, Copy, FileText, Check, Server, MoreHorizontal,
 } from 'lucide-react'
-import { subscribe, getState, getTranscripts, getDirs, getFiles } from './store'
+import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles } from './store'
 import { cmd } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry } from './types'
 
@@ -21,6 +21,7 @@ const hljsLang = (p: string) => HLJS_EXT[fileExt(p)]
 
 function useAgent() { return useSyncExternalStore(subscribe, getState, getState) }
 function useTranscripts() { return useSyncExternalStore(subscribe, getTranscripts, getTranscripts) }
+function useTranscriptMeta() { return useSyncExternalStore(subscribe, getTranscriptMeta, getTranscriptMeta) }
 function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
 function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
 
@@ -156,14 +157,39 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
   return null
 }
 
-function MsgList({ msgs, onRespond, working }: { msgs: Msg[]; onRespond?: (r: string, c: string[]) => void; working?: boolean }) {
+function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadEarlier }: {
+  msgs: Msg[]; onRespond?: (r: string, c: string[]) => void; working?: boolean
+  animate?: boolean; hasEarlier?: boolean; onLoadEarlier?: () => void
+}) {
   const ref = useRef<HTMLDivElement>(null)
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
-  useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }, [ordered.length, working])
+  const prevFirst = useRef<number | undefined>(undefined)
+  const prevH = useRef(0)
+  const [loading, setLoading] = useState(false)
+  // 末尾新消息/首次:滚到底;顶部插入「更早」消息:保持当前可视位置不跳。
+  useLayoutEffect(() => {
+    const el = ref.current; if (!el) return
+    const firstOrd = ordered[0]?.ord
+    if (prevFirst.current !== undefined && firstOrd !== undefined && firstOrd < prevFirst.current)
+      el.scrollTop = el.scrollTop + (el.scrollHeight - prevH.current)
+    else
+      el.scrollTop = el.scrollHeight
+    prevFirst.current = firstOrd
+    prevH.current = el.scrollHeight
+  }, [ordered, working])
+  useEffect(() => { setLoading(false) }, [ordered.length, hasEarlier])
   return (
     <div ref={ref} className="flex-1 overflow-y-auto overflow-x-hidden">
       <div className="max-w-[780px] mx-auto px-7 py-5 space-y-4">
-        {ordered.map((m) => <div key={m.id} className="animate-msg"><MessageRow m={m} onRespond={onRespond} /></div>)}
+        {hasEarlier && (
+          <div className="flex justify-center pb-1">
+            <button onClick={() => { if (onLoadEarlier && !loading) { setLoading(true); onLoadEarlier() } }} disabled={loading}
+              className="px-3.5 py-1.5 rounded-lg text-[12px] text-dim border border-line hover:bg-sunken disabled:opacity-60 transition-colors">
+              {loading ? '加载中…' : '加载更早'}
+            </button>
+          </div>
+        )}
+        {ordered.map((m) => <div key={m.id} className={animate ? 'animate-msg' : undefined}><MessageRow m={m} onRespond={onRespond} /></div>)}
         {working && (
           <div className="flex gap-2.5 animate-msg">
             <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
@@ -246,23 +272,25 @@ function Conversation({ s }: { s: Session }) {
   )
 }
 
-function ManualView({ m, msgs }: { m: Manual; msgs: Msg[] }) {
+function ManualView({ m, msgs, hasEarlier, onLoadEarlier }: { m: Manual; msgs: Msg[]; hasEarlier?: boolean; onLoadEarlier?: () => void }) {
   return (
     <div className="flex flex-col h-full bg-bg">
       <WorkHeader title={m.title} meta={manualMeta(m.state)} sub={m.cwd}
         right={<button onClick={() => cmd.raiseWindow(m.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {m.terminal}</button>} />
-      <MsgList msgs={msgs} />
+      <MsgList msgs={msgs} animate={false} hasEarlier={hasEarlier} onLoadEarlier={onLoadEarlier} />
       <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {m.terminal} 里输入,这里只读。</div>
     </div>
   )
 }
 
-function HistoryView({ h, msgs, onResume, resuming }: { h: History; msgs: Msg[]; onResume: () => void; resuming: boolean }) {
+function HistoryView({ h, msgs, onResume, resuming, hasEarlier, onLoadEarlier }: {
+  h: History; msgs: Msg[]; onResume: () => void; resuming: boolean; hasEarlier?: boolean; onLoadEarlier?: () => void
+}) {
   return (
     <div className="flex flex-col h-full bg-bg">
       <WorkHeader title={h.label} meta={{ text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }}
         right={<button onClick={onResume} disabled={resuming} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={resuming ? 'animate-spin' : ''} />{resuming ? '恢复中…' : 'Resume'}</button>} />
-      <MsgList msgs={msgs} />
+      <MsgList msgs={msgs} animate={false} hasEarlier={hasEarlier} onLoadEarlier={onLoadEarlier} />
     </div>
   )
 }
@@ -427,6 +455,7 @@ function NewBtn({ workdir }: { workdir: string }) {
 function ConsolePage({ query }: { query: string }) {
   const state = useAgent()
   const transcripts = useTranscripts()
+  const tmeta = useTranscriptMeta()
   const [selectedProject, setSelectedProject] = useState<string | null>(null)
   const [sel, setSel] = useState<Sel>(null)
   const [openFile, setOpenFile] = useState<string | null>(null)
@@ -483,11 +512,19 @@ function ConsolePage({ query }: { query: string }) {
       </div>
     )
     if (sel.kind === 'session') { const s = state.sessions.find((x) => x.id === sel.id); return s ? <Conversation s={s} /> : null }
-    if (sel.kind === 'manual') { const m = state.manual.find((x) => x.id === sel.id); return m ? <ManualView m={m} msgs={transcripts[m.id] ?? []} /> : null }
+    if (sel.kind === 'manual') {
+      const m = state.manual.find((x) => x.id === sel.id); if (!m) return null
+      const mm = tmeta[m.id]
+      return <ManualView m={m} msgs={transcripts[m.id] ?? []} hasEarlier={mm?.hasEarlier}
+        onLoadEarlier={() => mm && cmd.loadTranscript('manual', m.id, undefined, mm.earliest)} />
+    }
     const h = state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id)
     const wd = (sel as any).workdir
-    return h ? <HistoryView h={h} msgs={transcripts[h.id] ?? []} onResume={() => doResume(wd, h.id)} resuming={pendingResume === h.id} /> : null
-  }, [sel, state, transcripts, pendingResume])
+    if (!h) return null
+    const hm = tmeta[h.id]
+    return <HistoryView h={h} msgs={transcripts[h.id] ?? []} onResume={() => doResume(wd, h.id)} resuming={pendingResume === h.id}
+      hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', h.id, wd, hm.earliest)} />
+  }, [sel, state, transcripts, tmeta, pendingResume])
 
   const FILTERS: { k: typeof filter; label: string }[] = [{ k: 'all', label: '全部' }, { k: 'running', label: '进行中' }, { k: 'done', label: '已完成' }]
   const [histOpen, setHistOpen] = useState(true)

@@ -93,7 +93,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "loadFile":
             if let path = obj["path"] as? String { loadFile(path: path) }
         case "loadTranscript":
-            // 历史/手动会话只读浏览:解析转录,推回消息。
+            // 历史/手动会话只读浏览:分窗懒加载(末尾一窗 / beforeByte 之前一窗)。
             guard let id = obj["id"] as? String, let kind = obj["kind"] as? String else { return }
             let path: String?
             if kind == "history", let wd = obj["workdir"] as? String {
@@ -101,7 +101,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             } else {
                 path = store?.sessions.first { $0.id == id }?.transcriptPath
             }
-            loadTranscript(id: id, path: path)
+            let before = (obj["beforeByte"] as? NSNumber)?.uint64Value
+            loadTranscript(id: id, path: path, beforeByte: before)
         default:
             break
         }
@@ -130,14 +131,18 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         }
     }
 
-    private func loadTranscript(id: String, path: String?) {
+    private func loadTranscript(id: String, path: String?, beforeByte: UInt64?) {
         guard let path else { return }
         Task.detached(priority: .userInitiated) { [weak self] in
-            let items = AgentSessionManager.parseTranscriptFile(path: path)
-            let msgs = items.enumerated().map { i, t -> [String: Any] in
-                ["id": "h\(i)", "role": t.role, "kind": t.kind.rawValue, "text": t.text, "ord": i]
+            let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: beforeByte)
+            let msgs = win.messages.map { m -> [String: Any] in
+                ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
             }
-            await MainActor.run { self?.pushJSON(type: "transcript", payload: ["id": id, "messages": msgs]) }
+            await MainActor.run {
+                self?.pushJSON(type: "transcript", payload: [
+                    "id": id, "messages": msgs, "earliest": win.earliest, "hasEarlier": win.hasEarlier,
+                ])
+            }
         }
     }
 

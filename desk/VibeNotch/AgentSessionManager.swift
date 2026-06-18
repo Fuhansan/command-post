@@ -208,36 +208,78 @@ final class AgentSessionManager: ObservableObject {
         -> [(role: String, kind: AgentMessage.Kind, text: String)] {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
         var out: [(String, AgentMessage.Kind, String)] = []
-        for line in content.split(separator: "\n") {
-            guard let d = line.data(using: .utf8),
-                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let type = o["type"] as? String,
-                  let msg = o["message"] as? [String: Any] else { continue }
-            if type == "user" {
-                if let s = msg["content"] as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
-                    out.append(("user", .text, s))
-                } else if let blocks = msg["content"] as? [[String: Any]] {
-                    for b in blocks where (b["type"] as? String) == "text" {
-                        if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)) }
-                    }
+        for line in content.split(separator: "\n") { out.append(contentsOf: parseTranscriptLine(String(line))) }
+        return out
+    }
+
+    /// 解析转录中的一行(jsonl),抽出可显示的消息;一行的多个 block 可产生多条。
+    nonisolated static func parseTranscriptLine(_ line: String)
+        -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        guard let d = line.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let type = o["type"] as? String,
+              let msg = o["message"] as? [String: Any] else { return [] }
+        var out: [(String, AgentMessage.Kind, String)] = []
+        if type == "user" {
+            if let s = msg["content"] as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
+                out.append(("user", .text, s))
+            } else if let blocks = msg["content"] as? [[String: Any]] {
+                for b in blocks where (b["type"] as? String) == "text" {
+                    if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)) }
                 }
-            } else if type == "assistant", let blocks = msg["content"] as? [[String: Any]] {
-                for b in blocks {
-                    switch b["type"] as? String {
-                    case "text":
-                        if let t = b["text"] as? String, !t.isEmpty { out.append(("assistant", .text, t)) }
-                    case "tool_use":
-                        let name = b["name"] as? String ?? "?"
-                        let input = b["input"] as? [String: Any] ?? [:]
-                        let sm = (input["command"] ?? input["file_path"] ?? input["path"]
-                                  ?? input["pattern"] ?? input["url"]) as? String ?? ""
-                        out.append(("assistant", .tool, "\(name): \(sm)"))
-                    default: break
-                    }
+            }
+        } else if type == "assistant", let blocks = msg["content"] as? [[String: Any]] {
+            for b in blocks {
+                switch b["type"] as? String {
+                case "text":
+                    if let t = b["text"] as? String, !t.isEmpty { out.append(("assistant", .text, t)) }
+                case "tool_use":
+                    let name = b["name"] as? String ?? "?"
+                    let input = b["input"] as? [String: Any] ?? [:]
+                    let sm = (input["command"] ?? input["file_path"] ?? input["path"]
+                              ?? input["pattern"] ?? input["url"]) as? String ?? ""
+                    out.append(("assistant", .tool, "\(name): \(sm)"))
+                default: break
                 }
             }
         }
         return out
+    }
+
+    /// 只解析文件「尾部一窗」(默认末尾 256KB),供历史/手动会话懒加载,避免读+推+渲染整份大转录。
+    /// endByte 省略 = 到文件末尾;传值 = 解析该字节偏移之前的一窗(「加载更早」)。
+    /// ord = 该消息所在行的起始字节偏移(全局单调,跨窗稳定排序/去重);earliest = 本窗最早一条消息所在行的偏移。
+    nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024)
+        -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int)], earliest: Int, hasEarlier: Bool) {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return ([], 0, false) }
+        defer { try? fh.close() }
+        let fileSize = (try? fh.seekToEnd()) ?? 0
+        let end = min(endByte ?? fileSize, fileSize)
+        let start = end > UInt64(windowBytes) ? end - UInt64(windowBytes) : 0
+        try? fh.seek(toOffset: start)
+        let bytes = [UInt8]((try? fh.read(upToCount: Int(end - start))) ?? Data())
+        // start>0:丢弃可能被切断的首行残片(从第一个换行后开始)。
+        var i = 0
+        if start > 0 { i = (bytes.firstIndex(of: 0x0A)).map { $0 + 1 } ?? bytes.count }
+        var out: [(String, AgentMessage.Kind, String, Int)] = []
+        var firstKept: Int? = nil
+        while i < bytes.count {
+            var j = i
+            while j < bytes.count && bytes[j] != 0x0A { j += 1 }
+            if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8) {
+                let lineByteStart = Int(start) + i
+                let msgs = parseTranscriptLine(lineStr)
+                if !msgs.isEmpty {
+                    if firstKept == nil { firstKept = lineByteStart }
+                    for (k, m) in msgs.enumerated() {
+                        out.append((m.role, m.kind, m.text, lineByteStart * 16 + min(k, 15)))
+                    }
+                }
+            }
+            i = j + 1
+        }
+        let earliest = firstKept ?? Int(start)
+        return (out, earliest, earliest > 0)
     }
 
     /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。

@@ -1,7 +1,10 @@
 import type { AppState, Msg, Entry, FileBody } from './types'
 
+export interface TranscriptMeta { earliest: number; hasEarlier: boolean }
+
 let state: AppState = { projects: [], sessions: [], manual: [] }
 let transcripts: Record<string, Msg[]> = {}
+let transcriptMeta: Record<string, TranscriptMeta> = {}
 let dirs: Record<string, Entry[]> = {}
 let files: Record<string, FileBody> = {}
 const listeners = new Set<() => void>()
@@ -13,8 +16,15 @@ export function setState(s: AppState) {
   notify()
 }
 export function getTranscripts() { return transcripts }
-export function setTranscript(id: string, messages: Msg[]) {
-  transcripts = { ...transcripts, [id]: messages }; notify()
+export function getTranscriptMeta() { return transcriptMeta }
+// 合并:历史/手动转录分窗加载,「加载更早」时把旧消息并进来(按 id 去重)。
+export function setTranscript(id: string, messages: Msg[], meta?: TranscriptMeta) {
+  const prev = transcripts[id] ?? []
+  const seen = new Set(prev.map((m) => m.id))
+  const merged = prev.concat(messages.filter((m) => !seen.has(m.id)))
+  transcripts = { ...transcripts, [id]: merged }
+  if (meta) transcriptMeta = { ...transcriptMeta, [id]: meta }
+  notify()
 }
 export function getDirs() { return dirs }
 export function setDir(path: string, entries: Entry[]) { dirs = { ...dirs, [path]: entries }; notify() }
