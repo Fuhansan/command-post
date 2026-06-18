@@ -15,6 +15,7 @@ export interface Pending { id: string; title: string; detail?: string; options: 
 
 export interface Session {
   id: string
+  key?: string           // 稳定 key(claude session_id),供重命名/隐藏
   title: string
   workdir: string
   agent: string          // claude | codex
@@ -29,11 +30,12 @@ export interface Session {
 export interface Entry { name: string; path: string; isDir: boolean }
 export interface FileBody { text: string; truncated: boolean }
 
-export interface History { id: string; label: string; mtime: number }
+export interface History { id: string; key?: string; label: string; mtime: number }
 export interface Project { workdir: string; name: string; history: History[] }
 
 export interface Manual {
   id: string
+  key?: string
   title: string
   cwd: string
   terminal: string
@@ -42,10 +44,12 @@ export interface Manual {
   lastActivityAt: number
 }
 
+export interface HiddenEntry { key: string; title: string }
 export interface AppState {
   projects: Project[]
   sessions: Session[]
   manual: Manual[]
+  hidden: HiddenEntry[]
 }
 
 export interface UsageTotals {

@@ -73,6 +73,14 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             if let sid = obj["sid"] as? String, let model = obj["model"] as? String {
                 manager?.switchModel(sid, to: model)
             }
+        case "renameSession":
+            if let key = obj["key"] as? String, let title = obj["title"] as? String {
+                SessionMetaStore.shared.rename(key, to: title); pushState()
+            }
+        case "hideSession":
+            if let key = obj["key"] as? String { SessionMetaStore.shared.hide(key); pushState() }
+        case "unhideSession":
+            if let key = obj["key"] as? String { SessionMetaStore.shared.unhide(key); pushState() }
         case "send":
             if let sid = obj["sid"] as? String, let text = obj["text"] as? String { manager?.send(sid, text: text) }
         case "respond":
@@ -167,23 +175,35 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     private func pushState() {
         guard ready, let manager else { return }
+        let meta = SessionMetaStore.shared
         let projects = manager.projects.map { proj -> [String: Any] in
             manager.loadHistoryList(for: proj)   // 懒加载历史(已缓存则跳过)
-            let hist = (manager.historyByProject[proj] ?? []).map {
-                ["id": $0.id, "label": $0.label, "mtime": $0.mtime.timeIntervalSince1970 * 1000]
+            let hist = (manager.historyByProject[proj] ?? []).compactMap { h -> [String: Any]? in
+                if meta.isHidden(h.id) { return nil }
+                return ["id": h.id, "key": h.id, "label": meta.title(for: h.id) ?? h.label,
+                        "mtime": h.mtime.timeIntervalSince1970 * 1000]
             }
             return ["workdir": proj, "name": (proj as NSString).lastPathComponent, "history": hist]
         }
-        let sessions = manager.sessions.map { sessionDTO($0) }
-        let manual = (store?.sessions ?? []).map { manualDTO($0) }
-        pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions, "manual": manual])
+        let sessions = manager.sessions.compactMap { sessionDTO($0) }
+        let manual = (store?.sessions ?? []).compactMap { manualDTO($0) }
+        let hidden = meta.hiddenEntries().map { ["key": $0.key, "title": $0.title] }
+        pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions, "manual": manual, "hidden": hidden])
     }
 
-    private func manualDTO(_ e: SessionEntry) -> [String: Any] {
-        let title = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
+    /// 会话的稳定 key:优先 claude session_id(跨重启/与历史统一),没有则用内部 id。
+    private func sessionKey(_ s: AgentSession) -> String {
+        if let a = s.agentSessionId, !a.isEmpty { return a }
+        return s.id
+    }
+
+    private func manualDTO(_ e: SessionEntry) -> [String: Any]? {
+        let meta = SessionMetaStore.shared
+        if meta.isHidden(e.id) { return nil }
+        let base = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
             .map { String($0.prefix(40)) } ?? (e.promptSummary.map { String($0.prefix(40)) } ?? "手动会话")
         return [
-            "id": e.id, "title": title, "cwd": e.cwd,
+            "id": e.id, "key": e.id, "title": meta.title(for: e.id) ?? base, "cwd": e.cwd,
             "terminal": e.terminal.displayName,
             "agent": "claude",   // hook 会话均为 Claude Code(codex 走控制台 driver)
             "state": manualState(e.state),
@@ -197,12 +217,15 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         }
     }
 
-    private func sessionDTO(_ s: AgentSession) -> [String: Any] {
-        // 标题用首条用户消息(s.title 是目录名,不能当会话标题);没有则「新会话」。
-        let title = s.messages.first { $0.kind == .text && $0.role == "user" }
+    private func sessionDTO(_ s: AgentSession) -> [String: Any]? {
+        let key = sessionKey(s)
+        let meta = SessionMetaStore.shared
+        if meta.isHidden(key) { return nil }
+        // 标题优先用户自定义,其次首条用户消息(s.title 是目录名,不能当会话标题);没有则「新会话」。
+        let base = s.messages.first { $0.kind == .text && $0.role == "user" }
             .map { String($0.text.prefix(40)) } ?? "新会话"
         return [
-            "id": s.id, "title": title, "workdir": s.workdir,
+            "id": s.id, "key": key, "title": meta.title(for: key) ?? base, "workdir": s.workdir,
             "agent": s.agent.rawValue, "status": statusKey(s.status),
             "model": s.model ?? "",
             "agentSessionId": s.agentSessionId ?? "",

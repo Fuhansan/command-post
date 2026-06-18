@@ -4,7 +4,7 @@ import { marked } from 'marked'
 import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
-  BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal,
+  BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage } from './store'
 import { cmd } from './bridge'
@@ -219,11 +219,21 @@ function IconBtn({ title, onClick, children }: { title: string; onClick?: () => 
   )
 }
 
-function WorkHeader({ title, meta, model, sub, right }: { title: string; meta?: DotMeta; model?: string; sub?: string; right?: React.ReactNode }) {
+function WorkHeader({ title, meta, model, sub, renameKey, right }: { title: string; meta?: DotMeta; model?: string; sub?: string; renameKey?: string; right?: React.ReactNode }) {
+  const [menu, setMenu] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [val, setVal] = useState(title)
+  useEffect(() => { if (!editing) setVal(title) }, [title, editing])
+  const commit = () => { setEditing(false); if (renameKey) cmd.renameSession(renameKey, val.trim()) }
   return (
     <div className="flex-none flex items-center gap-3 px-5 py-3 border-b border-line">
       <div className="flex-1 min-w-0">
-        <div className="text-[15px] font-semibold text-ink truncate">{title}</div>
+        {editing
+          ? <input autoFocus value={val} onChange={(e) => setVal(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } else if (e.key === 'Escape') setEditing(false) }}
+              onBlur={commit} placeholder="会话名…(留空恢复默认)"
+              className="w-full text-[15px] font-semibold text-ink bg-transparent outline-none border-b border-strong pb-0.5 select-text placeholder:text-faint placeholder:font-normal" />
+          : <div className="text-[15px] font-semibold text-ink truncate">{title}</div>}
         <div className="flex items-center gap-2 mt-1">
           {meta && <Dot meta={meta} size={8} />}
           {meta && <span className="text-[11.5px] text-dim">{meta.text}</span>}
@@ -231,7 +241,25 @@ function WorkHeader({ title, meta, model, sub, right }: { title: string; meta?: 
           {sub && <><span className="text-[11.5px] text-faint">·</span><span className="text-[11.5px] text-faint truncate">{sub}</span></>}
         </div>
       </div>
-      <div className="flex items-center gap-1">{right}</div>
+      <div className="flex items-center gap-1">
+        {renameKey && (
+          <div className="relative">
+            <IconBtn title="更多" onClick={() => setMenu((o) => !o)}><MoreHorizontal size={16} /></IconBtn>
+            {menu && (
+              <>
+                <div className="fixed inset-0 z-30" onClick={() => setMenu(false)} />
+                <div className="absolute right-0 mt-1.5 z-40 w-32 p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
+                  <button onClick={() => { setMenu(false); setVal(title); setEditing(true) }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken"><Pencil size={13} />重命名</button>
+                  <button onClick={() => { setMenu(false); cmd.hideSession(renameKey) }}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] rounded-lg hover:bg-sunken" style={{ color: 'var(--red)' }}><EyeOff size={13} />隐藏</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {right}
+      </div>
     </div>
   )
 }
@@ -312,10 +340,8 @@ function Conversation({ s }: { s: Session }) {
   return (
     <div className="flex flex-col h-full bg-bg">
       <WorkHeader title={s.title || '会话'} meta={sessionMeta(s.status)} model={modelLabel(s.model)} sub={s.workdir}
-        right={<>
-          <IconBtn title="更多"><MoreHorizontal size={16} /></IconBtn>
-          <IconBtn title="结束会话" onClick={() => cmd.closeSession(s.id)}><X size={16} /></IconBtn>
-        </>} />
+        renameKey={s.key || s.agentSessionId || s.id}
+        right={<IconBtn title="结束会话" onClick={() => cmd.closeSession(s.id)}><X size={16} /></IconBtn>} />
       <MsgList msgs={s.messages} onRespond={(r, c) => cmd.respond(s.id, r, c)} working={s.status === 'working'} />
       <Composer sid={s.id} model={s.model} onSend={(t) => cmd.sendInput(s.id, t)} />
     </div>
@@ -325,7 +351,7 @@ function Conversation({ s }: { s: Session }) {
 function ManualView({ m, msgs, hasEarlier, onLoadEarlier }: { m: Manual; msgs: Msg[]; hasEarlier?: boolean; onLoadEarlier?: () => void }) {
   return (
     <div className="flex flex-col h-full bg-bg">
-      <WorkHeader title={m.title} meta={manualMeta(m.state)} sub={m.cwd}
+      <WorkHeader title={m.title} meta={manualMeta(m.state)} sub={m.cwd} renameKey={m.key || m.id}
         right={<button onClick={() => cmd.raiseWindow(m.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {m.terminal}</button>} />
       <MsgList msgs={msgs} animate={false} hasEarlier={hasEarlier} onLoadEarlier={onLoadEarlier} />
       <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {m.terminal} 里输入,这里只读。</div>
@@ -338,7 +364,7 @@ function HistoryView({ h, msgs, onResume, resuming, hasEarlier, onLoadEarlier }:
 }) {
   return (
     <div className="flex flex-col h-full bg-bg">
-      <WorkHeader title={h.label} meta={{ text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }}
+      <WorkHeader title={h.label} meta={{ text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }} renameKey={h.key || h.id}
         right={<button onClick={onResume} disabled={resuming} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={resuming ? 'animate-spin' : ''} />{resuming ? '恢复中…' : 'Resume'}</button>} />
       <MsgList msgs={msgs} animate={false} hasEarlier={hasEarlier} onLoadEarlier={onLoadEarlier} />
     </div>
@@ -776,6 +802,7 @@ function ProvidersPage() {
 }
 
 function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light' | 'dark') => void }) {
+  const state = useAgent()
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
       <div className="max-w-[640px] mx-auto px-8 pt-8 pb-12">
@@ -793,6 +820,19 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
               ))}
             </div>
           </div>
+        </div>
+
+        <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">已隐藏会话 · {state.hidden.length}</div>
+        <div className="border border-line rounded-[13px] bg-elev overflow-hidden">
+          {state.hidden.length === 0
+            ? <div className="px-4 py-4 text-[12px] text-dim">没有隐藏的会话。隐藏只是不在列表展示,转录不会被删除。</div>
+            : state.hidden.map((h) => (
+              <div key={h.key} className="flex items-center px-4 py-3 border-b last:border-b-0 border-line">
+                <span className="flex-1 text-[13px] text-ink truncate">{h.title}</span>
+                <button onClick={() => cmd.unhideSession(h.key)}
+                  className="text-[12px] px-2.5 py-1 rounded-lg hover:bg-sunken transition-colors" style={{ color: 'var(--accent)' }}>恢复</button>
+              </div>
+            ))}
         </div>
       </div>
     </div>

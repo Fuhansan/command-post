@@ -49,6 +49,9 @@ export const cmd = {
   resume: (workdir: string, id: string) => send({ action: 'newSession', workdir, resume: id }),
   closeSession: (sid: string) => send({ action: 'closeSession', sid }),
   switchModel: (sid: string, model: string) => send({ action: 'switchModel', sid, model }),
+  renameSession: (key: string, title: string) => send({ action: 'renameSession', key, title }),
+  hideSession: (key: string) => send({ action: 'hideSession', key }),
+  unhideSession: (key: string) => send({ action: 'unhideSession', key }),
   sendInput: (sid: string, text: string) => send({ action: 'send', sid, text }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),

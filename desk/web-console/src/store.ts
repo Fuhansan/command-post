@@ -2,7 +2,7 @@ import type { AppState, Msg, Entry, FileBody, UsageData } from './types'
 
 export interface TranscriptMeta { earliest: number; hasEarlier: boolean }
 
-let state: AppState = { projects: [], sessions: [], manual: [] }
+let state: AppState = { projects: [], sessions: [], manual: [], hidden: [] }
 let usage: UsageData | null = null
 let transcripts: Record<string, Msg[]> = {}
 let transcriptMeta: Record<string, TranscriptMeta> = {}
@@ -13,7 +13,7 @@ const notify = () => listeners.forEach((l) => l())
 
 export function getState(): AppState { return state }
 export function setState(s: AppState) {
-  state = { projects: s.projects ?? [], sessions: s.sessions ?? [], manual: s.manual ?? [] }
+  state = { projects: s.projects ?? [], sessions: s.sessions ?? [], manual: s.manual ?? [], hidden: s.hidden ?? [] }
   notify()
 }
 export function getTranscripts() { return transcripts }
