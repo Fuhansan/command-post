@@ -143,13 +143,15 @@ struct AgentConsoleRootView: View {
             if let proj = selectedProject {
                 let consoleSessions = manager.sessions.filter { $0.workdir == proj }
                 let manualSessions = hookSessions(proj)
-                if consoleSessions.isEmpty && manualSessions.isEmpty {
+                let history = resumableHistory(proj)
+                if consoleSessions.isEmpty && manualSessions.isEmpty && history.isEmpty {
                     startInline(proj)
                 } else {
                     ScrollView {
                         VStack(spacing: 4) {
                             ForEach(consoleSessions) { sessionCard($0) }
                             ForEach(manualSessions) { manualCard($0) }
+                            ForEach(history, id: \.id) { historyCard($0, proj) }
                         }
                         .padding(8)
                     }
@@ -159,6 +161,9 @@ struct AgentConsoleRootView: View {
             }
         }
         .background(CT.panel)
+        .task(id: selectedProject) {
+            if let p = selectedProject { manager.loadHistoryList(for: p) }
+        }
     }
 
     /// 会话卡外壳:按类型给「框色 + 标签」—— 一眼区分 Claude / Codex / 手动。
@@ -228,19 +233,26 @@ struct AgentConsoleRootView: View {
         .contextMenu { Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) } }
     }
 
+    /// 历史会话卡:灰色框 +「历史」标签 —— 已结束、可恢复;点击 --resume 拉起。
+    private func historyCard(_ h: HistoryEntry, _ proj: String) -> some View {
+        Button { start(proj, resume: h.id) } label: {
+            cardShell(selected: false, tint: CT.faint, tag: "历史",
+                      tagIcon: "clock.arrow.circlepath", title: h.label) {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.uturn.backward").font(.system(size: 9)).foregroundStyle(CT.sub)
+                    Text("点按恢复 · \(h.id.prefix(8))").font(.system(size: 11)).foregroundStyle(CT.sub)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
     /// 新建会话菜单:继续最近 / 全新 / 从历史恢复。
     private func newSessionMenu(_ proj: String) -> some View {
         Menu {
             Button { start(proj, continueLast: true) } label: {
                 Label("继续最近的会话", systemImage: "clock.arrow.circlepath") }
             Button { start(proj) } label: { Label("全新会话", systemImage: "plus.bubble") }
-            let history = resumableHistory(proj)
-            if !history.isEmpty {
-                Divider()
-                ForEach(history, id: \.id) { h in
-                    Button { start(proj, resume: h.id) } label: { Text("↩︎ " + h.label) }
-                }
-            }
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "plus").font(.system(size: 11, weight: .semibold))
