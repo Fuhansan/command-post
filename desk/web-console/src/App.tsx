@@ -1,5 +1,6 @@
 import { useSyncExternalStore, useState, useMemo, useRef, useEffect, useLayoutEffect } from 'react'
 import hljs from 'highlight.js'
+import { marked } from 'marked'
 import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
@@ -94,6 +95,12 @@ function Row({ title, badge, meta, model, time, active, onClick }: {
   )
 }
 
+// 助手文本走 Markdown 渲染(粗体/列表/代码/标题/表格等)
+function Markdown({ text }: { text: string }) {
+  const html = useMemo(() => marked.parse(text, { gfm: true, breaks: true, async: false }) as string, [text])
+  return <div className="md flex-1 text-[13.5px] leading-[1.72] text-ink select-text min-w-0" dangerouslySetInnerHTML={{ __html: html }} />
+}
+
 // ===== 消息渲染 =====
 function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
   if (m.kind === 'text' && m.role === 'user') {
@@ -108,7 +115,7 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
     return (
       <div className="flex gap-2.5">
         <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0 mt-0.5" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
-        <div className="flex-1 text-[13.5px] leading-[1.72] text-ink whitespace-pre-wrap break-words select-text">{m.text}</div>
+        <Markdown text={m.text} />
       </div>
     )
   }
