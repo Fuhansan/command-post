@@ -72,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupRelayAgent()
         startCaffeinate()
         AgentConsoleWindowController.shared.manager = agentManager
+        AgentConsoleWindowController.shared.store = store
         agentManager.restoreSessions()   // 崩溃/重启恢复:用 --resume 重建上次的控制台会话
     }
 

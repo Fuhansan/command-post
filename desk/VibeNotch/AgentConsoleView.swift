@@ -5,10 +5,27 @@ import AppKit
 /// 直接接 `AgentSessionManager`(stream-json 新架构),与旧 hook 路径并存、互不影响。
 struct AgentConsoleRootView: View {
     @ObservedObject var manager: AgentSessionManager
+    @ObservedObject var store: SessionStore
     @State private var selectedProject: String?
     @State private var selectedSessionId: String?
     @State private var projectsCollapsed = false
     @State private var draft: String = ""
+    @State private var manualTranscript: [String: [AgentMessage]] = [:]   // 手动会话只读对话缓存
+
+    /// 某 cwd 是否属于该项目(等于或在其子目录下)。
+    private func inProject(_ cwd: String, _ proj: String) -> Bool {
+        cwd == proj || cwd.hasPrefix(proj + "/")
+    }
+    /// 该项目下的手动(hook)会话。
+    private func hookSessions(_ proj: String) -> [SessionEntry] {
+        store.sessions.filter { inProject($0.cwd, proj) }
+    }
+    /// 排除「当前活跃会话(console + 手动)」后的可恢复历史 —— 活着的会话不该出现在历史里。
+    private func resumableHistory(_ proj: String) -> [HistoryEntry] {
+        var live = Set(store.sessions.map { $0.id })
+        for s in manager.sessions { if let cid = s.agentSessionId, !cid.isEmpty { live.insert(cid) } }
+        return (manager.historyByProject[proj] ?? []).filter { !live.contains($0.id) }
+    }
 
     // 微信式三栏:项目栏(可收缩) | 会话列表 | 对话。
     var body: some View {
@@ -87,12 +104,14 @@ struct AgentConsoleRootView: View {
             .padding(8)
             Divider()
             if let proj = selectedProject {
-                let sessions = manager.sessions.filter { $0.workdir == proj }
-                if sessions.isEmpty {
+                let consoleSessions = manager.sessions.filter { $0.workdir == proj }
+                let manualSessions = hookSessions(proj)
+                if consoleSessions.isEmpty && manualSessions.isEmpty {
                     startInline(proj)
                 } else {
                     List(selection: $selectedSessionId) {
-                        ForEach(sessions) { s in sessionRow(s).tag(s.id) }
+                        ForEach(consoleSessions) { s in sessionRow(s).tag(s.id) }
+                        ForEach(manualSessions) { e in manualSessionRow(e).tag(e.id) }
                     }
                     .listStyle(.sidebar)
                 }
@@ -122,13 +141,28 @@ struct AgentConsoleRootView: View {
         }
     }
 
+    /// 手动(hook)会话行:打「手动」标签 —— 它是你在 IDE/终端里自己跑的,选中后只读 + 可唤起窗口。
+    private func manualSessionRow(_ e: SessionEntry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(manualTitle(e)).font(.system(size: 13, weight: .medium)).lineLimit(1)
+            HStack(spacing: 4) {
+                Image(systemName: "hand.raised.fill").font(.system(size: 9)).foregroundStyle(.orange)
+                Text("手动 · \(e.terminal.displayName)").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+        .contextMenu {
+            Button("唤起 \(e.terminal.displayName)") { raiseWindow(e) }
+        }
+    }
+
     /// 新建会话菜单:继续最近 / 全新 / 从历史恢复。
     private func newSessionMenu(_ proj: String) -> some View {
         Menu {
             Button { start(proj, continueLast: true) } label: {
                 Label("继续最近的会话", systemImage: "clock.arrow.circlepath") }
             Button { start(proj) } label: { Label("全新会话", systemImage: "plus.bubble") }
-            let history = manager.historyByProject[proj] ?? []
+            let history = resumableHistory(proj)
             if !history.isEmpty {
                 Divider()
                 ForEach(history, id: \.id) { h in
@@ -144,7 +178,7 @@ struct AgentConsoleRootView: View {
 
     /// 项目下还没有会话时,会话栏内联显示「继续最近 / 全新 / 历史」。
     private func startInline(_ proj: String) -> some View {
-        let history = manager.historyByProject[proj] ?? []
+        let history = resumableHistory(proj)
         return ScrollView {
             VStack(alignment: .leading, spacing: 8) {
                 Button { start(proj, continueLast: true) } label: {
@@ -179,6 +213,8 @@ struct AgentConsoleRootView: View {
     private var conversationPane: some View {
         if let sid = selectedSessionId, let s = manager.sessions.first(where: { $0.id == sid }) {
             conversation(s)
+        } else if let sid = selectedSessionId, let e = store.sessions.first(where: { $0.id == sid }) {
+            manualPane(e)
         } else {
             VStack(spacing: 10) {
                 Image(systemName: selectedProject == nil ? "folder" : "bubble.left.and.bubble.right")
@@ -189,6 +225,68 @@ struct AgentConsoleRootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    // MARK: - 手动会话:只读对话 + 唤起 IDE/终端
+
+    /// 手动会话标题:转录首句,没有则提示。
+    private func manualTitle(_ e: SessionEntry) -> String {
+        if let p = e.transcriptPath, let s = AgentSessionManager.firstUserPrompt(path: p) {
+            return String(s.prefix(40))
+        }
+        return e.promptSummary.map { String($0.prefix(40)) } ?? "手动会话"
+    }
+
+    private func manualPane(_ e: SessionEntry) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(manualTitle(e)).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                    Text(e.cwd).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Label("手动", systemImage: "hand.raised.fill")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+                Button { raiseWindow(e) } label: {
+                    Label("唤起 \(e.terminal.displayName)", systemImage: "arrow.up.forward.app")
+                }.controlSize(.small).buttonStyle(.borderedProminent)
+            }
+            .padding(8)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(manualTranscript[e.id] ?? []) { m in messageRow(m, sid: e.id) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(10)
+            }
+            .defaultScrollAnchor(.bottom)
+            Divider()
+            Text("手动会话:在 \(e.terminal.displayName) 里输入,这里只读。点上方按钮唤起那个窗口。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+        }
+        .task(id: e.id) { await loadManualTranscript(e) }
+    }
+
+    /// 唤起手动会话对应的终端/IDE 窗口(沿 ownerPID 父链找到 app 进程并激活)。
+    private func raiseWindow(_ e: SessionEntry) {
+        let start = e.ownerPID ?? e.terminalPID
+        guard let start, start > 1,
+              let appPid = ProcessUtils.findTerminal(startPid: start).pid,
+              let app = NSRunningApplication(processIdentifier: appPid) else { return }
+        app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    /// 后台解析转录 → 只读对话(缓存,避免每次重渲染重读)。
+    private func loadManualTranscript(_ e: SessionEntry) async {
+        guard manualTranscript[e.id] == nil, let path = e.transcriptPath else { return }
+        let parsed = await Task.detached(priority: .userInitiated) {
+            AgentSessionManager.parseTranscriptFile(path: path)
+        }.value
+        let msgs = parsed.enumerated().map { i, t in
+            AgentMessage(id: "mh\(i)", role: t.role, kind: t.kind, text: t.text, ord: i)
+        }
+        manualTranscript[e.id] = msgs
     }
 
     private func start(_ proj: String, resume: String? = nil, continueLast: Bool = false) {
