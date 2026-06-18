@@ -19,11 +19,15 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         let cfg = WKWebViewConfiguration()
         let ucc = WKUserContentController()
         cfg.userContentController = ucc
+        // 自定义 scheme:把 dist 文件喂给 WKWebView(避免 file:// 下 ES module 被 CORS 拦)。
+        if let dist = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "dist")?
+            .deletingLastPathComponent() {
+            cfg.setURLSchemeHandler(DistSchemeHandler(root: dist), forURLScheme: "app")
+        }
         webView = WKWebView(frame: .zero, configuration: cfg)
         super.init()
         ucc.add(self, name: "agent")
         webView.navigationDelegate = self
-        webView.setValue(false, forKey: "drawsBackground")   // 透明,让 web 背景生效
         loadFrontend()
 
         manager.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
@@ -31,11 +35,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
 
     private func loadFrontend() {
-        guard let index = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "dist") else {
+        guard Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "dist") != nil,
+              let url = URL(string: "app://local/index.html") else {
             webView.loadHTMLString("<h2 style='font-family:sans-serif;padding:40px'>未找到 web 控制台前端(dist 未打包)</h2>", baseURL: nil)
             return
         }
-        webView.loadFileURL(index, allowingReadAccessTo: index.deletingLastPathComponent())
+        webView.load(URLRequest(url: url))
     }
 
     // MARK: - JS → Swift
@@ -113,5 +118,40 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         guard let data = try? JSONSerialization.data(withJSONObject: ["type": type, "payload": payload]),
               let json = String(data: data, encoding: .utf8) else { return }
         webView.evaluateJavaScript("window.__agent && window.__agent.push(\(json))", completionHandler: nil)
+    }
+}
+
+/// 把打包进 app 的 dist/ 文件用 app:// scheme 喂给 WKWebView。
+final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
+    private let root: URL
+    init(root: URL) { self.root = root }
+
+    func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
+        guard let url = task.request.url else { task.didFinish(); return }
+        var path = url.path
+        if path.isEmpty || path == "/" { path = "/index.html" }
+        let fileURL = root.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+        guard let data = try? Data(contentsOf: fileURL) else {
+            let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
+            task.didReceive(resp); task.didFinish(); return
+        }
+        let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                   headerFields: ["Content-Type": Self.mime(fileURL.pathExtension),
+                                                  "Access-Control-Allow-Origin": "*"])!
+        task.didReceive(resp); task.didReceive(data); task.didFinish()
+    }
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+
+    private static func mime(_ ext: String) -> String {
+        switch ext.lowercased() {
+        case "html": return "text/html; charset=utf-8"
+        case "js", "mjs": return "text/javascript; charset=utf-8"
+        case "css": return "text/css; charset=utf-8"
+        case "json": return "application/json; charset=utf-8"
+        case "svg": return "image/svg+xml"
+        case "png": return "image/png"
+        case "woff2": return "font/woff2"
+        default: return "application/octet-stream"
+        }
     }
 }
