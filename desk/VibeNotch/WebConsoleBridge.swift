@@ -2,6 +2,12 @@ import AppKit
 import WebKit
 import Combine
 
+/// 让网页非交互区域(顶栏空白处)也能拖动窗口。配合 window.isMovableByWindowBackground。
+/// 网页里的按钮/可选文本会自行消费 mousedown,不受影响;只有空白区拖动才移动窗口。
+final class DraggableWebView: WKWebView {
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
 /// Web 控制台桥接:持有 WKWebView,订阅会话模型变化推给 JS,接收 JS 命令调模型。
 /// 点对点桥接,无本地服务/端口。
 @MainActor
@@ -27,7 +33,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             .deletingLastPathComponent() {
             cfg.setURLSchemeHandler(DistSchemeHandler(root: dist), forURLScheme: "app")
         }
-        webView = WKWebView(frame: .zero, configuration: cfg)
+        webView = DraggableWebView(frame: .zero, configuration: cfg)
         super.init()
         ucc.add(self, name: "agent")
         webView.navigationDelegate = self
