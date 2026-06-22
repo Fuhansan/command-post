@@ -24,7 +24,6 @@ dist/
 .idea/
 .claude/
 .vscode/
-.omc/
 
 # Backed-up nested git dirs
 *_git_backup/
@@ -32,3 +31,9 @@ coding-server/data/
 
 cli-ios/build-device/
 cli-ios/build-device
+
+# coding-server 部署构建产物(不入库,本地打包生成)
+coding-server/deploy/coding-server.jar
+coding-server/deploy/server.log
+coding-server/deploy/server.pid
+coding-server/coding-server-deploy.tar.gz

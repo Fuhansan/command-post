@@ -4,21 +4,23 @@ import SwiftUI
 enum SessionStatusUI {
     static func label(_ s: String) -> String {
         switch s {
-        case "idle":    return "空闲"
-        case "working": return "运行中"
-        case "waiting": return "等待确认"
-        case "done":    return "完成"
-        case "ended":   return "已结束"
-        default:        return s
+        case "idle":      return "空闲"
+        case "working":   return "运行中"
+        case "waiting":   return "等待确认"   // 真有审批/选择待你处理(needsAction)
+        case "suspended": return "会话挂起"   // 空闲等你输入,无待办 —— 不催你
+        case "done":      return "完成"
+        case "ended":     return "已结束"
+        default:          return s
         }
     }
     static func color(_ s: String) -> Color {
         switch s {
-        case "working": return Theme.blue
-        case "waiting": return Theme.gold
-        case "done":    return Theme.green
-        case "ended":   return Theme.textTer
-        default:        return Theme.textSec
+        case "working":   return Theme.blue
+        case "waiting":   return Theme.gold    // 黄:需要你处理
+        case "suspended": return Theme.textSec // 灰:仅挂起,不需处理
+        case "done":      return Theme.green
+        case "ended":     return Theme.textTer
+        default:          return Theme.textSec
         }
     }
 }
@@ -26,36 +28,51 @@ enum SessionStatusUI {
 /// 屏 1 —— 任务列表(首页)。每个 claude 终端会话 = 一个任务(来自服务器,非模拟数据)。
 struct TasksView: View {
     @EnvironmentObject private var relay: RelayClient
-    @State private var showLaunch = false
-    @State private var launchCmd = "claude"
-    @State private var launched = false
+
+    /// 单任务 = 手动敲的 claude 且 cwd 不属于任何已打开项目(含子目录)。属于项目的折叠进项目,不重复。
+    private var singleTasks: [RelaySession] {
+        relay.sessions.filter { $0.isManual && relay.project(forCwd: $0.cwd) == nil }
+    }
 
     var body: some View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
                 ScrollView {
-                    VStack(spacing: 16) {
+                    // 一个统一列表:项目卡片(可下钻)+ 单任务卡片(手动会话),不分区。
+                    VStack(spacing: 12) {
                         header
-                        if relay.sessions.isEmpty {
+                        if relay.projects.isEmpty && singleTasks.isEmpty {
                             emptyState
                         } else {
-                            ForEach(relay.sessions) { s in
-                                NavigationLink(value: s.id) {
-                                    SessionCard(session: s)
+                            ForEach(relay.projects) { proj in
+                                NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
+                                    ProjectRow(project: proj,
+                                               sessions: relay.sessions.filter { relay.project(forCwd: $0.cwd)?.workdir == proj.workdir })
                                 }
                                 .buttonStyle(.plain)
+                            }
+                            ForEach(singleTasks) { s in
+                                NavigationLink(value: s.id) { SessionCard(session: s) }
+                                    .buttonStyle(.plain)
                             }
                         }
                     }
                     .padding(16)
                 }
+                .refreshable {
+                    // 下拉刷新:强制重连重新拉取(连接半死/代理干扰时手动恢复)
+                    relay.reconnectToCurrentServer()
+                    try? await Task.sleep(nanoseconds: 800_000_000)
+                }
             }
             .navigationDestination(for: String.self) { sid in
                 TaskDetailView(sessionId: sid)
             }
+            .navigationDestination(for: ProjectRoute.self) { route in
+                ProjectSessionsView(workdir: route.workdir)
+            }
             .toolbar(.hidden, for: .navigationBar)
-            .sheet(isPresented: $showLaunch) { launchSheet }
         }
     }
 
@@ -70,56 +87,7 @@ struct TasksView: View {
                 connectionLine
             }
             Spacer()
-            // 新建会话:电脑端开一个终端跑命令
-            Button {
-                launchCmd = "claude"; launched = false; showLaunch = true
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .background(Theme.blueBtn).clipShape(Circle())
-            }
-            .disabled(!relay.agents.contains { $0.online })
         }
-    }
-
-    /// 新建会话弹层:在电脑上开一个 Terminal.app 跑命令(默认 claude)。
-    private var launchSheet: some View {
-        ZStack {
-            Theme.bg.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 14) {
-                Text("在电脑上新建会话").font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.text)
-                Text("电脑会打开一个终端窗口运行下面的命令。想进某个项目就带上 cd,例如:\ncd ~/proj && claude")
-                    .font(.system(size: 13)).foregroundStyle(Theme.textSec)
-                TextField("", text: $launchCmd, prompt: Text("要运行的命令").foregroundColor(Theme.textTer), axis: .vertical)
-                    .font(.system(size: 15, design: .monospaced)).foregroundStyle(Theme.text)
-                    .autocorrectionDisabled().textInputAutocapitalization(.never)
-                    .lineLimit(1...4)
-                    .padding(12).background(Theme.field)
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Theme.stroke))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                Button {
-                    relay.launchCommand(launchCmd)
-                    launched = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { showLaunch = false }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: launched ? "checkmark.circle.fill" : "play.fill")
-                        Text(launched ? "已发送,等终端启动…" : "在电脑上运行")
-                            .font(.system(size: 16, weight: .semibold))
-                    }
-                    .foregroundStyle(.white).frame(maxWidth: .infinity).padding(.vertical, 13)
-                    .background(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty ? Theme.cardHi
-                                : (launched ? Theme.green : Theme.blueBtn))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                }
-                .buttonStyle(.plain)
-                .disabled(launchCmd.trimmingCharacters(in: .whitespaces).isEmpty || launched)
-                Spacer()
-            }
-            .padding(24)
-        }
-        .presentationDetents([.medium])
     }
 
     private var connectionLine: some View {
@@ -151,9 +119,9 @@ struct TasksView: View {
         VStack(spacing: 12) {
             Image(systemName: "terminal")
                 .font(.system(size: 40)).foregroundStyle(Theme.textTer)
-            Text("暂无进行中的任务")
+            Text("还没有项目或会话")
                 .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-            Text("在电脑上打开终端运行 Claude Code,会话会作为任务出现在这里")
+            Text("在电脑 VibeNotch「打开项目」,或在终端运行 Claude Code,就会出现在这里")
                 .font(.system(size: 13)).foregroundStyle(Theme.textSec)
                 .multilineTextAlignment(.center)
         }
@@ -186,6 +154,11 @@ struct SessionCard: View {
                         Text(SessionStatusUI.label(session.status))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(SessionStatusUI.color(session.status))
+                        if !session.agentSessionId.isEmpty {
+                            Text("·").font(.system(size: 12)).foregroundStyle(Theme.textTer)
+                            Text("id \(session.agentSessionId.prefix(8))")
+                                .font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.textTer)
+                        }
                     }
                 }
                 Spacer()
@@ -195,6 +168,16 @@ struct SessionCard: View {
                         .padding(.horizontal, 10).padding(.vertical, 5)
                         .background(Theme.coral).clipShape(Capsule())
                 }
+            }
+            if session.isManual {
+                // 手动会话:用户自己敲的 claude,反控走 GUI 模拟,电脑锁屏后无法操作。
+                HStack(spacing: 5) {
+                    Image(systemName: "hand.raised.fill").font(.system(size: 10))
+                    Text("手动 · 锁屏不可控").font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(Theme.gold)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(Theme.gold.opacity(0.15)).clipShape(Capsule())
             }
             if hasCwd {
                 HStack(spacing: 5) {

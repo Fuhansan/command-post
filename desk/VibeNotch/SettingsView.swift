@@ -4,6 +4,9 @@ struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     let relayAgent: RelayAgent?
     @StateObject private var pairing = PairingController()
+    /// 中转服务器地址(本机=127.0.0.1;公网 VPS=填其公网 IP)。
+    @State private var serverHost: String = AgentServer.host
+    @State private var serverSaved = false
     /// Re-resolved on each render so language changes apply live without
     /// needing to close and reopen the window.
     private var locale: L10n.Locale { L10n.resolved(from: settings.language) }
@@ -15,6 +18,23 @@ struct SettingsView: View {
                 accountRow
                 if let relayAgent {
                     AgentConnStateRow(agent: relayAgent)
+                }
+            }
+
+            // 中转服务器地址:服务器在本机时填 127.0.0.1;搬到公网 VPS 后填 VPS 公网 IP。
+            // WS 走 8090、HTTP(登录/配对/图片)走 8080,端口固定,只填地址。
+            Section("中转服务器") {
+                TextField("服务器 IP / 域名", text: $serverHost)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: serverHost) { _ in serverSaved = false }
+                HStack {
+                    Button(serverSaved ? "✓ 已保存,正在重连" : "保存并重连") {
+                        AgentServer.host = serverHost.trimmingCharacters(in: .whitespacesAndNewlines)
+                        serverSaved = true   // 地址变更会经通知触发 RelayAgent 按新地址重连
+                    }
+                    .disabled(serverHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Spacer()
+                    Text("WS 8090 / HTTP 8080").font(.caption).foregroundStyle(.secondary)
                 }
             }
 
@@ -32,6 +52,31 @@ struct SettingsView: View {
                 ))
 
                 Toggle(L10n.t(.settingsMuteSounds, locale: locale), isOn: $settings.muted)
+            }
+
+            // 手机「新建会话」用的默认工作目录 + 代理
+            Section("新建会话") {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("默认工作目录(如 ~/Projects)", text: $settings.defaultWorkdir)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                    Text("手机点「+」新建会话时,新终端先 cd 进此目录再运行命令。留空则用 ~ 。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("代理命令(大陆用户跑 claude 需要)", text: $settings.launchProxy, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1...3)
+                    HStack(spacing: 6) {
+                        Text("命令前自动执行,设代理后 claude 才能连上 Anthropic。留空则不设。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        Button("填入默认") {
+                            settings.launchProxy = "export https_proxy=http://127.0.0.1:7890 http_proxy=http://127.0.0.1:7890 all_proxy=socks5://127.0.0.1:7890"
+                        }
+                        .font(.system(size: 11))
+                    }
+                }
             }
 
             Section {

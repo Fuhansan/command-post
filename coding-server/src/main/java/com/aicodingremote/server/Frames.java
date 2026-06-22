@@ -52,6 +52,16 @@ final class Frames {
         return f.toString();
     }
 
+    /** 手机(Client）上线 → 通知同账号的 Agent,促其把当前所有任务全量重推,补齐快照缺漏。 */
+    static String clientPresence(boolean online) {
+        ObjectNode f = M.createObjectNode();
+        f.put("v", 1).put("t", "presence").put("from", "server");
+        ObjectNode body = f.putObject("body");
+        body.put("role", "client");
+        body.put("online", online);
+        return f.toString();
+    }
+
     /** Agent 断开时服务器代发的设备级 reset:手机据此清掉该电脑的会话。 */
     static String agentReset(String agentId) {
         ObjectNode f = M.createObjectNode();

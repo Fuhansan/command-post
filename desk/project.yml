@@ -26,6 +26,10 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: VibeNotch
+      # Web 控制台前端产物(React+Tailwind 构建)→ 作为文件夹引用打进 Resources/dist
+      - path: web-console/dist
+        type: folder
+        buildPhase: resources
     info:
       path: VibeNotch/Info.plist
       properties:
@@ -36,8 +40,13 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         NSHumanReadableCopyright: ""
+        # 手机「新建会话」用 AppleScript 控制 Terminal.app 开窗口跑命令(自动化权限)
+        NSAppleEventsUsageDescription: "VibeNotch 需要控制终端来从手机端新建会话(打开终端运行命令)。"
+        # 只保留 NSAllowsArbitraryLoads:同时写 NSAllowsLocalNetworking 会让
+        # macOS 忽略 ArbitraryLoads、只认 LocalNetworking(仅放行本地网络),
+        # 导致公网 VPS 的明文被 ATS 拦(-1022)。与 iOS 端保持一致。
         NSAppTransportSecurity:
-          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.local.VibeNotch

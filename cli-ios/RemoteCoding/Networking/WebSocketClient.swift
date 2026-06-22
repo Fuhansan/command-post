@@ -87,12 +87,20 @@ final class WebSocketClient: NSObject, ObservableObject {
     }
 
     private func receiveLoop() {
-        task?.receive { [weak self] result in
+        // 绑定本次连接的 task:切换服务器/重连时,旧 task 被 cancel 后其回调会**异步晚到**,
+        // 那时新 task 已就位。若不甄别,旧回调会掐掉新连接的心跳、触发多余重连(切服务器抖动)。
+        let myTask = task
+        myTask?.receive { [weak self] result in
             guard let self else { return }
-            Task { @MainActor in
-                switch result {
-                case .success(let message):
-                    if case .string(let text) = message, let frame = Frame.decode(text) {
+            switch result {
+            case .success(let message):
+                // 关键:JSON 解码在 URLSession 的后台队列上完成,绝不占用主线程 ——
+                // 大帧(组件树 / 最大 8MB 图片)解析不再卡 UI。只把结果回主线程派发。
+                var frame: Frame? = nil
+                if case .string(let text) = message { frame = Frame.decode(text) }
+                Task { @MainActor in
+                    guard myTask === self.task else { return }   // 过期 task 的回调,丢弃
+                    if let frame {
                         if case .pong = frame.t {
                             self.lastPongAt = Date()   // 心跳回应,不上抛
                         } else {
@@ -100,7 +108,10 @@ final class WebSocketClient: NSObject, ObservableObject {
                         }
                     }
                     self.receiveLoop()
-                case .failure(let error):
+                }
+            case .failure(let error):
+                Task { @MainActor in
+                    guard myTask === self.task else { return }
                     self.heartbeat?.invalidate(); self.heartbeat = nil
                     if self.manualClose {
                         self.state = .disconnected   // 用户主动断开,保持断开态

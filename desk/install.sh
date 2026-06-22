@@ -8,6 +8,15 @@ set -o pipefail   # xcodebuild 失败时不被 tail 吞掉退出码
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
+# Web 控制台前端:构建 dist/(打进 app 资源)。需要 node。
+if [[ -d "$PROJECT_DIR/web-console" ]]; then
+  echo "→ Building web console frontend…"
+  source ~/.nvm/nvm.sh 2>/dev/null || true
+  ( cd "$PROJECT_DIR/web-console"
+    [[ -d node_modules ]] || npm install >/dev/null 2>&1
+    npm run build >/dev/null 2>&1 ) || echo "  (web-console 构建失败,跳过,用上次的 dist)"
+fi
+
 echo "→ Generating Xcode project…"
 xcodegen generate >/dev/null
 

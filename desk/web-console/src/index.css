@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== 设计令牌(取自 Claude Design「Coding 终端」稿)===== */
+:root {
+  --bg:#f6f6f4; --bg-elev:#ffffff; --bg-elev2:#fbfbfa; --bg-sunken:#eeeeeb;
+  --text:#1b1b19; --text-dim:#6c6c66; --text-faint:#a0a099;
+  --border:rgba(20,20,16,.08); --border-strong:rgba(20,20,16,.14);
+  --accent:#5562c9; --accent-fg:#ffffff; --accent-soft:#ecedfb;
+  --green:#3f9d6b; --amber:#bd8a36; --red:#c25b54;
+  --term-bg:#1c1c18; --term-border:rgba(255,255,255,.07);
+  --term-text:#e7e7e0; --term-dim:#909086; --term-green:#84d3a4;
+}
+[data-theme="dark"] {
+  --bg:#151513; --bg-elev:#1d1d1a; --bg-elev2:#242421; --bg-sunken:#121210;
+  --text:#ededea; --text-dim:#9c9c94; --text-faint:#6c6c63;
+  --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.17);
+  --accent:#868ef2; --accent-fg:#16160f; --accent-soft:#2c2d4a;
+  --green:#5cbd86; --amber:#cda255; --red:#d6726a;
+  --term-bg:#0f0f0c; --term-border:rgba(255,255,255,.07);
+  --term-text:#e7e7e0; --term-dim:#7e7e74; --term-green:#84d3a4;
+}
+
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: "Geist Variable", "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  color: var(--text);
+  background: var(--bg);
+  user-select: none;
+  transition: background .2s ease, color .2s ease;
+}
+.titlebar-pad { padding-top: 8px; }
+[data-theme="dark"] { -webkit-font-smoothing: subpixel-antialiased; }
+
+/* 运行中状态点:柔和脉冲 */
+@keyframes pulseDot { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.4; transform:scale(.82); } }
+.dot-live { animation: pulseDot 1.4s ease-in-out infinite; }
+
+/* 入场动画:纯淡入,不做位移 —— 避免和滚动到底打架产生抖动 */
+@keyframes conv-in { from { opacity:0; } to { opacity:1; } }
+.animate-conv { animation: conv-in .2s ease both; }
+@keyframes msg-in { from { opacity:0; } to { opacity:1; } }
+.animate-msg { animation: msg-in .22s ease both; }
+@keyframes pop-in { from { opacity:0; transform:translateY(8px) scale(.985); } to { opacity:1; transform:none; } }
+.animate-pop { animation: pop-in .16s ease both; }
+@keyframes fade-in { from { opacity:0; } to { opacity:1; } }
+.animate-fade { animation: fade-in .15s ease both; }
+
+/* 思考中三点 */
+@keyframes typing-dot { 0%,80%,100% { transform:translateY(0); opacity:.35; } 40% { transform:translateY(-3px); opacity:1; } }
+.typing-dot { animation: typing-dot 1.2s ease-in-out infinite; }
+
+/* 细腻滚动条 */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* highlight.js 跟随等宽字体 */
+.hljs { font-family: "Geist Mono Variable", ui-monospace, monospace; background: transparent !important; }
+
+/* 助手消息 Markdown 排版 */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 .65em; }
+.md h1, .md h2, .md h3, .md h4 { font-weight: 600; line-height: 1.3; margin: 1em 0 .45em; }
+.md h1 { font-size: 1.28em; } .md h2 { font-size: 1.16em; } .md h3 { font-size: 1.05em; } .md h4 { font-size: 1em; }
+.md ul, .md ol { margin: .35em 0 .65em; padding-left: 1.4em; }
+.md ul { list-style: disc; } .md ol { list-style: decimal; }
+.md li { margin: .2em 0; }
+.md li > ul, .md li > ol { margin: .2em 0; }
+.md code { font-family: "Geist Mono Variable", ui-monospace, monospace; font-size: .88em; background: var(--bg-sunken); padding: .12em .36em; border-radius: 4px; }
+.md pre { background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 10px; padding: .75em 1em; overflow-x: auto; margin: .6em 0; }
+.md pre code { background: none; padding: 0; font-size: .86em; line-height: 1.6; color: var(--text); }
+.md a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.md strong { font-weight: 600; }
+.md blockquote { border-left: 3px solid var(--border-strong); margin: .6em 0; padding: .1em 0 .1em .9em; color: var(--text-dim); }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+.md table { border-collapse: collapse; margin: .6em 0; font-size: .95em; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--border); padding: .3em .6em; text-align: left; }
+.md th { background: var(--bg-sunken); font-weight: 600; }

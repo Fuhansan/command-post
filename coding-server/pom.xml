@@ -42,6 +42,12 @@
 			<artifactId>netty-codec-http</artifactId>
 		</dependency>
 
+		<!-- 发邮件:忘记密码时把验证码发到用户绑定邮箱(JavaMailSender)。 -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-mail</artifactId>
+		</dependency>
+
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-test</artifactId>

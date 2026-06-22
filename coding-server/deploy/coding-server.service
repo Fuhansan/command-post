@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Coding Remote relay server (HTTP 8080 + Netty WS 8090)
+After=network.target
+
+[Service]
+Type=simple
+# 改成你在服务器上的用户名(如 root 或 ubuntu)
+User=root
+# 解压后的目录(data/ 会建在这里,务必和实际路径一致)
+WorkingDirectory=/opt/coding-server
+ExecStart=/usr/bin/java -Xmx256m -jar /opt/coding-server/coding-server.jar
+# Spring 收到 SIGTERM 正常退出码是 143,标记为成功避免反复告警
+SuccessExitStatus=143
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

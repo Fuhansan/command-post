@@ -9,7 +9,9 @@ typealias VibeNotch = DynamicNotch<NotchExpandedView, NotchCompactSummary, Notch
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     nonisolated func menuWillOpen(_ menu: NSMenu) {
-        Task { @MainActor in self.rebuildDisplaySubmenu() }
+        Task { @MainActor in
+            self.rebuildDisplaySubmenu()
+        }
     }
 
     private var notch: VibeNotch?
@@ -22,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastHoverState: Bool = false
     private static let hoverCollapseGrace: TimeInterval = 0.20
     let store = SessionStore()
+    /// stream-json 新架构的多会话宿主(与旧 hook 路径并存,经 Agent 控制台使用)。
+    let agentManager = AgentSessionManager()
     let pendingStore = PendingDecisionStore()
     private var relayAgent: RelayAgent?
     private var autoExpandUntil: Date?
@@ -50,6 +54,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Touch AppSettings.shared so it loads ~/.vibenotch/settings.json and
         // syncs `muted` into SoundPlayer before any transition can fire.
         _ = AppSettings.shared
+        // 不再用 tmux 包装(遥控会话走 stream-json 控制台)。清理 ~/.zshrc/.bashrc 旧包装段。
+        ShellWrapper.uninstall()
         vlog("launched")
         vlog("screens count=\(NSScreen.screens.count)")
         for (i, s) in NSScreen.screens.enumerated() {
@@ -64,6 +70,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startIdleSweep()
         startLivenessSweep()
         setupRelayAgent()
+        startCaffeinate()
+        AgentConsoleWindowController.shared.manager = agentManager
+        AgentConsoleWindowController.shared.store = store
+        agentManager.restoreSessions()   // 崩溃/重启恢复:用 --resume 重建上次的控制台会话
+    }
+
+    /// 防系统深度休眠 —— 否则锁屏后系统休眠会断 WS、停掉 tmux,远程就失联。
+    /// `caffeinate -i` 阻止「闲置导致的系统休眠」,`-w <pid>` 让它随 VibeNotch 一起退出。
+    private var caffeinate: Process?
+    private func startCaffeinate() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        p.arguments = ["-i", "-w", String(ProcessInfo.processInfo.processIdentifier)]
+        do { try p.run(); caffeinate = p; vlog("caffeinate 已启动(防系统休眠)") }
+        catch { vlog("caffeinate 启动失败: \(error.localizedDescription)") }
     }
 
     /// 快速清扫:每 5 秒检查各会话的 owner 进程是否还活着,移除已死的(终端被关/强杀、
@@ -142,7 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agent.onRemoteClose = { [weak self] sid in
             guard let self else { return }
             guard let entry = self.store.sessions.first(where: { $0.id == sid }) else {
-                vlog("relay close ignored: sid=\(sid.prefix(8)) unknown")
+                // 本地查无 = 鬼会话(电脑终端早没了、服务端旧快照残留)→ 不再忽略,
+                // 主动让服务端+手机清掉它,否则手机永远删不动这条。
+                vlog("relay close: sid=\(sid.prefix(8)) 本地查无 → 作为鬼会话清除")
+                self.relayAgent?.purgeGhostSession(sid: sid)
                 return
             }
             vlog("relay remote close sid=\(sid.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
@@ -160,11 +184,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("relay input ignored: sid=\(sid.prefix(8)) unknown")
                 return
             }
-            if !WindowActivator.isAccessibilityTrusted {
-                WindowActivator.requestAccessibilityIfNeeded()
-                vlog("relay input: AX not trusted — prompted, dropping input")
-                return
-            }
             // 组装注入文本:用户文字 + 图片路径(claude 会自己读路径里的图)
             var parts: [String] = []
             if !text.isEmpty { parts.append(text) }
@@ -174,16 +193,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              : imagePaths.map { "图片: \($0)" }.joined(separator: " "))
             }
             let message = parts.joined(separator: " ")
-            vlog("relay input sid=\(sid.prefix(8)) len=\(message.count) imgs=\(imagePaths.count)")
-            // 必须确认激活了目标终端窗口才打字,否则会敲进用户当前聚焦的任意应用
-            guard self.jumpToTerminal(sessionId: sid) else {
-                vlog("relay input dropped: terminal activation failed sid=\(sid.prefix(8))")
+            // 手敲会话(旧 hook 路径)用 GUI 模拟键盘注入 —— 仅未锁屏可用;锁屏遥控请走
+            // VibeNotch 控制台会话(stream-json)。
+            guard WindowActivator.isAccessibilityTrusted else {
+                WindowActivator.requestAccessibilityIfNeeded()
+                vlog("relay input: AX 未授权,丢弃 sid=\(sid.prefix(8))")
                 return
             }
-            // 等窗口激活、输入焦点就位后再打字
+            guard self.jumpToTerminal(sessionId: sid) else {
+                vlog("relay input GUI 回退失败:终端激活失败(可能锁屏)sid=\(sid.prefix(8))")
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 TerminalTyper.type(message)
             }
+            vlog("relay input via GUI 回退 sid=\(sid.prefix(8)) len=\(message.count)")
         }
         agent.onRemoteAnswer = { [weak self] sid, digits, isMulti, labels in
             guard let self else { return }
@@ -197,23 +221,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("relay answer via hook: sid=\(sid.prefix(8)) labels=\(labels)")
                 return
             }
-            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选注入数字键;
+            // 路径二(回退):hook 已放行(超时/转电脑后又在手机点)→ 单选经 tmux 注入数字键;
             // 多选按键时序不可靠,不注入,提示在电脑完成
             guard !isMulti else {
                 vlog("relay answer dropped: 多选已放行到终端,不做按键注入 sid=\(sid.prefix(8))")
                 self.relayAgent?.questionAnswerFailed(sid: sid)   // 卡片提示改在电脑作答
                 return
             }
-            if !WindowActivator.isAccessibilityTrusted {
-                WindowActivator.requestAccessibilityIfNeeded()
-                return
+            guard let d = digits.first else { return }
+            // GUI 模拟数字键(仅未锁屏)
+            guard WindowActivator.isAccessibilityTrusted else {
+                WindowActivator.requestAccessibilityIfNeeded(); return
             }
-            guard self.jumpToTerminal(sessionId: sid) else { return }
-            if let d = digits.first {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                    TerminalTyper.type(d, thenReturn: false)
-                }
+            guard self.jumpToTerminal(sessionId: sid) else {
+                self.relayAgent?.questionAnswerFailed(sid: sid); return
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                TerminalTyper.type(d, thenReturn: false)
+            }
+            vlog("relay answer via GUI 回退: sid=\(sid.prefix(8)) digit=\(d)")
         }
         agent.onRemoteAnswerLocal = { [weak self] sid in
             guard let self else { return }
@@ -221,10 +247,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.releaseQuestionGate(sid: sid)
             self.jumpToTerminal(sessionId: sid)   // 把终端带到前台,题目马上弹出
         }
-        agent.onRemoteLaunch = { command in
-            vlog("relay launch: \(command)")
-            TerminalLauncher.run(command: command)
+        agent.onRemoteLaunch = { [weak self] command in
+            guard let self else { return }
+            // 手机「+」新建会话:走 VibeNotch 后台 spawn(stream-json 控制台会话),
+            // 不再开新终端 + tmux。会话经 syncConsole 回推手机(sid 带 "c:"),锁屏可控。
+            let dir = AppSettings.shared.defaultWorkdir.isEmpty
+                ? NSHomeDirectory() : AppSettings.shared.defaultWorkdir
+            let kind: AgentKind = command.lowercased().contains("codex") ? .codex : .claude
+            vlog("relay launch → stream-json 控制台会话: \(command) workdir=\(dir)")
+            self.agentManager.newSession(agent: kind, workdir: dir)
         }
+        agent.onRemoteConsoleOpen = { [weak self] workdir, resumeId, continueLast in
+            guard let self else { return }
+            vlog("relay console open: \(workdir) resume=\(resumeId?.prefix(8) ?? "-") cont=\(continueLast)")
+            self.agentManager.newSession(agent: .claude, workdir: workdir,
+                                         resume: resumeId, continueLast: continueLast)
+        }
+        agent.agentManager = agentManager   // 控制台(stream-json)会话也桥接到手机(start 内订阅)
         agent.start()
         relayAgent = agent
         SettingsWindowController.shared.relayAgent = agent
@@ -304,7 +343,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let p = event.ppid, p > 1 else { return "?" }
             return ProcessUtils.findTerminalKind(startPid: pid_t(p)).displayName
         }()
-        vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term)")
+        vlog("EVENT \(event.hookEventName) session=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-") ppid=\(event.ppid.map(String.init) ?? "-") term=\(term) tx=\(event.transcriptPath ?? "<nil>")")
+
+        // 控制台(stream-json 新架构)spawn 的会话:**不进旧 store 路径**(避免与新桥接重复显示)。
+        // 仅 PreToolUse 交给新权限路由(审批走控制台/手机);其余事件直接放过。
+        if let ppid = event.ppid, agentManager.isConsoleSession(ownerPID: pid_t(ppid)) {
+            if event.hookEventName == "PreToolUse" {
+                _ = agentManager.handleConsolePreToolUse(
+                    ownerPID: pid_t(ppid),
+                    toolName: event.toolName ?? "",
+                    detail: event.toolInput?.command ?? event.toolInput?.filePath ?? "",
+                    decide: { [weak conn] d in _ = conn?.respond(json: d.hookOutput) })
+            } else {
+                conn.dismiss()
+            }
+            return
+        }
+
         store.apply(event)
 
         // 每个工具/停止事件来时立即读一次转录,不等下一次 800ms 轮询 → 执行完一步即时显示
@@ -312,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let sid = event.sessionId, let path = event.transcriptPath {
             switch event.hookEventName {
             case "PreToolUse", "PostToolUse", "Stop", "Notification":
-                store.updateTurnSteps(sessionId: sid, steps: TranscriptReader.currentTurnSteps(transcriptPath: path))
+                store.updateTurnSteps(sessionId: sid, steps: CodingAgents.turnSteps(transcriptPath: path))
             default:
                 break
             }
@@ -339,6 +394,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let tool = event.toolName,
            PolicyConstants.dangerousTools.contains(tool),
            let sid = event.sessionId {
+            // 黑名单策略:Bash 默认放行,只有删除/git push/delete/install 才弹审批。
+            if tool == "Bash", !PolicyConstants.bashNeedsApproval(event.toolInput?.command ?? "") {
+                vlog("auto-allow bash: sid=\(sid.prefix(8))")
+                _ = conn.respond(json: PermissionDecision.allow.hookOutput)
+                return
+            }
             vlog("pending permission: sid=\(sid.prefix(8)) tool=\(tool)")
             pendingStore.add(sid: sid, conn: conn)
         } else if event.hookEventName == "PreToolUse",
@@ -365,7 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let started = Date()
             while !Task.isCancelled {
                 guard let self else { return }
-                let steps = TranscriptReader.currentTurnSteps(transcriptPath: transcriptPath)
+                let steps = CodingAgents.turnSteps(transcriptPath: transcriptPath)
                 if steps != lastSteps {
                     lastSteps = steps
                     self.store.updateTurnSteps(sessionId: sessionId, steps: steps)
@@ -517,6 +578,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return mi
         }())
 
+        // stream-json 新架构的桌面入口(实验):点开类终端窗口,自己 spawn 会话对话。
+        menu.addItem({
+            let mi = NSMenuItem(title: "Agent 控制台(实验)",
+                                action: #selector(openAgentConsole), keyEquivalent: "")
+            return mi
+        }())
+        // Web 控制台(WKWebView + React)
+        menu.addItem({
+            let mi = NSMenuItem(title: "Agent 控制台(Web)",
+                                action: #selector(openWebConsole), keyEquivalent: "")
+            return mi
+        }())
+
         menu.addItem(.separator())
 
         let displayParent = NSMenuItem(
@@ -574,6 +648,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mi.state = (stored == screen.localizedName) ? .on : .off
             menu.addItem(mi)
         }
+    }
+
+    @objc private func openAgentConsole() {
+        AgentConsoleWindowController.shared.show()
+    }
+
+    @objc private func openWebConsole() {
+        WebConsoleWindowController.shared.manager = agentManager
+        WebConsoleWindowController.shared.store = store
+        WebConsoleWindowController.shared.relayAgent = relayAgent
+        WebConsoleWindowController.shared.show()
     }
 
     @objc private func openSettings() {

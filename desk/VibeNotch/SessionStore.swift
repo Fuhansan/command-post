@@ -50,7 +50,7 @@ final class SessionStore: ObservableObject {
                     state: .idle,
                     cwd: cwd,
                     promptSummary: prevPrompt,
-                    turnSteps: TranscriptReader.currentTurnSteps(transcriptPath: path),
+                    turnSteps: CodingAgents.turnSteps(transcriptPath: path),
                     toolDetail: nil,
                     terminal: terminal,
                     terminalPID: terminalPID,
@@ -100,7 +100,10 @@ final class SessionStore: ObservableObject {
                     return Date()
                 }()
                 entry?.toolDetail = formatToolDetail(name: event.toolName, input: event.toolInput)
-                if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool) {
+                // 黑名单策略:放行的 Bash 不进等待态(否则会误标「需处理」)。
+                let safeBash = event.toolName == "Bash"
+                    && !PolicyConstants.bashNeedsApproval(event.toolInput?.command ?? "")
+                if let tool = event.toolName, PolicyConstants.dangerousTools.contains(tool), !safeBash {
                     entry?.state = .waiting(message: "Run \(tool)?")
                 } else if event.toolName == "AskUserQuestion" {
                     // TUI 选择题:进入等待 + 保留题目结构(刘海/手机渲染交互卡)

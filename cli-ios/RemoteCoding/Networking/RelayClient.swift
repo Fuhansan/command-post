@@ -6,6 +6,7 @@ struct RelaySession: Identifiable {
     let id: String              // sid
     var title: String           // 项目名(cwd 末段)
     var terminal: String        // 终端/IDE 名
+    var cli: String = ""        // CLI 类型 claude|codex|""(决定快捷指令集)
     var cwd: String             // 项目工作目录
     var subtitle: String        // prompt 摘要 / 当前活动
     var status: String          // idle | working | waiting | done | ended
@@ -13,7 +14,12 @@ struct RelaySession: Identifiable {
     var pendingKind: String     // ""|perm(待审批,可批量)|question(待选择,需进会话)
     var pendingDetail: String   // 待办摘要(命令 / 题目)
     var agentId: String         // 来自哪台电脑(多机同账号时区分;reset 按机清理)
+    var source: String = ""     // console=VibeNotch 项目会话 | hook=用户手动敲的(锁屏不可控)
+    var agentSessionId: String = ""   // claude session_id(项目内去重历史 / 定位进入)
+    var hasMore: Bool = false   // 还有更早的消息没加载(顶部显示「加载更早」)
     var messages: [UIMessage]   // 该会话的下行富消息
+
+    var isManual: Bool { source == "hook" }   // 手动会话:平铺首页 + 打「锁屏不可控」标签
 }
 
 /// 应用级中转连接(单例,经 environmentObject 注入)。
@@ -23,6 +29,8 @@ final class RelayClient: ObservableObject {
     @Published private(set) var connection: ConnectionState = .disconnected
     @Published private(set) var agents: [AgentInfo] = []
     @Published private(set) var sessions: [RelaySession] = []
+    /// 电脑端打开的项目列表(结构化,来自 `console:projects` 通道)。首页「项目区」用。
+    @Published private(set) var projects: [ProjectInfo] = []
 
     /// 中转地址。iOS 模拟器可直连宿主机 127.0.0.1;真机改成电脑的局域网 IP。
     // MARK: - 服务器地址(设置页只填 IP + 端口,其余固定拼接)
@@ -109,6 +117,7 @@ final class RelayClient: ObservableObject {
         self.account = account
         sessions = []
         agents = []
+        projects = []
         ws.connect(to: Self.currentURL())
     }
 
@@ -118,6 +127,7 @@ final class RelayClient: ObservableObject {
         ws.disconnect()
         sessions = []
         agents = []
+        projects = []
         ws.connect(to: Self.currentURL())
     }
 
@@ -126,12 +136,14 @@ final class RelayClient: ObservableObject {
         ws.disconnect()
         sessions = []
         agents = []
+        projects = []
     }
 
     func disconnect() {
         account = nil
         agents = []
         sessions = []
+        projects = []
         ws.disconnect()
     }
 
@@ -180,11 +192,16 @@ final class RelayClient: ObservableObject {
     }
 
     private static func parseAgents(_ body: JSONValue?) -> [AgentInfo] {
-        (body?["agents"]?.arrayValue ?? []).map {
-            AgentInfo(id: $0.string("id"), name: $0.string("name", default: "Agent"),
-                      online: $0["online"]?.boolValue ?? true,
-                      suspended: $0["suspended"]?.boolValue ?? false)
+        var seen = Set<String>()
+        var out: [AgentInfo] = []
+        for a in body?["agents"]?.arrayValue ?? [] {
+            let id = a.string("id")
+            guard !id.isEmpty, seen.insert(id).inserted else { continue }   // 同 id 去重
+            out.append(AgentInfo(id: id, name: a.string("name", default: "Agent"),
+                                 online: a["online"]?.boolValue ?? true,
+                                 suspended: a["suspended"]?.boolValue ?? false))
         }
+        return out
     }
 
     /// 断开某台电脑(服务器挂起它并踢下线;它的会话随 reset/离线清除)。
@@ -222,11 +239,15 @@ final class RelayClient: ObservableObject {
         let online = body["online"]?.boolValue ?? false
         let name = body["name"]?.stringValue
         if let idx = agents.firstIndex(where: { $0.id == id }) {
-            // 上线即清掉挂起/重连中;离线保留原 suspended(挂起导致的离线仍显示「重连」)
-            let susp = online ? false : agents[idx].suspended
-            let resuming = online ? false : agents[idx].resuming
-            agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name,
-                                    online: online, suspended: susp, resuming: resuming)
+            // 离线且非挂起/非重连中 → 该电脑已下线,直接移除(不在列表里残留僵尸)
+            if !online && !agents[idx].suspended && !agents[idx].resuming {
+                agents.remove(at: idx)
+            } else {
+                let susp = online ? false : agents[idx].suspended
+                let resuming = online ? false : agents[idx].resuming
+                agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name,
+                                        online: online, suspended: susp, resuming: resuming)
+            }
         } else if online {
             agents.append(AgentInfo(id: id, name: name ?? id, online: true))
         }
@@ -239,7 +260,10 @@ final class RelayClient: ObservableObject {
 
     /// PROTOCOL §5 —— ui 帧按 `sid` 归入对应会话;`body.session` 为任务元信息(首页行用)。
     private func applyUI(_ frame: Frame) {
-        guard let sid = frame.sid, let msg = UIMessage(frame: frame) else { return }
+        guard let sid = frame.sid else { return }
+        // 项目列表通道:解析成结构化项目模型,不当作聊天会话展示。
+        if sid == "console:projects" { applyProjects(frame.body); return }
+        guard let msg = UIMessage(frame: frame) else { return }
         let meta = frame.body?["session"]
         let idx = sessions.firstIndex(where: { $0.id == sid })
         var s = idx.map { sessions[$0] }
@@ -248,8 +272,12 @@ final class RelayClient: ObservableObject {
                             pendingKind: "", pendingDetail: "", agentId: "", messages: [])
         if let meta {
             s.agentId = meta["agent"]?.stringValue ?? s.agentId
+            s.source = meta["source"]?.stringValue ?? s.source
+            s.agentSessionId = meta["claudeId"]?.stringValue ?? s.agentSessionId
+            s.hasMore = meta["hasMore"]?.boolValue ?? s.hasMore
             s.title = meta["title"]?.stringValue ?? s.title
             s.terminal = meta["terminal"]?.stringValue ?? s.terminal
+            s.cli = meta["cli"]?.stringValue ?? s.cli
             s.cwd = meta["cwd"]?.stringValue ?? s.cwd
             s.subtitle = meta["subtitle"]?.stringValue ?? s.subtitle
             s.status = meta["status"]?.stringValue ?? s.status
@@ -268,6 +296,19 @@ final class RelayClient: ObservableObject {
             s.messages.append(msg)
         }
         if let idx { sessions[idx] = s } else { sessions.append(s) }
+    }
+
+    /// 解析 `console:projects` 通道的结构化项目列表 → 驱动首页「项目区」。
+    private func applyProjects(_ body: JSONValue?) {
+        let arr = body?["projects"]?.arrayValue ?? []
+        projects = arr.compactMap { p in
+            let wd = p.string("workdir")
+            guard !wd.isEmpty else { return nil }
+            let hist = (p["history"]?.arrayValue ?? []).map {
+                ProjectHistory(id: $0.string("id"), label: $0.string("label"))
+            }
+            return ProjectInfo(workdir: wd, name: p.string("name"), history: hist)
+        }
     }
 
     /// PROTOCOL §7 —— patch:
@@ -315,21 +356,37 @@ final class RelayClient: ObservableObject {
                      body: .object(["kind": .string("text"), "text": .string(trimmed)]))
     }
 
-    /// 图文输入:图片(base64)+ 可选文字一起发往电脑端,注入对应终端。本地先回显一条图文气泡。
-    func sendImageInput(images: [StagedImagePayload], text: String, sessionId: String) {
-        guard !images.isEmpty else { return sendInput(text: text, sessionId: sessionId) }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let frameId = "in_\(UUID().uuidString)"
-        var msg = UIMessage(localUserImages: images, text: trimmed)
-        msg.status = .sending; msg.upstreamId = frameId
+    /// 图文回显:即时在气泡里显示(缩略图,仅本地展示),先不发送。
+    /// 返回本地消息 id,供图片上传完成后关联发送 / 更新投递状态。
+    func beginImageEcho(thumbs: [StagedImagePayload], text: String, sessionId: String) -> String {
+        var msg = UIMessage(localUserImages: thumbs, text: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        msg.status = .sending
         if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[idx].messages.append(msg)
         }
-        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: msg.id,
+        return msg.id
+    }
+
+    /// 图片上传换回 id 后,发送图文输入帧 —— 控制通道**只带图片 id**,不带 base64。
+    /// 电脑端 VibeNotch 凭 id 经 HTTP 把图拉下来再注入。
+    func sendImageRefs(refs: [(id: String, ext: String)], text: String, sessionId: String, localMsgId: String) {
+        guard !refs.isEmpty else {
+            // 全部上传失败 → 标记失败,气泡可手动重发(此时无 pendingFrame,重发走重新上传由 UI 兜底)
+            setStatus(.failed, localMsgId: localMsgId, sessionId: sessionId)
+            return
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let frameId = "in_\(UUID().uuidString)"
+        // 把上行帧 id 记到回显消息上(重发/对账用)
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+           let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == localMsgId }) {
+            sessions[sIdx].messages[mIdx].upstreamId = frameId
+        }
+        sendReliable(t: "input", id: frameId, sid: sessionId, localMsgId: localMsgId,
                      body: .object([
                        "kind": .string("image"),
                        "text": .string(trimmed),
-                       "images": .array(images.map { .object(["data": .string($0.data), "ext": .string($0.ext)]) })
+                       "images": .array(refs.map { .object(["id": .string($0.id), "ext": .string($0.ext)]) })
                      ]))
     }
 
@@ -343,6 +400,32 @@ final class RelayClient: ObservableObject {
                        "action_id": .string("launch_command"),
                        "value": .string(cmd)
                      ]))
+    }
+
+    // MARK: - 项目内开会话(电脑端 onRemoteConsoleOpen 处理)
+
+    /// 在项目里「继续最近」会话(claude --continue)。
+    func consoleContinue(workdir: String) { sendConsoleOpen("console_continue", value: workdir) }
+    /// 在项目里开「全新」会话。
+    func consoleNewSession(workdir: String) { sendConsoleOpen("console_new", value: workdir) }
+    /// 从项目历史里「恢复」一条会话(claude --resume <id>)。
+    func consoleResume(workdir: String, historyId: String) {
+        sendConsoleOpen("console_resume", value: "\(workdir)\u{1}\(historyId)")
+    }
+    /// 懒加载:请求该会话更早的一批消息(电脑端扩大窗口重推)。
+    func loadMoreMessages(sessionId: String) {
+        sendConsoleOpen("console_load_more", value: sessionId)
+    }
+    private func sendConsoleOpen(_ actionId: String, value: String) {
+        sendReliable(t: "action", id: "act_\(UUID().uuidString)", sid: "system", localMsgId: nil,
+                     body: .object(["action_id": .string(actionId), "value": .string(value)]))
+    }
+
+    /// 某 cwd 属于哪个项目(最长前缀匹配)——把项目子目录里的手动会话也折叠进该项目。
+    func project(forCwd cwd: String) -> ProjectInfo? {
+        projects
+            .filter { cwd == $0.workdir || cwd.hasPrefix($0.workdir + "/") }
+            .max(by: { $0.workdir.count < $1.workdir.count })
     }
 
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。

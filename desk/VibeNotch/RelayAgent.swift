@@ -24,7 +24,8 @@ final class RelayAgent: NSObject, ObservableObject {
     }
     @Published private(set) var connState: ConnState = .offline
 
-    static let relayURL = URL(string: "ws://127.0.0.1:8090/ws")!
+    /// 中转地址改由 AgentServer 提供(可在设置里填 VPS 公网 IP),不再写死本机。
+    static var relayURL: URL { AgentServer.wsURL }
     /// 本机 Agent 的稳定唯一标识(多台电脑同账号时区分会话/快照/在线状态)。
     static let deviceId: String = {
         let key = "agent.deviceId"
@@ -51,6 +52,9 @@ final class RelayAgent: NSObject, ObservableObject {
     var onRemoteAnswerLocal: ((String) -> Void)?
     /// 手机请求新建会话:打开 Terminal.app 运行命令(如 `claude`)。
     var onRemoteLaunch: ((String) -> Void)?
+    /// 手机从「打开项目」选了某项目的会话方式 → 电脑在该目录开 stream-json 会话。
+    /// (workdir, resumeId?, continueLast)
+    var onRemoteConsoleOpen: ((String, String?, Bool) -> Void)?
     /// 手机回传的远程决定(allow/deny)。由 AppDelegate 接到 `decide(sessionId:decision:)`。
     var onRemoteDecision: ((String, PermissionDecision) -> Void)?
 
@@ -58,8 +62,40 @@ final class RelayAgent: NSObject, ObservableObject {
     private let pending: PendingDecisionStore
 
     private var task: URLSessionWebSocketTask?
-    private lazy var session = URLSession(configuration: .default)
+    private lazy var session = URLSession.direct   // 直连中转服务器,不走系统代理
     private var cancellables = Set<AnyCancellable>()
+
+    /// 控制台(stream-json 新架构)会话桥接:订阅它,把 AgentSession 翻成现有手机协议帧。
+    weak var agentManager: AgentSessionManager?
+    private var lastSentConsole: [String: String] = [:]
+    private var knownConsoleSids: Set<String> = []
+    private var consoleWindow: [String: Int] = [:]   // csid → 当前推送的消息窗口大小(懒加载)
+    private static let defaultConsoleWindow = 25
+    private static let consoleWindowStep = 25
+    // hook 会话历史回填(转录里、当前轮之前的旧消息):缓存解析结果 + 窗口大小,翻页扩大窗口。
+    private var hookWindow: [String: Int] = [:]
+    private var hookHistoryCache: [String: [(role: String, kind: AgentMessage.Kind, text: String)]] = [:]
+
+    // 稳定顺序:每条消息按「首次出现」分配单调递增 ord 并固定 —— 审批卡停在它出现的位置,
+    // 不会因为之后到达的文本而被挤到末尾(修审批后顺序错乱)。
+    private var liveOrdMap: [String: Int] = [:]
+    private var liveOrdCounter = 0
+    private func liveOrd(for id: String) -> Int {
+        if let o = liveOrdMap[id] { return o }
+        let o = liveOrdCounter; liveOrdCounter += 1; liveOrdMap[id] = o; return o
+    }
+
+    /// 取某 hook 会话「当前轮之前」的历史消息(转录里),一次解析后缓存复用。
+    private func hookHistory(for e: SessionEntry) -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        if let cached = hookHistoryCache[e.id] { return cached }
+        guard let path = e.transcriptPath else { return [] }
+        let all = AgentSessionManager.parseTranscriptFile(path: path)
+        // 边界 = 最后一条用户消息(当前轮起点);它之后由实时管线渲染,历史只取之前的,避免重复。
+        let boundary = all.lastIndex { $0.role == "user" } ?? all.count
+        let hist = Array(all.prefix(boundary))
+        hookHistoryCache[e.id] = hist
+        return hist
+    }
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
     private var knownSids: Set<String> = []         // 已推送过的会话,用于检测会话整体消失
@@ -104,6 +140,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private var retry = 0
     private var started = false
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
+    private var lastClientResyncAt = Date.distantPast   // 手机上线触发全量重推的防抖
 
     init(store: SessionStore, pending: PendingDecisionStore) {
         self.store = store
@@ -128,6 +165,14 @@ final class RelayAgent: NSObject, ObservableObject {
         pending.$decisionEvents
             .sink { [weak self] _ in Task { @MainActor in self?.syncToServer() } }
             .store(in: &cancellables)
+        if let mgr = agentManager {
+            mgr.$sessions
+                .sink { [weak self] _ in Task { @MainActor in self?.syncConsole() } }
+                .store(in: &cancellables)
+            mgr.$projects
+                .sink { [weak self] _ in Task { @MainActor in self?.syncProjects() } }
+                .store(in: &cancellables)
+        }
         connect()
     }
 
@@ -163,11 +208,32 @@ final class RelayAgent: NSObject, ObservableObject {
         knownSids.removeAll()
         // 进程刚启动(非网络重连)→ 让服务器+手机清掉上个进程实例的残留消息,
         // 避免重启后轮次重置导致旧 id(如 t2:img0/prompt)与新 id 并存的孤儿气泡。
+        // 注意:firstConnect 的翻转推迟到收到 auth_ok 之后(见 ingest),保证首连若没连稳
+        // 时下次重连会重发 reset —— 否则进程重启撞上网络抖动会漏 reset,服务端鬼快照永久残留。
         if firstConnect {
-            firstConnect = false
             sendReset()
         }
+        lastSentConsole.removeAll()
+        consoleWindow.removeAll()   // 重连从默认窗口(最后 25 条)起,避免一次性重推超长历史
         syncToServer()   // 连上后补发当前所有会话
+        syncConsole()    // 控制台会话
+        syncProjects()   // 「打开项目」列表
+    }
+
+    /// 手机上线 → 把当前所有会话**全量重推**(清 lastSent 让 syncToServer 不走去重、整体重发一遍),
+    /// 补齐服务端快照缺漏。带 3s 防抖:手机频繁重连/多设备时不至于反复全量重推。
+    private func forceResyncForClient() {
+        guard Date().timeIntervalSince(lastClientResyncAt) > 3 else { return }
+        lastClientResyncAt = Date()
+        vlog("relay: 手机上线,全量重推当前会话/控制台/项目")
+        lastSent.removeAll()
+        lastSentConsole.removeAll()   // 否则新连/重连的手机拿不到 console 会话与项目(被去重缓存挡住)
+        consoleWindow.removeAll()
+        hookWindow.removeAll()
+        hookHistoryCache.removeAll()  // 重连重算历史边界(当前轮可能已变)
+        syncToServer()
+        syncConsole()
+        syncProjects()
     }
 
     /// 清空本账号在服务器与手机端的全部会话(agent 进程重启时调用)。
@@ -236,6 +302,8 @@ final class RelayAgent: NSObject, ObservableObject {
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
             for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
             permRecords[sid] = nil
+            hookWindow[sid] = nil; hookHistoryCache[sid] = nil
+            for k in Array(liveOrdMap.keys) where k.hasPrefix("m:\(sid):") { liveOrdMap[k] = nil }
         }
         knownSids = activeSids
 
@@ -248,7 +316,11 @@ final class RelayAgent: NSObject, ObservableObject {
             }
             let turn = max(turnCount[e.id] ?? 0, 1)
 
-            let meta = sessionMeta(e)
+            // hook 历史回填:窗口默认最后 N 条(当前轮之前);hasMore 让手机显示「加载更早」。
+            let hist = hookHistory(for: e)
+            let hwin = hookWindow[e.id] ?? Self.defaultConsoleWindow
+            var meta = sessionMeta(e)
+            meta["hasMore"] = hist.count > hwin
             let msgs = buildMessages(e, turn: turn)
             let currentIds = Set(msgs.map { $0.id })
             // 只清理**当前轮**消失的消息(流式变化/待批准已处理);过去轮永久保留为历史。
@@ -257,10 +329,11 @@ final class RelayAgent: NSObject, ObservableObject {
                 sendMessageRemove(sid: e.id, msgId: k)
                 lastSent[k] = nil
             }
-            // 变化的消息才推
+            // 变化的消息才推。ord = 逻辑顺序号(轮次×1000+轮内位置),手机据此排序渲染,
+            // 不受推送到达时序影响 —— 修复审批卡比它前面的文本先到达而排到文本上面的问题。
             for m in msgs {
                 let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
-                                           "time": stamp(for: m.id)]
+                                           "time": stamp(for: m.id), "ord": liveOrd(for: m.id)]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
@@ -270,7 +343,39 @@ final class RelayAgent: NSObject, ObservableObject {
                     "fallbackText": m.fallback, "body": body
                 ]))
             }
+
+            // 历史回填:发窗口内的旧消息(当前轮之前),ord 取负值 —— 永远排在实时消息之前。
+            let shown = hist.suffix(hwin)
+            let startIdx = hist.count - shown.count
+            for (k, hm) in shown.enumerated() {
+                let idx = startIdx + k
+                let mid = "m:\(e.id):h\(idx)"
+                let root: [String: Any]
+                switch hm.kind {
+                case .text where hm.role == "user": root = bubble(role: "user", hm.text)
+                case .tool:                          root = commandComp(hm.text)
+                case .file:                          root = fileComp(path: hm.text, hunks: [])
+                default:                             root = bubble(role: "agent", hm.text)
+                }
+                let body: [String: Any] = ["role": hm.role == "user" ? "user" : "agent",
+                                           "session": meta, "root": root,
+                                           "time": stamp(for: mid), "ord": idx - hist.count]
+                let sig = jsonString(body)
+                guard lastSent[mid] != sig else { continue }
+                lastSent[mid] = sig
+                seq += 1
+                send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": e.id, "seq": seq,
+                                 "from": "agent", "fallbackText": cap(hm.text, 120), "body": body]))
+            }
         }
+    }
+
+    /// 清除一个本机已不存在、但仍残留在服务端/手机上的「鬼会话」。
+    /// 用于:手机点结束一个本地 store 查无的 sid(多由 agent 进程重启、服务端旧快照造成)。
+    func purgeGhostSession(sid: String) {
+        sendSessionRemove(sid: sid)
+        for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
+        knownSids.remove(sid)
     }
 
     /// 删除整个会话(及其所有消息)。
@@ -287,6 +392,202 @@ final class RelayAgent: NSObject, ObservableObject {
                          "from": "agent", "body": ["op": "remove"]]))
     }
 
+    // MARK: - 控制台(stream-json)会话 → 手机(复用现有协议)
+
+    /// 把 AgentSessionManager 的会话翻成手机协议帧。手机 sid 加 "c:" 前缀避免与旧会话冲突;
+    /// 用独立的 lastSentConsole 去重,不与旧 hook 路径互相干扰。
+    private func syncConsole() {
+        guard let mgr = agentManager else { return }
+        let active = Set(mgr.sessions.map { "c:\($0.id)" })
+        for csid in knownConsoleSids where !active.contains(csid) {
+            sendSessionRemove(sid: csid)
+            for k in Array(lastSentConsole.keys) where k.hasPrefix("m:\(csid):") { lastSentConsole[k] = nil }
+            consoleWindow[csid] = nil
+        }
+        knownConsoleSids = active
+
+        for s in mgr.sessions {
+            let csid = "c:\(s.id)"
+            let window = consoleWindow[csid] ?? Self.defaultConsoleWindow
+            var meta = consoleMeta(s)
+            meta["hasMore"] = s.messages.count > window   // 还有更早的没推 → 手机显示「加载更早」
+            let msgs = consoleMessages(s, limit: window)
+            let prefix = "m:\(csid):"
+            let curIds = Set(msgs.map { prefix + $0.id })
+            for k in Array(lastSentConsole.keys) where k.hasPrefix(prefix) && !curIds.contains(k) {
+                sendMessageRemove(sid: csid, msgId: k); lastSentConsole[k] = nil
+            }
+            for m in msgs {
+                let mid = prefix + m.id
+                let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
+                                           "time": stamp(for: mid), "ord": m.ord]
+                let sig = jsonString(body)
+                guard lastSentConsole[mid] != sig else { continue }
+                lastSentConsole[mid] = sig
+                seq += 1
+                send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": csid, "seq": seq,
+                                 "from": "agent", "fallbackText": m.fallback, "body": body]))
+            }
+        }
+    }
+
+    /// 把电脑已打开的项目列表翻成一个「打开项目」ui 消息推手机:每项目一张卡(继续最近/全新/
+    /// 历史恢复按钮)。手机点按钮 → console_* action 回电脑开会话。手机端不用改,复用现有协议。
+    private func syncProjects() {
+        guard let mgr = agentManager else { return }
+        let sid = "console:projects"
+        let mid = "m:\(sid):list"
+        var cards: [[String: Any]] = []
+        var projList: [[String: Any]] = []     // 结构化项目数据(手机端建项目模型用)
+        for proj in mgr.projects {
+            let name = (proj as NSString).lastPathComponent
+            var kids: [[String: Any]] = [text(proj, color: "secondary", style: "caption")]
+            kids.append(["type": "button_group", "props": ["buttons": [
+                button(label: "继续最近", style: "danger", actionId: "console_continue", value: proj),
+                button(label: "全新", style: "default", actionId: "console_new", value: proj)
+            ]]])
+            let hist = AgentSessionManager.listHistory(workdir: proj, limit: 5)
+            if !hist.isEmpty {
+                kids.append(text("从历史恢复:", color: "secondary", style: "caption"))
+                for h in hist {
+                    kids.append(["type": "button_group", "props": ["buttons": [
+                        button(label: "↩︎ \(h.label)", style: "default",
+                               actionId: "console_resume", value: "\(proj)\u{1}\(h.id)")
+                    ]]])
+                }
+            }
+            cards.append(card(title: name, icon: "folder.fill", style: "default", children: kids))
+            projList.append([
+                "workdir": proj, "name": name,
+                "history": hist.map { ["id": $0.id, "label": $0.label] }
+            ])
+        }
+        let root: [String: Any] = cards.isEmpty
+            ? bubble(role: "agent", "电脑端还没打开项目。在电脑 VibeNotch「打开项目」后,这里就能选项目开会话。")
+            : ["type": "stack", "props": ["spacing": 10], "children": cards]
+        let meta: [String: Any] = [
+            "title": "📁 打开项目", "terminal": "控制台", "cli": "claude", "cwd": "",
+            "subtitle": "选项目开会话", "status": "idle", "needsAction": false,
+            "pendingKind": "", "pendingDetail": "", "agent": Self.deviceId, "source": "projects"
+        ]
+        // body.projects:结构化项目列表 —— 手机端据此渲染原生「项目」页(不再解析聊天卡片)。
+        let body: [String: Any] = ["role": "agent", "session": meta, "root": root,
+                                   "projects": projList, "time": stamp(for: mid), "ord": 0]
+        let sig = jsonString(body)
+        guard lastSentConsole[mid] != sig else { return }
+        lastSentConsole[mid] = sig
+        knownConsoleSids.insert(sid)
+        seq += 1
+        send(jsonString(["v": 1, "t": "ui", "id": mid, "sid": sid, "seq": seq,
+                         "from": "agent", "fallbackText": "打开项目", "body": body]))
+    }
+
+    private func consoleMessages(_ s: AgentSession, limit: Int)
+        -> [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] {
+        var out: [(id: String, role: String, root: [String: Any], fallback: String, ord: Int)] = []
+        // 懒加载:默认只推最后 limit 条消息;手机「加载更早」会扩大窗口再要更老的。
+        for m in s.messages.suffix(limit) {
+            switch m.kind {
+            case .text where m.role == "user":
+                out.append(("msg:\(m.id)", "user", bubble(role: "user", m.text), m.text, m.ord))
+            case .text:
+                out.append(("msg:\(m.id)", "agent", bubble(role: "agent", m.text), m.text, m.ord))
+            case .tool:
+                out.append(("msg:\(m.id)", "agent", commandComp(m.text), m.text, m.ord))
+            case .file:
+                out.append(("msg:\(m.id)", "agent", fileComp(path: m.text, hunks: []), m.text, m.ord))
+            case .permission:
+                // 审批卡就长在命令位置:待处理=命令+允许/拒绝;处理后原地变命令+✓已允许/✕已拒绝。
+                let root: [String: Any]
+                if let st = m.permState {
+                    let (label, color, icon, style) = st == "allow"
+                        ? ("✓ 已允许", "success", "checkmark.circle.fill", "default")
+                        : ("✕ 已拒绝", "danger", "xmark.circle.fill", "default")
+                    root = card(title: "审批请求", icon: icon, style: style, children: [
+                        text("请求执行以下操作:", color: "secondary", style: "caption"),
+                        code(m.text), badge(label, color: color)])
+                } else {
+                    let csid = "c:\(s.id)"
+                    root = card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: [
+                        text("请求执行以下操作:", color: "secondary", style: "caption"), code(m.text),
+                        ["type": "button_group", "props": ["buttons": [
+                            button(label: "拒绝", style: "default", actionId: "perm_deny", value: csid),
+                            button(label: "允许", style: "danger", actionId: "perm_allow", value: csid)]]]])
+                }
+                out.append(("msg:\(m.id)", "agent", root, m.text, m.ord))
+            }
+        }
+        var pord = 1_000_000
+        for req in s.pending {
+            pord += 1
+            switch req.kind {
+            case .permission:
+                out.append(("pend:\(req.id)", "agent", consolePermCard(req, csid: "c:\(s.id)"), "需要批准", pord))
+            case .choice, .planConfirm:
+                out.append(("pend:\(req.id)", "agent", consoleChoiceCard(req), "等待你选择", pord))
+            }
+        }
+        if out.isEmpty {
+            out.append(("ready", "agent", bubble(role: "agent", "会话已就绪,发送指令开始 👇"), "会话已就绪", 0))
+        }
+        return out
+    }
+
+    private func consoleMeta(_ s: AgentSession) -> [String: Any] {
+        // 待审批的权限现在是 messages 里一条未处理的 .permission 消息;选择题仍在 pending。
+        let permMsg = s.messages.first { $0.kind == .permission && $0.permState == nil }
+        let isPending = !s.pending.isEmpty || permMsg != nil
+        let pendingKind = permMsg != nil ? "perm" : (s.pending.first != nil ? "question" : "")
+        return [
+            "pendingKind": pendingKind,
+            "pendingDetail": cap(permMsg?.text ?? s.pending.first?.detail ?? "", 160),
+            "agent": Self.deviceId,
+            "source": "console",          // VibeNotch 起的项目会话 → 手机按项目归类
+            "project": s.workdir,         // 所属项目(工作目录)
+            "claudeId": s.agentSessionId ?? "",   // claude session_id:项目内去重历史/定位进入
+            // 标题用首句(项目内同目录,不能再用目录名当标题,否则都一样);没有则「新会话」。
+            "title": s.messages.first { $0.kind == .text && $0.role == "user" }.map { cap($0.text, 40) } ?? "新会话",
+            "terminal": "控制台",
+            "cli": s.agent.rawValue,
+            "cwd": s.workdir,
+            "subtitle": cap(s.messages.last?.text ?? "", 80),
+            "status": isPending ? "waiting" : consoleStatusKey(s.status),
+            "needsAction": isPending
+        ]
+    }
+
+    private func consoleStatusKey(_ st: SessionStatus) -> String {
+        switch st {
+        case .working, .starting: return "working"
+        case .waitingInput:       return "suspended"
+        case .needsResponse:      return "waiting"
+        case .idle:               return "idle"
+        case .done:               return "done"
+        case .error:              return "error"
+        }
+    }
+
+    private func consolePermCard(_ req: PendingRequest, csid: String) -> [String: Any] {
+        var kids: [[String: Any]] = [text("请求执行以下操作:", color: "secondary", style: "caption")]
+        if let d = req.detail { kids.append(code(d)) }
+        kids.append(["type": "button_group", "props": ["buttons": [
+            button(label: "拒绝", style: "default", actionId: "perm_deny", value: csid),
+            button(label: "允许", style: "danger", actionId: "perm_allow", value: csid)
+        ]]])
+        return card(title: "需要你处理", icon: "exclamationmark.circle.fill", style: "danger", children: kids)
+    }
+
+    private func consoleChoiceCard(_ req: PendingRequest) -> [String: Any] {
+        var kids: [[String: Any]] = []
+        if let d = req.detail { kids.append(text(d, bold: true)) }
+        let buttons = req.options.enumerated().map { i, opt in
+            button(label: "\(i + 1) · \(opt.label)", style: i == 0 ? "danger" : "default",
+                   actionId: "question_answer", value: "\(i + 1)")
+        }
+        kids.append(["type": "button_group", "props": ["buttons": buttons]])
+        return card(title: req.title, icon: "list.bullet.clipboard.fill", style: "warning", children: kids)
+    }
+
     /// 任务元信息 —— 手机首页任务行用(项目名/目录/终端/副标题/状态/是否需处理)。
     private func sessionMeta(_ e: SessionEntry) -> [String: Any] {
         let isPerm = pending.pendingIDs.contains(e.id)
@@ -298,15 +599,21 @@ final class RelayAgent: NSObject, ObservableObject {
                ?? (e.pendingQuestion?.tool == "ExitPlanMode" ? "计划待确认" : ""))
         let subtitle = e.promptSummary ?? e.toolDetail ?? e.lastReplyBlock ?? ""
         let cwd = e.cwd
-        let base = (cwd as NSString).lastPathComponent
-        // 标题优先用项目名(cwd 末段);取不到再退回终端名。
-        let project = (base.isEmpty || base == "?" || base == "/") ? e.terminal.displayName : base
+        // 手动会话标题用首句(转录第一条用户消息),没有则「新会话」—— 不再用目录名当标题。
+        let firstPrompt = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
+        let title = firstPrompt.map { cap($0, 40) } ?? "新会话"
+        // CLI 类型(claude/codex…),由转录路径判定 —— 手机据此显示对应的快捷指令。
+        let cli = e.transcriptPath.flatMap { CodingAgents.forTranscript($0)?.id } ?? ""
         return [
             "pendingKind": pendingKind,            // perm=待审批(可批量) question=待选择(逐个)
             "pendingDetail": cap(pendingDetail, 160),
             "agent": Self.deviceId,                // 来自哪台电脑
-            "title": project,                     // 项目名(主标题)
+            "source": "hook",                      // 用户手动敲的 claude → 手机平铺成独立卡片(锁屏不可控)
+            "project": "",                         // 手动会话不归项目
+            "claudeId": e.id,                      // claude session_id(卡片展示,排查重复用)
+            "title": title,                       // 首句(没有则「新会话」)
             "terminal": e.terminal.displayName,    // 终端 / IDE
+            "cli": cli,                            // claude | codex |(空=未知)
             "cwd": cwd,                            // 项目工作目录
             "subtitle": subtitle,
             "status": isPending ? "waiting" : statusKey(e.state),
@@ -318,7 +625,9 @@ final class RelayAgent: NSObject, ObservableObject {
         switch s {
         case .idle: return "idle"
         case .working: return "working"
-        case .waiting: return "waiting"
+        // 这里的 .waiting 是「非审批/非选择」的空闲等输入(Notification hook),映射成 suspended
+        // =「会话挂起」。真正需要你处理的审批/选择由 sessionMeta 的 isPending 单独覆盖成 "waiting"。
+        case .waiting: return "suspended"
         case .done: return "done"
         }
     }
@@ -472,6 +781,13 @@ final class RelayAgent: NSObject, ObservableObject {
         } else if out.isEmpty, case .waiting(let msg) = e.state {
             out.append(Msg(id: "\(pfx)wait", role: "agent",
                            root: bubble(role: "agent", msg), fallback: msg))
+        }
+        // 刚启动、还没任何内容的会话也要出现在手机上(否则从手机新建的会话看不到、
+        // 没法发第一条指令)。占位消息;真实内容到达后会被同轮 diff 清理。
+        if out.isEmpty {
+            out.append(Msg(id: "\(pfx)ready", role: "agent",
+                           root: bubble(role: "agent", "会话已就绪,发送指令开始 👇"),
+                           fallback: "会话已就绪"))
         }
         return out
     }
@@ -651,7 +967,19 @@ final class RelayAgent: NSObject, ObservableObject {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         let t = obj["t"] as? String
         if t == "pong" { lastPongAt = Date(); return }
-        if t == "auth_ok" { connState = .online; return }
+        if t == "auth_ok" {
+            connState = .online
+            // 确认成功上线 → 本次首连的 reset 已送达,以后网络重连不再 reset(保留历史)。
+            firstConnect = false
+            return
+        }
+        // 手机上线 → 服务端会向本机转发一条 client presence。电脑主动把当前所有任务
+        // **全量重推**一遍,补齐服务端快照可能的缺漏(服务端重启丢内存 / 早期断网漏同步)。
+        if t == "presence", let body = obj["body"] as? [String: Any],
+           (body["role"] as? String) == "client", (body["online"] as? Bool) == true {
+            forceResyncForClient()
+            return
+        }
         if t == "error", let body = obj["body"] as? [String: Any],
            (body["fatal"] as? Bool) == true {
             // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
@@ -683,6 +1011,30 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         guard let body = obj["body"] as? [String: Any] else { return }
         let actionId = body["action_id"] as? String ?? ""
+        // 手机从「打开项目」卡片选了会话方式 → 电脑在该目录开 stream-json 会话。
+        if actionId == "console_continue" || actionId == "console_new" || actionId == "console_resume" {
+            let value = body["value"] as? String ?? ""
+            if actionId == "console_resume" {
+                let parts = value.components(separatedBy: "\u{1}")
+                if parts.count == 2 { onRemoteConsoleOpen?(parts[0], parts[1], false) }
+            } else {
+                onRemoteConsoleOpen?(value, nil, actionId == "console_continue")
+            }
+            return
+        }
+        // 懒加载:手机「加载更早」→ 扩大该会话窗口,重推更老的一批。
+        if actionId == "console_load_more" {
+            let sid = body["value"] as? String ?? ""
+            guard !sid.isEmpty else { return }
+            if sid.hasPrefix("c:") {   // 控制台会话
+                consoleWindow[sid] = (consoleWindow[sid] ?? Self.defaultConsoleWindow) + Self.consoleWindowStep
+                Task { @MainActor in self.syncConsole() }
+            } else {                   // hook 会话
+                hookWindow[sid] = (hookWindow[sid] ?? Self.defaultConsoleWindow) + Self.consoleWindowStep
+                Task { @MainActor in self.syncToServer() }
+            }
+            return
+        }
         // 选择题回答:sid 来自帧信封,value 是选项序号(数字键)
         if actionId == "question_answer" {
             guard let sid = obj["sid"] as? String,
@@ -690,6 +1042,11 @@ final class RelayAgent: NSObject, ObservableObject {
             // value = "2"(单选)或 "1,3"(多选,完成后一次性回传)
             let digits = value.split(separator: ",").map(String.init).filter { Int($0) != nil }
             guard !digits.isEmpty else { return }
+            // 控制台(stream-json)会话:路由到 AgentSessionManager
+            if sid.hasPrefix("c:"), let n = Int(digits[0]) {
+                agentManager?.respondChoice(String(sid.dropFirst(2)), optionIndex: n)
+                return
+            }
             var isMulti = false
             if let e = store.sessions.first(where: { $0.id == sid }), let pq = e.pendingQuestion {
                 isMulti = pq.questions.first?.multiSelect == true
@@ -724,6 +1081,17 @@ final class RelayAgent: NSObject, ObservableObject {
             ?? (body["msg_id"] as? String).map { $0.replacingOccurrences(of: "msg:", with: "") }
             ?? ""
         guard !sid.isEmpty else { return }
+        // 控制台(stream-json)会话:sid 带 "c:" 前缀 → 路由到 AgentSessionManager
+        if sid.hasPrefix("c:") {
+            let csid = String(sid.dropFirst(2))
+            switch actionId {
+            case "perm_allow":    agentManager?.respondPermission(csid, allow: true)
+            case "perm_deny":     agentManager?.respondPermission(csid, allow: false)
+            case "session_close": agentManager?.closeSession(csid)
+            default: break
+            }
+            return
+        }
         switch actionId {
         case "perm_allow":    onRemoteDecision?(sid, .allow)
         case "perm_deny":     onRemoteDecision?(sid, .deny)
@@ -738,21 +1106,57 @@ final class RelayAgent: NSObject, ObservableObject {
         guard let sid = obj["sid"] as? String,
               let body = obj["body"] as? [String: Any] else { return }
         let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        var paths: [String] = []
-        if let images = body["images"] as? [[String: Any]] {
-            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            for (i, img) in images.enumerated() {
-                guard let b64 = img["data"] as? String,
-                      let data = Data(base64Encoded: b64) else { continue }
-                let ext = (img["ext"] as? String ?? "jpg").lowercased()
-                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
-                guard FileManager.default.createFile(atPath: path, contents: data) else { continue }
-                paths.append(path)
-            }
+        // 控制台(stream-json)会话:文本直接路由到 AgentSessionManager(图片后续支持)
+        if sid.hasPrefix("c:") {
+            agentManager?.send(String(sid.dropFirst(2)), text: text)
+            return
         }
-        guard !text.isEmpty || !paths.isEmpty else { return }
-        onRemoteInput?(sid, text, paths)
+        let images = body["images"] as? [[String: Any]] ?? []
+        // 图片要从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程注入终端。
+        Task.detached(priority: .userInitiated) { [weak self] in
+            var paths: [String] = []
+            if !images.isEmpty {
+                let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                for (i, img) in images.enumerated() {
+                    let ext = (img["ext"] as? String ?? "jpg").lowercased()
+                    let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
+                    let data: Data?
+                    if let id = img["id"] as? String, !id.isEmpty {
+                        data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
+                        vlog("relay image[\(i)] 走 id=\(id) → \(data != nil ? "下载成功 \(data!.count)B" : "下载失败")")
+                    } else if let b64 = img["data"] as? String {
+                        data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
+                        vlog("relay image[\(i)] 走 base64(旧链路) \(data?.count ?? 0)B")
+                    } else {
+                        data = nil
+                        vlog("relay image[\(i)] 既无 id 也无 data,跳过 keys=\(Array(img.keys))")
+                    }
+                    guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
+                    paths.append(path)
+                }
+            }
+            guard !text.isEmpty || !paths.isEmpty else { return }
+            await MainActor.run { self?.onRemoteInput?(sid, text, paths) }
+        }
+    }
+
+    /// 凭 id 从服务器(HTTP 8080,与 WS 的 8090 同主机)下载图片字节。
+    /// 已在后台调用,同步等待结果。带配对 token(服务器据此按账号取图)。
+    nonisolated private static func downloadImage(id: String) -> Data? {
+        guard let url = URL(string: "\(AgentServer.httpBase)/api/image/\(id)") else { return nil }
+        var req = URLRequest(url: url, timeoutInterval: 30)
+        if let token = AgentCredentials.token, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        var out: Data?
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.direct.dataTask(with: req) { data, resp, _ in
+            if let http = resp as? HTTPURLResponse, http.statusCode == 200 { out = data }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 30)
+        return out
     }
 
     // MARK: - 收发底层

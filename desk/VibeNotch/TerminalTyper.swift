@@ -1,7 +1,9 @@
 import AppKit
 
 /// 把文字「打」进当前聚焦的终端窗口(CGEvent 模拟键盘,任意终端/IDE 通用)。
-/// 调用前需先激活目标窗口(jumpToTerminal),且要求辅助功能权限。
+/// **仅作非 tmux 会话的回退**:调用前需先激活目标窗口(jumpToTerminal),要求辅助
+/// 功能权限,且**锁屏时无效**(macOS 不向锁屏后的 App 投递模拟按键)。
+/// 想锁屏也能控,会话要跑在 tmux 里(走 TmuxBridge)。
 enum TerminalTyper {
 
     /// 模拟键入 text,然后按回车提交。换行替换为空格,避免中途提交。

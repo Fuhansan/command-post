@@ -99,6 +99,17 @@ public class Hub {
 
     public void register(Connection c) {
         Account a = acc(c.account);
+        if (c.isAgent() && c.deviceId != null && !c.deviceId.isEmpty()) {
+            // 同一台电脑(deviceId)只保留一条连接:踢掉同设备的旧连接(僵尸/重连残留),
+            // 避免 authOk 把同一台 Mac 报成多个。
+            a.agents.values().removeIf(old -> {
+                if (c.deviceId.equals(old.deviceId) && old.channel != c.channel) {
+                    if (old.channel.isActive()) old.channel.close();
+                    return true;
+                }
+                return false;
+            });
+        }
         (c.isAgent() ? a.agents : a.clients).put(c.channel.id(), c);
     }
 
