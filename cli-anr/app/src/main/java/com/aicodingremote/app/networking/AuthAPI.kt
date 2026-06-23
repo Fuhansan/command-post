@@ -35,6 +35,13 @@ object AuthAPI {
         val hasPassword: String? = null,
     )
 
+    /** [check] 返回:邮箱是否已注册、是否已设密码。前端据此分流到密码登录 / 验证码登录 / 注册。 */
+    @Serializable
+    data class CheckResult(
+        val exists: Boolean,
+        val hasPassword: Boolean,
+    )
+
     /** 服务端错误(带可展示文案)。 */
     class AuthException(message: String) : Exception(message)
 
@@ -81,6 +88,68 @@ object AuthAPI {
             "${ServerConfig.restBaseURL()}/api/pair/claim",
             buildJson("code" to code, "token" to token),
             "配对失败",
+        )
+    }
+
+    /** 统一入口:查邮箱是否已注册、是否设了密码,据此分流(密码登录 / 验证码登录 / 注册)。 */
+    suspend fun check(account: String): CheckResult = withContext(Dispatchers.IO) {
+        val raw = post(
+            "${baseURL()}/check",
+            buildJson("account" to account),
+            "检查失败",
+        )
+        json.decodeFromString(CheckResult.serializer(), raw)
+    }
+
+    /** 验证码登录 - 第一步:发码到该邮箱(账号须已注册)。 */
+    suspend fun loginCode(account: String) {
+        post(
+            "${baseURL()}/login/code",
+            buildJson("account" to account),
+            "发送失败",
+        )
+    }
+
+    /** 验证码登录 - 第二步:验码并登录。 */
+    suspend fun loginVerify(account: String, code: String): AuthResult =
+        postForResult(
+            "${baseURL()}/login/verify",
+            buildJson("account" to account, "code" to code),
+            "登录失败",
+        )
+
+    /** 注册 - 第一步:请求把注册验证码发到该邮箱(已注册会报错)。 */
+    suspend fun registerCode(account: String) {
+        post(
+            "${baseURL()}/register/code",
+            buildJson("account" to account),
+            "发送失败",
+        )
+    }
+
+    /** 注册 - 第二步:验码 + 创建账号,直接返回登录令牌。 */
+    suspend fun register(account: String, code: String, password: String): AuthResult =
+        postForResult(
+            "${baseURL()}/register",
+            buildJson("account" to account, "code" to code, "password" to password),
+            "注册失败",
+        )
+
+    /** 忘记密码 - 第一步:请求把验证码发到该邮箱。 */
+    suspend fun forgotPassword(account: String) {
+        post(
+            "${baseURL()}/forgot",
+            buildJson("account" to account),
+            "发送失败",
+        )
+    }
+
+    /** 忘记密码 - 第二步:用验证码重设密码。 */
+    suspend fun resetPassword(account: String, code: String, password: String) {
+        post(
+            "${baseURL()}/reset",
+            buildJson("account" to account, "code" to code, "password" to password),
+            "重置失败",
         )
     }
 

@@ -32,9 +32,13 @@ import com.aicodingremote.app.designsystem.Theme
 import com.aicodingremote.app.features.more.DevicesScreen
 import com.aicodingremote.app.features.more.SettingsScreen
 import com.aicodingremote.app.features.notifications.NotificationsScreen
+import com.aicodingremote.app.features.tasks.ProjectSessionsScreen
 import com.aicodingremote.app.features.tasks.TaskDetailScreen
 import com.aicodingremote.app.features.tasks.TasksScreen
 import com.aicodingremote.app.networking.UpdateChecker
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 /**
  * 主框架:底部 4 Tab(任务 / 通知 / 设备 / 设置)+ 详情页;
@@ -46,6 +50,7 @@ fun MainScreen(updater: UpdateChecker) {
     val backStack by nav.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val showBottom = currentRoute?.startsWith(Route.SESSION_PREFIX) != true
+        && currentRoute?.startsWith(Route.PROJECT_PREFIX) != true
     // 通知 Tab 角标 = 跨会话待办数(对位 iOS `.badge(relay.pendingCount)`)。
     val relay = LocalRelayClient.current
 
@@ -70,7 +75,10 @@ fun MainScreen(updater: UpdateChecker) {
         ) {
             NavHost(navController = nav, startDestination = Route.TASKS) {
                 composable(Route.TASKS) {
-                    TasksScreen(onOpen = { sid -> nav.navigate(Route.session(sid)) })
+                    TasksScreen(
+                        onOpenSession = { sid -> nav.navigate(Route.session(sid)) },
+                        onOpenProject = { wd -> nav.navigate(Route.project(wd)) },
+                    )
                 }
                 composable(Route.NOTIFICATIONS) {
                     NotificationsScreen(onOpen = { sid -> nav.navigate(Route.session(sid)) })
@@ -80,6 +88,20 @@ fun MainScreen(updater: UpdateChecker) {
                 composable(Route.SESSION) { entry ->
                     val sid = entry.arguments?.getString("sid").orEmpty()
                     TaskDetailScreen(sessionId = sid, onBack = { nav.popBackStack() })
+                }
+                composable(Route.PROJECT) { entry ->
+                    val wd = entry.arguments?.getString("wd")
+                        ?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) }
+                        .orEmpty()
+                    ProjectSessionsScreen(
+                        workdir = wd,
+                        onBack = { nav.popBackStack() },
+                        onOpenSession = { sid ->
+                            // 程序化进入新会话:不在 project 上叠加,而是替换回 tasks → session
+                            nav.popBackStack()
+                            nav.navigate(Route.session(sid))
+                        },
+                    )
                 }
             }
         }
@@ -93,7 +115,11 @@ private object Route {
     const val SETTINGS = "settings"
     const val SESSION_PREFIX = "session/"
     const val SESSION = "session/{sid}"
+    const val PROJECT_PREFIX = "project/"
+    const val PROJECT = "project/{wd}"
     fun session(sid: String) = "$SESSION_PREFIX$sid"
+    fun project(workdir: String) =
+        "$PROJECT_PREFIX${URLEncoder.encode(workdir, StandardCharsets.UTF_8.name())}"
 }
 
 @Composable

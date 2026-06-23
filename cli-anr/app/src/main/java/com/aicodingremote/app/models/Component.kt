@@ -93,6 +93,7 @@ data class UIMessage(
     val root: Component,
     val fallbackText: String?,
     val time: String? = null,                  // 消息时间(HH:mm,首次出现时刻,由 agent 下发)
+    val ord: Int = Int.MAX_VALUE,              // 逻辑顺序号(agent 下发,轮次×1000+轮内位置);本地消息=MAX_VALUE 排末尾
     val status: DeliveryStatus? = null,        // 仅本地发出的消息有;agent 下发的为 null
     val upstreamId: String? = null,            // 对应的上行帧 id(重发/对账用)
 ) {
@@ -108,14 +109,20 @@ data class UIMessage(
                 root = Component.from(body["root"]),
                 fallbackText = frame.fallbackText,
                 time = body["time"]?.stringValue,
+                ord = body["ord"]?.intValue ?: Int.MAX_VALUE,
             )
         }
 
         /** 本地构造一条用户文本消息(用户在输入框发送时)。 */
         fun localUserText(text: String): UIMessage {
+            // 用 bubble(role:user) 而非裸 text:发出去立刻就是右侧蓝气泡,与 agent 回传的
+            // 用户消息同构(BubbleRenderer 读 text/role)。否则裸 text 左对齐无气泡,看着像「在左边」。
             val root = buildJsonObject {
-                put("type", "text")
-                putJsonObject("props") { put("text", text) }
+                put("type", "bubble")
+                putJsonObject("props") {
+                    put("text", text)
+                    put("role", "user")
+                }
             }
             return UIMessage(
                 id = UUID.randomUUID().toString(),

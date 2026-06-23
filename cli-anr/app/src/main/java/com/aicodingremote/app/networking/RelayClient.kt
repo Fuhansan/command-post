@@ -14,6 +14,8 @@ import com.aicodingremote.app.models.ComponentAction
 import com.aicodingremote.app.models.DeliveryStatus
 import com.aicodingremote.app.models.Frame
 import com.aicodingremote.app.models.FrameType
+import com.aicodingremote.app.models.ProjectHistory
+import com.aicodingremote.app.models.ProjectInfo
 import com.aicodingremote.app.models.StagedImagePayload
 import com.aicodingremote.app.models.UIMessage
 import com.aicodingremote.app.models.arrayValue
@@ -49,6 +51,7 @@ data class RelaySession(
     val id: String,                 // sid
     val title: String,              // 项目名(cwd 末段)
     val terminal: String,           // 终端/IDE 名
+    val cli: String = "",           // CLI 类型 claude|codex|""(决定快捷指令集)
     val cwd: String,                // 项目工作目录
     val subtitle: String,           // prompt 摘要 / 当前活动
     val status: String,             // idle | working | waiting | done | ended
@@ -56,8 +59,14 @@ data class RelaySession(
     val pendingKind: String,        // ""|perm(待审批,可批量)|question(待选择,需进会话)
     val pendingDetail: String,      // 待办摘要(命令 / 题目)
     val agentId: String,            // 来自哪台电脑(多机同账号时区分;reset 按机清理)
+    val source: String = "",        // console=VibeNotch 项目会话 | hook=用户手动敲的(锁屏不可控)
+    val agentSessionId: String = "",// claude session_id(项目内去重历史 / 定位进入)
+    val hasMore: Boolean = false,   // 还有更早的消息没加载(顶部显示「加载更早」)
     val messages: SnapshotStateList<UIMessage>,
-)
+) {
+    /** 手动会话:平铺首页 + 打「锁屏不可控」标签。 */
+    val isManual: Boolean get() = source == "hook"
+}
 
 /**
  * 应用级中转连接(ViewModel),经 CompositionLocal 注入。
@@ -74,6 +83,9 @@ class RelayClient : ViewModel() {
     val agents: SnapshotStateList<AgentInfo> = mutableStateListOf()
     val sessions: SnapshotStateList<RelaySession> = mutableStateListOf()
 
+    /** 电脑端打开的项目列表(结构化,来自 `console:projects` 通道)。首页「项目区」用。 */
+    val projects: SnapshotStateList<ProjectInfo> = mutableStateListOf()
+
     private val ws = WebSocketClient(onState = { connection = it })
     private var account: String? = null
 
@@ -89,6 +101,7 @@ class RelayClient : ViewModel() {
         this.account = account
         sessions.clear()
         agents.clear()
+        projects.clear()
         ws.connect(ServerConfig.currentURL())
     }
 
@@ -98,6 +111,7 @@ class RelayClient : ViewModel() {
         ws.disconnect()
         sessions.clear()
         agents.clear()
+        projects.clear()
         ws.connect(ServerConfig.currentURL())
     }
 
@@ -106,12 +120,14 @@ class RelayClient : ViewModel() {
         ws.disconnect()
         sessions.clear()
         agents.clear()
+        projects.clear()
     }
 
     fun disconnect() {
         account = null
         agents.clear()
         sessions.clear()
+        projects.clear()
         ws.disconnect()
     }
 
@@ -249,6 +265,11 @@ class RelayClient : ViewModel() {
      */
     private fun applyUI(frame: Frame) {
         val sid = frame.sid ?: return
+        // 项目列表通道:解析成结构化项目模型,不当作聊天会话展示。
+        if (sid == "console:projects") {
+            applyProjects(frame.body)
+            return
+        }
         val msg = UIMessage.from(frame) ?: return
         val meta = frame.body?.get("session")
 
@@ -268,8 +289,12 @@ class RelayClient : ViewModel() {
         )
         val updated = current.copy(
             agentId = meta?.get("agent")?.stringValue ?: current.agentId,
+            source = meta?.get("source")?.stringValue ?: current.source,
+            agentSessionId = meta?.get("claudeId")?.stringValue ?: current.agentSessionId,
+            hasMore = meta?.get("hasMore")?.boolValue ?: current.hasMore,
             title = meta?.get("title")?.stringValue ?: current.title,
             terminal = meta?.get("terminal")?.stringValue ?: current.terminal,
+            cli = meta?.get("cli")?.stringValue ?: current.cli,
             cwd = meta?.get("cwd")?.stringValue ?: current.cwd,
             subtitle = meta?.get("subtitle")?.stringValue ?: current.subtitle,
             status = meta?.get("status")?.stringValue ?: current.status,
@@ -290,6 +315,21 @@ class RelayClient : ViewModel() {
         if (mIdx >= 0) updated.messages[mIdx] = msg else updated.messages.add(msg)
 
         if (idx >= 0) sessions[idx] = updated else sessions.add(updated)
+    }
+
+    /** 解析 `console:projects` 通道的结构化项目列表 → 驱动首页「项目区」。 */
+    private fun applyProjects(body: JsonElement?) {
+        val arr = body?.get("projects")?.arrayValue ?: emptyList()
+        val next = arr.mapNotNull { p ->
+            val wd = p.string("workdir")
+            if (wd.isEmpty()) return@mapNotNull null
+            val hist = (p["history"]?.arrayValue ?: emptyList()).map {
+                ProjectHistory(id = it.string("id"), label = it.string("label"))
+            }
+            ProjectInfo(workdir = wd, name = p.string("name"), history = hist)
+        }
+        projects.clear()
+        projects.addAll(next)
     }
 
     /**
@@ -359,29 +399,53 @@ class RelayClient : ViewModel() {
     }
 
     /**
-     * 图文输入:图片(base64)+ 可选文字一起发往电脑端,注入对应终端。本地先回显一条图文气泡。
+     * 图文回显:即时在气泡里显示(缩略图,仅本地展示),先不发送。
+     * 返回本地消息 id,供图片上传完成后关联发送 / 更新投递状态。
      */
-    fun sendImageInput(images: List<StagedImagePayload>, text: String, sessionId: String) {
-        if (images.isEmpty()) {
-            sendInput(text, sessionId)
+    fun beginImageEcho(thumbs: List<StagedImagePayload>, text: String, sessionId: String): String {
+        val trimmed = text.trim()
+        val msg = UIMessage.localUserImages(thumbs, trimmed)
+            .copy(status = DeliveryStatus.SENDING)
+        val idx = sessions.indexOfFirst { it.id == sessionId }
+        if (idx >= 0) sessions[idx].messages.add(msg)
+        return msg.id
+    }
+
+    /**
+     * 图片上传换回 id 后,发送图文输入帧 —— 控制通道**只带图片 id**,不带 base64。
+     * 电脑端 VibeNotch 凭 id 经 HTTP 把图拉下来再注入。
+     */
+    fun sendImageRefs(
+        refs: List<Pair<String, String>>,   // (id, ext)
+        text: String,
+        sessionId: String,
+        localMsgId: String,
+    ) {
+        if (refs.isEmpty()) {
+            // 全部上传失败 → 标记失败,气泡可手动重发(此时无 pendingFrame,重发走重新上传由 UI 兜底)
+            setStatus(DeliveryStatus.FAILED, localMsgId, sessionId)
             return
         }
         val trimmed = text.trim()
         val frameId = "in_${UUID.randomUUID()}"
-        val msg = UIMessage.localUserImages(images, trimmed)
-            .copy(status = DeliveryStatus.SENDING, upstreamId = frameId)
-        val idx = sessions.indexOfFirst { it.id == sessionId }
-        if (idx >= 0) sessions[idx].messages.add(msg)
+        // 把上行帧 id 记到回显消息上(重发/对账用)
+        val sIdx = sessions.indexOfFirst { it.id == sessionId }
+        if (sIdx >= 0) {
+            val mIdx = sessions[sIdx].messages.indexOfFirst { it.id == localMsgId }
+            if (mIdx >= 0) {
+                sessions[sIdx].messages[mIdx] = sessions[sIdx].messages[mIdx].copy(upstreamId = frameId)
+            }
+        }
         sendReliable(
-            t = "input", id = frameId, sid = sessionId, localMsgId = msg.id,
+            t = "input", id = frameId, sid = sessionId, localMsgId = localMsgId,
             body = buildJsonObject {
                 put("kind", "image")
                 put("text", trimmed)
                 put("images", buildJsonArray {
-                    images.forEach { img ->
+                    refs.forEach { (id, ext) ->
                         add(buildJsonObject {
-                            put("data", img.data)
-                            put("ext", img.ext)
+                            put("id", id)
+                            put("ext", ext)
                         })
                     }
                 })
@@ -404,6 +468,37 @@ class RelayClient : ViewModel() {
             },
         )
     }
+
+    // MARK: - 项目内开会话(电脑端 onRemoteConsoleOpen 处理)
+
+    /** 在项目里「继续最近」会话(claude --continue)。 */
+    fun consoleContinue(workdir: String) = sendConsoleOpen("console_continue", workdir)
+
+    /** 在项目里开「全新」会话。 */
+    fun consoleNewSession(workdir: String) = sendConsoleOpen("console_new", workdir)
+
+    /** 从项目历史里「恢复」一条会话(claude --resume <id>)。 */
+    fun consoleResume(workdir: String, historyId: String) =
+        sendConsoleOpen("console_resume", "$workdir$historyId")
+
+    /** 懒加载:请求该会话更早的一批消息(电脑端扩大窗口重推)。 */
+    fun loadMoreMessages(sessionId: String) = sendConsoleOpen("console_load_more", sessionId)
+
+    private fun sendConsoleOpen(actionId: String, value: String) {
+        sendReliable(
+            t = "action", id = "act_${UUID.randomUUID()}", sid = "system", localMsgId = null,
+            body = buildJsonObject {
+                put("action_id", actionId)
+                put("value", value)
+            },
+        )
+    }
+
+    /** 某 cwd 属于哪个项目(最长前缀匹配)——把项目子目录里的手动会话也折叠进该项目。 */
+    fun project(forCwd: String): ProjectInfo? =
+        projects
+            .filter { forCwd == it.workdir || forCwd.startsWith(it.workdir + "/") }
+            .maxByOrNull { it.workdir.length }
 
     /**
      * 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。
@@ -565,13 +660,6 @@ class RelayClient : ViewModel() {
                 }
             } ?: (false to "无法连接")
         }
-
-        /**
-         * 默认连机器自身回环。
-         * - 真机:配合 `adb reverse tcp:8090 tcp:8090`,手机的 127.0.0.1:8090 直通 Mac 的 8090,跟 WiFi 无关。
-         * - 模拟器:用 `adb reverse` 同样可达;若没装 adb reverse,把这里改回 `10.0.2.2` 即可。
-         */
-        const val DEFAULT_URL = "ws://127.0.0.1:8090/ws"
     }
 }
 

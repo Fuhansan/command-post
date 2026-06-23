@@ -67,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -92,8 +93,10 @@ import com.aicodingremote.app.models.ComponentAction
 import com.aicodingremote.app.models.DeliveryStatus
 import com.aicodingremote.app.models.StagedImagePayload
 import com.aicodingremote.app.models.UIMessage
+import com.aicodingremote.app.networking.ImageAPI
 import com.aicodingremote.app.networking.RelaySession
 import com.aicodingremote.app.rendering.ComponentView
+import kotlinx.coroutines.launch
 import com.aicodingremote.app.rendering.renderers.AvatarStyle
 import com.aicodingremote.app.rendering.renderers.MessageAvatar
 import com.aicodingremote.app.rendering.renderers.messageAvatarStyle
@@ -109,6 +112,7 @@ import java.io.ByteArrayOutputStream
 @Composable
 fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
     val relay = LocalRelayClient.current
+    val scope = rememberCoroutineScope()
     val session = relay.session(sessionId)
     var draft by rememberSaveable { mutableStateOf("") }
     var showEndConfirm by remember { mutableStateOf(false) }
@@ -180,8 +184,22 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
                 if (stagedImages.isEmpty()) {
                     relay.sendInput(draft, sessionId = sessionId)
                 } else {
-                    relay.sendImageInput(stagedImages.toList(), draft, sessionId = sessionId)
+                    // 1) 立即气泡回显;2) 后台并发上传换 id;3) 拿到 id 后发引用帧。
+                    val thumbs = stagedImages.toList()
+                    val text = draft
+                    val localId = relay.beginImageEcho(thumbs, text, sessionId = sessionId)
                     stagedImages.clear()
+                    scope.launch {
+                        val refs = thumbs.mapNotNull { img ->
+                            try {
+                                val bytes = Base64.decode(img.data, Base64.DEFAULT)
+                                ImageAPI.upload(bytes) to img.ext
+                            } catch (_: Throwable) {
+                                null
+                            }
+                        }
+                        relay.sendImageRefs(refs, text, sessionId = sessionId, localMsgId = localId)
+                    }
                 }
                 draft = ""
             },
