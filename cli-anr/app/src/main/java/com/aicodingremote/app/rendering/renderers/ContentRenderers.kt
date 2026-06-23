@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material3.Icon
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -194,7 +195,11 @@ fun KeyValueRenderer(component: Component) {
     }
 }
 
-/** PROTOCOL §5.2 —— 进度条(`value` 缺省 = 无限转圈)。 */
+/**
+ * PROTOCOL §5.2 —— 进度条。
+ * - 有 `value`(0..1) → 线性进度条;
+ * - 无 `value` → 圆形 spinner(对位 iOS 无限转圈)。
+ */
 @Composable
 fun ProgressRenderer(component: Component) {
     val label = component.props["label"]?.stringValue
@@ -212,11 +217,17 @@ fun ProgressRenderer(component: Component) {
                 modifier = Modifier.fillMaxWidth().height(6.dp),
             )
         } else {
-            LinearProgressIndicator(
-                color = Theme.blue,
-                trackColor = Theme.cardHi,
-                modifier = Modifier.fillMaxWidth().height(6.dp),
-            )
+            // 无限转圈(不知道何时结束):对位 iOS 默认 ProgressView() 的小转圈。
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CircularProgressIndicator(
+                    color = Theme.blue,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
         }
     }
 }

@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.PhotoCamera
@@ -73,7 +74,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
@@ -150,9 +151,11 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
 
     // 只在「底部新增消息」/状态切到 working 时跟随落底,「加载更早」是往上插入(lastId 不变)
     // → 不触发,避免把用户从正在看的位置弹回底部。对位 iOS `.onChange(of: last?.id)`。
+    // 用瞬时 scrollToItem(非 animate)落底,对位 iOS `defaultScrollAnchor(.bottom)` —— 进入/收消息
+    // 直接落底,不再「动画地从上往下扫一遍」长会话的视觉折磨。
     LaunchedEffect(lastId, working) {
         val lastIndex = listState.layoutInfo.totalItemsCount - 1
-        if (lastIndex >= 0) listState.animateScrollToItem(lastIndex)
+        if (lastIndex >= 0) listState.scrollToItem(lastIndex)
     }
 
     Column(
@@ -349,82 +352,47 @@ private fun EndConfirmDialog(onConfirm: () -> Unit, onDismiss: () -> Unit) {
     )
 }
 
+/**
+ * 顶部只放一个可点复制的 session id 胶囊(对位 iOS commit f23137d 后的简化设计)。
+ * 不再展示大头像 + 状态卡 —— 标题与状态已在 NavBar/会话流自带,头部腾出空间给消息。
+ */
 @Composable
 private fun SessionHeader(session: RelaySession?) {
-    Column(
+    val sid = (session?.agentSessionId.takeUnless { it.isNullOrEmpty() }) ?: (session?.id ?: "")
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+        horizontalArrangement = Arrangement.Center,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(
-                        Brush.linearGradient(
-                            listOf(Color(0xFF7C5CD6), Color(0xFFC061E0)),
-                        ),
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = (session?.title ?: "会").firstOrNull()?.toString() ?: "会",
-                    color = Color.White,
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(
-                    session?.title ?: "会话",
-                    color = Theme.text,
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                val status = session?.status ?: "working"
-                val term = session?.terminal
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        Modifier
-                            .size(7.dp)
-                            .clip(CircleShape)
-                            .background(SessionStatusUI.color(status)),
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        SessionStatusUI.label(status),
-                        color = SessionStatusUI.color(status),
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                    )
-                    if (!term.isNullOrEmpty() && term != "?") {
-                        Text(" · $term", color = Theme.textSec, fontSize = 14.sp)
-                    }
+        Row(
+            modifier = Modifier
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .background(Theme.textTer.copy(alpha = 0.14f))
+                .clickable {
+                    if (sid.isNotEmpty()) clipboard.setText(androidx.compose.ui.text.AnnotatedString(sid))
                 }
-                val cwd = session?.cwd
-                if (!cwd.isNullOrEmpty() && cwd != "?") {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            Icons.Default.Folder,
-                            contentDescription = null,
-                            tint = Theme.textTer,
-                            modifier = Modifier.size(11.dp),
-                        )
-                        Spacer(Modifier.width(5.dp))
-                        Text(
-                            shortMacPath(cwd),
-                            color = Theme.textSec,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Text("#", color = Theme.textSec, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            Text(
+                sid.ifEmpty { "无 id" },
+                color = Theme.textSec,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Icon(
+                Icons.Default.ContentCopy,
+                contentDescription = "复制",
+                tint = Theme.textSec,
+                modifier = Modifier.size(11.dp),
+            )
         }
     }
 }
@@ -834,6 +802,7 @@ private fun CommandPopup(draft: String, cli: String, onPick: (String) -> Unit) {
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 0.dp)
             .padding(bottom = 8.dp)
+            .shadow(10.dp, RoundedCornerShape(12.dp))
             .cardStyle(fill = Theme.field, stroke = Theme.stroke, radius = 12.dp),
     ) {
         matches.forEachIndexed { i, c ->
