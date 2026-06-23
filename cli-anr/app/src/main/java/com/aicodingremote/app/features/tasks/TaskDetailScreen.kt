@@ -88,14 +88,18 @@ import androidx.compose.ui.unit.sp
 import com.aicodingremote.app.app.LocalOnComponentAction
 import com.aicodingremote.app.app.LocalRelayClient
 import com.aicodingremote.app.designsystem.Theme
+import com.aicodingremote.app.designsystem.cardStyle
 import com.aicodingremote.app.designsystem.darkFieldColors
 import com.aicodingremote.app.models.ComponentAction
 import com.aicodingremote.app.models.DeliveryStatus
 import com.aicodingremote.app.models.StagedImagePayload
+import com.aicodingremote.app.models.CLIKind
 import com.aicodingremote.app.models.UIMessage
 import com.aicodingremote.app.networking.ImageAPI
 import com.aicodingremote.app.networking.RelaySession
 import com.aicodingremote.app.rendering.ComponentView
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import kotlinx.coroutines.launch
 import com.aicodingremote.app.rendering.renderers.AvatarStyle
 import com.aicodingremote.app.rendering.renderers.MessageAvatar
@@ -120,8 +124,23 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
 
     val keyboard = LocalSoftwareKeyboardController.current
     val listState = rememberLazyListState()
-    val msgCount = session?.messages?.size ?: 0
     val working = session?.status == "working"
+    val hasMore = session?.hasMore == true
+
+    // 按 agent 下发的逻辑序号 ord 排(同 ord 保持到达顺序,本地刚发的 MAX_VALUE 排末尾)。
+    // 对位 iOS `orderedMessages`:LazyColumn 顺序与底部跟随都用它。
+    val msgs = session?.messages
+    val orderedMessages = remember(msgs?.toList()) {
+        (msgs ?: emptyList()).withIndex()
+            .sortedWith(compareBy({ it.value.ord }, { it.index }))
+            .map { it.value }
+    }
+    val lastId = orderedMessages.lastOrNull()?.id
+    val firstId = orderedMessages.firstOrNull()?.id
+
+    // 顶部「加载更早」防重复触发;新一批到了(顶部 id 变)→ 解锁。
+    var loadingMore by remember { mutableStateOf(false) }
+    LaunchedEffect(firstId) { if (loadingMore) loadingMore = false }
 
     // 会话被移除(结束 / 异常退出 / 死亡巡检翻转)→ 自动返回列表
     val gone = session == null
@@ -129,12 +148,11 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
         if (gone) onBack()
     }
 
-    LaunchedEffect(msgCount, working) {
-        // working 时末尾挂着 typing 指示器,滚到它;否则滚到最后一条消息
-        val target = msgCount + (if (working) 1 else 0) // 偏过 sessionHeader(index 0)
-        if (target > 0) {
-            listState.animateScrollToItem(target)
-        }
+    // 只在「底部新增消息」/状态切到 working 时跟随落底,「加载更早」是往上插入(lastId 不变)
+    // → 不触发,避免把用户从正在看的位置弹回底部。对位 iOS `.onChange(of: last?.id)`。
+    LaunchedEffect(lastId, working) {
+        val lastIndex = listState.layoutInfo.totalItemsCount - 1
+        if (lastIndex >= 0) listState.animateScrollToItem(lastIndex)
     }
 
     Column(
@@ -142,7 +160,7 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
             .fillMaxSize()
             .background(Theme.bg),
     ) {
-        NavBar(onBack = onBack, onEnd = { showEndConfirm = true })
+        NavBar(session = session, onBack = onBack, onEnd = { showEndConfirm = true })
         Box(Modifier.weight(1f)) {
             LazyColumn(
                 state = listState,
@@ -155,9 +173,21 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                item { SessionHeader(session) }
-                if (session != null && session.messages.isNotEmpty()) {
-                    items(session.messages, key = { it.id }) { msg ->
+                item(key = "header") { SessionHeader(session) }
+                if (hasMore) {
+                    // 微信式:滚到顶部这一行自动出现 → 触发加载更早 + 转圈,不用点按钮。
+                    item(key = "loadMore") {
+                        LoadEarlierRow()
+                        LaunchedEffect(Unit) {
+                            if (!loadingMore) {
+                                loadingMore = true
+                                relay.loadMoreMessages(sessionId = sessionId)
+                            }
+                        }
+                    }
+                }
+                if (orderedMessages.isNotEmpty()) {
+                    items(orderedMessages, key = { it.id }) { msg ->
                         MessageRow(
                             msg = msg,
                             onAction = { action ->
@@ -177,6 +207,11 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
         InputBar(
             draft = draft,
             onDraftChange = { draft = it },
+            cli = session?.cli ?: "",
+            onPickQuickCommand = { cmd ->
+                relay.sendInput(cmd, sessionId = sessionId)
+                draft = ""
+            },
             stagedImages = stagedImages,
             onRemoveImage = { stagedImages.removeAt(it) },
             onPickImages = { stagedImages.addAll(it) },
@@ -219,7 +254,7 @@ fun TaskDetailScreen(sessionId: String, onBack: () -> Unit) {
 }
 
 @Composable
-private fun NavBar(onBack: () -> Unit, onEnd: () -> Unit) {
+private fun NavBar(session: RelaySession?, onBack: () -> Unit, onEnd: () -> Unit) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
@@ -234,6 +269,29 @@ private fun NavBar(onBack: () -> Unit, onEnd: () -> Unit) {
                 tint = Theme.text,
                 modifier = Modifier.size(22.dp),
             )
+        }
+        Text(
+            text = session?.title ?: "会话",
+            color = Theme.text,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        if (session?.isManual == true) {
+            Spacer(Modifier.width(8.dp))
+            // 手动会话:用户自己敲的 claude,反控走 GUI 模拟,电脑锁屏后无法操作。
+            Row(
+                modifier = Modifier
+                    .clip(androidx.compose.foundation.shape.CircleShape)
+                    .background(Theme.gold.copy(alpha = 0.15f))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("锁屏不可控", color = Theme.gold, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            }
         }
         Spacer(Modifier.weight(1f))
         Box {
@@ -554,6 +612,8 @@ private fun TypingIndicatorRow() {
 private fun InputBar(
     draft: String,
     onDraftChange: (String) -> Unit,
+    cli: String,
+    onPickQuickCommand: (String) -> Unit,
     stagedImages: List<StagedImagePayload>,
     onRemoveImage: (Int) -> Unit,
     onPickImages: (List<StagedImagePayload>) -> Unit,
@@ -582,6 +642,7 @@ private fun InputBar(
             .fillMaxWidth()
             .background(Theme.bg),
     ) {
+        CommandPopup(draft = draft, cli = cli, onPick = onPickQuickCommand)
         if (stagedImages.isNotEmpty()) {
             StagingStrip(stagedImages, onRemoveImage)
         }
@@ -754,4 +815,71 @@ private fun Bitmap.resizedToMaxDim(maxDim: Int): Bitmap {
     if (m <= maxDim) return this
     val scale = maxDim.toFloat() / m
     return Bitmap.createScaledBitmap(this, (width * scale).toInt(), (height * scale).toInt(), true)
+}
+
+/**
+ * 输入「/」时,在输入框上方弹出匹配的快捷指令气泡(命令+说明);点一个直接发送。
+ * 不输「/」就不显示,不占地方。指令集按会话的 CLI 类型(claude/codex)取。
+ * 对位 iOS `commandPopup`。
+ */
+@Composable
+private fun CommandPopup(draft: String, cli: String, onPick: (String) -> Unit) {
+    val q = draft.trim()
+    if (!q.startsWith("/")) return
+    val cmds = CLIKind.by(cli)?.quickCommands ?: return
+    val matches = cmds.filter { it.cmd.startsWith(q) }
+    if (matches.isEmpty()) return
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 0.dp)
+            .padding(bottom = 8.dp)
+            .cardStyle(fill = Theme.field, stroke = Theme.stroke, radius = 12.dp),
+    ) {
+        matches.forEachIndexed { i, c ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onPick(c.cmd) }
+                    .padding(horizontal = 14.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    c.cmd,
+                    color = Theme.text,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Text(c.desc, color = Theme.textSec, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (i != matches.lastIndex) {
+                HorizontalDivider(color = Theme.stroke, thickness = 1.dp)
+            }
+        }
+    }
+}
+
+/**
+ * 滚到顶时这一行自动出现 → 触发加载更早 + 转圈。对位 iOS hasMore 块。
+ */
+@Composable
+private fun LoadEarlierRow() {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Spacer(Modifier.weight(1f))
+        CircularProgressIndicator(
+            color = Theme.textSec,
+            strokeWidth = 2.dp,
+            modifier = Modifier.size(12.dp),
+        )
+        Text("加载更早消息…", color = Theme.textSec, fontSize = 12.sp)
+        Spacer(Modifier.weight(1f))
+    }
 }
