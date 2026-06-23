@@ -112,11 +112,11 @@ final class AgentSessionManager: ObservableObject {
         }
     }
 
-    /// driver 工厂:按 agent 类型造对应适配器(codex 后续加分支)。
+    /// driver 工厂:按 agent 类型造对应适配器。
     private func makeDriver(_ agent: AgentKind) -> AgentDriver {
         switch agent {
         case .claude: return ClaudeStreamJSONDriver()
-        case .codex:  return ClaudeStreamJSONDriver()   // TODO: CodexDriver(Phase 后续)
+        case .codex:  return CodexAppServerDriver()
         }
     }
 
@@ -208,6 +208,7 @@ final class AgentSessionManager: ObservableObject {
     /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
     nonisolated static func parseTranscriptFile(path: String)
         -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        if path.contains("/.codex/") { return CodexTranscriptReader.parseTranscriptFile(path: path) }
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
         var out: [(String, AgentMessage.Kind, String)] = []
         for line in content.split(separator: "\n") { out.append(contentsOf: parseTranscriptLine(String(line))) }
@@ -253,6 +254,9 @@ final class AgentSessionManager: ObservableObject {
     /// ord = 该消息所在行的起始字节偏移(全局单调,跨窗稳定排序/去重);earliest = 本窗最早一条消息所在行的偏移。
     nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024)
         -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int)], earliest: Int, hasEarlier: Bool) {
+        if path.contains("/.codex/") {
+            return CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
+        }
         guard let fh = FileHandle(forReadingAtPath: path) else { return ([], 0, false) }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
@@ -306,6 +310,7 @@ final class AgentSessionManager: ObservableObject {
 
     /// 读转录里第一条用户文本(历史列表的标签 / 会话标题)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。
     nonisolated static func firstUserPrompt(path: String) -> String? {
+        if path.contains("/.codex/") { return CodexTranscriptReader.firstUserPrompt(path: path) }
         guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? fh.close() }
         let data = (try? fh.read(upToCount: 256 * 1024)) ?? Data()

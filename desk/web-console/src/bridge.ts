@@ -1,4 +1,4 @@
-import { setState, setTranscript, setDir, setFile, setUsage, setConn } from './store'
+import { setState, upsertSession, removeSession, upsertManual, removeManual, setProjects, setTranscript, setDir, setFile, setUsage, setConn } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -16,6 +16,21 @@ function installReceiver() {
       switch (msg.type) {
         case 'state':
           setState(msg.payload)
+          break
+        case 'sessionUpsert':
+          upsertSession(msg.payload)
+          break
+        case 'sessionRemove':
+          removeSession(msg.payload.id)
+          break
+        case 'manualUpsert':
+          upsertManual(msg.payload)
+          break
+        case 'manualRemove':
+          removeManual(msg.payload.id)
+          break
+        case 'projects':
+          setProjects(msg.payload.projects, msg.payload.hidden)
           break
         case 'transcript':
           setTranscript(msg.payload.id, msg.payload.messages,
@@ -45,11 +60,13 @@ installReceiver()
 export function ready() { send({ action: 'ready' }) }
 
 // —— 命令封装 ——
+export type AgentId = 'claude' | 'codex'
+
 export const cmd = {
   openProject: () => send({ action: 'openProject' }),
-  newSession: (workdir: string) => send({ action: 'newSession', workdir }),
-  continueLast: (workdir: string) => send({ action: 'newSession', workdir, continueLast: true }),
-  resume: (workdir: string, id: string) => send({ action: 'newSession', workdir, resume: id }),
+  newSession: (workdir: string, agent: AgentId) => send({ action: 'newSession', workdir, agent }),
+  continueLast: (workdir: string, agent: AgentId) => send({ action: 'newSession', workdir, agent, continueLast: true }),
+  resume: (workdir: string, id: string, agent: AgentId = 'claude') => send({ action: 'newSession', workdir, agent, resume: id }),
   closeSession: (sid: string) => send({ action: 'closeSession', sid }),
   switchModel: (sid: string, model: string) => send({ action: 'switchModel', sid, model }),
   renameSession: (key: string, title: string) => send({ action: 'renameSession', key, title }),

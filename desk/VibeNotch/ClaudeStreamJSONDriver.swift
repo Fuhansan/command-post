@@ -63,6 +63,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = args
         p.currentDirectoryURL = URL(fileURLWithPath: workdir)
+        p.environment = Self.childEnvironment()
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
@@ -264,6 +265,36 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     /// → 交互/登录 shell 兜底。只缓存成功结果(不永久缓存失败)。
     private static var cachedBinary: String?
     private static let pathMemo = NSString(string: "~/.vibenotch/claude-path").expandingTildeInPath
+
+    /// claude 子进程的环境变量。GUI App(launchd 启动)的环境过于精简——缺 `USER`、缺终端里
+    /// 的 `https_proxy` 等。**`USER` 缺失会让 claude 读不到 macOS 钥匙串里的订阅凭据 → API 返回
+    /// 403「Not logged in」**(实测根因)。这里抓一次登录+交互 shell 的完整 env(含
+    /// USER/HOME/PATH/代理),以当前进程 env 打底,缓存复用,确保与用户终端里跑 claude 一致。
+    private static var cachedEnv: [String: String]?
+    private static func childEnvironment() -> [String: String] {
+        if let c = cachedEnv { return c }
+        var env = ProcessInfo.processInfo.environment
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-ilc", "env"]   // 登录+交互:确保 .zprofile/.zshrc 的代理、PATH 都加载
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        if (try? p.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if let s = String(data: data, encoding: .utf8) {
+                for line in s.split(separator: "\n") {
+                    guard let eq = line.firstIndex(of: "=") else { continue }
+                    let k = String(line[line.startIndex..<eq])
+                    if !k.isEmpty { env[k] = String(line[line.index(after: eq)...]) }
+                }
+            }
+        }
+        // 兜底:钥匙串读凭据强依赖 USER;HOME 也确保有,否则连 ~/.claude 都找不到。
+        if env["USER"] == nil { env["USER"] = NSUserName() }
+        if env["HOME"] == nil { env["HOME"] = NSHomeDirectory() }
+        cachedEnv = env
+        return env
+    }
 
     private static func claudeBinary() -> String? {
         let fm = FileManager.default

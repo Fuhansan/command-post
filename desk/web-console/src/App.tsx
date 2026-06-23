@@ -1,4 +1,5 @@
-import { useSyncExternalStore, useState, useMemo, useRef, useEffect, useLayoutEffect } from 'react'
+import { useSyncExternalStore, useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback, memo } from 'react'
+import { createPortal } from 'react-dom'
 import hljs from 'highlight.js'
 import { marked } from 'marked'
 import {
@@ -8,7 +9,7 @@ import {
   Activity, DollarSign, Boxes, Database, GitBranch, MessageSquare, Clipboard, Code2,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn } from './store'
-import { cmd } from './bridge'
+import { cmd, type AgentId } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry, UsageData } from './types'
 import { mockGit, PROVIDERS } from './mock'
 import type { GitStatus } from './mock'
@@ -47,7 +48,9 @@ function sessionMeta(status: string): DotMeta {
 function manualMeta(state: string): DotMeta {
   if (state === 'working') return { text: '运行中', color: 'var(--accent)', pulse: true }
   if (state === 'waiting') return { text: '待确认', color: 'var(--amber)', hollow: true }
-  return { text: '空闲', color: 'var(--text-faint)', hollow: true }
+  // manual 会话只要还在列表里 = 进程还活着(SessionEnd 才会移出)。done/suspended/idle
+  // 都是「回完一轮、在等你输入」,而非结束 → 显示绿色「在线」,不要画成灰色「空闲」让人误以为已结束。
+  return { text: '在线', color: 'var(--green)' }
 }
 function Dot({ meta, size = 7 }: { meta: DotMeta; size?: number }) {
   const base: React.CSSProperties = { width: size, height: size, borderRadius: '50%', flex: 'none', display: 'inline-block' }
@@ -100,13 +103,13 @@ function Row({ title, badge, meta, model, time, active, onClick }: {
 }
 
 // 助手文本走 Markdown 渲染(粗体/列表/代码/标题/表格等)
-function Markdown({ text }: { text: string }) {
+const Markdown = memo(function Markdown({ text }: { text: string }) {
   const html = useMemo(() => marked.parse(text, { gfm: true, breaks: true, async: false }) as string, [text])
   return <div className="md flex-1 text-[13.5px] leading-[1.72] text-ink select-text min-w-0" dangerouslySetInnerHTML={{ __html: html }} />
-}
+})
 
 // ===== 消息渲染 =====
-function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
+function MessageRowImpl({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
   if (m.kind === 'text' && m.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -168,6 +171,11 @@ function MessageRow({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choo
   }
   return null
 }
+// 增量推送后 DTO 会重建消息对象,引用必变 → 按字段比对,未变的消息跳过重渲染(流式时关键)。
+const MessageRow = memo(MessageRowImpl, (a, b) =>
+  a.onRespond === b.onRespond &&
+  a.m.id === b.m.id && a.m.kind === b.m.kind && a.m.role === b.m.role &&
+  a.m.text === b.m.text && a.m.permState === b.m.permState && a.m.permReqId === b.m.permReqId)
 
 function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadEarlier }: {
   msgs: Msg[]; onRespond?: (r: string, c: string[]) => void; working?: boolean
@@ -307,6 +315,9 @@ function attachToText(a: Attach): string {
 }
 
 function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
+  // 卸载即释放图片 blob URL(覆盖单删/清空/切会话所有移除路径,避免内存泄漏)。
+  const imgUrl = a.kind === 'image' ? a.url : undefined
+  useEffect(() => () => { if (imgUrl) URL.revokeObjectURL(imgUrl) }, [imgUrl])
   return (
     <div className="flex items-center gap-2 pl-2 pr-1 py-1.5 rounded-[9px] border border-line bg-elev2 max-w-[230px]">
       {a.kind === 'image'
@@ -333,6 +344,9 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
   const [menu, setMenu] = useState(false)
   const [drag, setDrag] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  // 输入法组字状态:WKWebView 里 e.isComposing 不可靠,手动跟踪。compositionend 延一拍再清,
+  // 让「确认候选词的回车」(紧跟 compositionend 触发)被拦下,不误发送。
+  const composingRef = useRef(false)
   const cur = modelLabel(model)
   const addFiles = (files: FileList | File[]) => {
     const add: Attach[] = []
@@ -365,7 +379,9 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
         <input ref={fileRef} type="file" multiple className="hidden" onChange={(e) => { if (e.target.files) addFiles(e.target.files); e.target.value = '' }} />
         {attachments.length > 0 && <div className="flex flex-wrap gap-2 px-3 pt-3">{attachments.map((a) => <AttachChip key={a.id} a={a} onRemove={() => setAttachments((p) => p.filter((x) => x.id !== a.id))} />)}</div>}
         <textarea value={draft} onChange={(e) => setDraft(e.target.value)} onPaste={onPaste}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } }}
+          onCompositionStart={() => { composingRef.current = true }}
+          onCompositionEnd={() => { setTimeout(() => { composingRef.current = false }, 0) }}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !composingRef.current && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}
           rows={1} placeholder="描述需求…  选中代码可「加入对话」,拖拽 / 粘贴可加附件"
           className="w-full resize-none bg-transparent outline-none px-4 pt-3.5 pb-1.5 text-[13px] text-ink select-text placeholder:text-faint" />
         <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
@@ -443,27 +459,29 @@ function WorkBar({ session, tri, right }: {
   const renameKey = session?.renameKey
   const commit = () => { setEditing(false); if (renameKey) cmd.renameSession(renameKey, val.trim()) }
   return (
-    <div className="flex-none flex items-center gap-3 px-5 h-[46px] border-b border-line bg-elev">
+    // 通栏会话头(对齐设计稿 line 205):标题左、三段切换中右、操作右,底部边线。
+    <div className="flex-none flex items-center gap-3 px-5 py-[13px] border-b border-line">
+      {/* 左:标题 + 状态(纯文本) */}
       <div className="flex-1 min-w-0">
-        {session && (
-          <>
-            {editing
-              ? <input autoFocus value={val} onChange={(e) => setVal(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } else if (e.key === 'Escape') setEditing(false) }}
-                  onBlur={commit} placeholder="会话名…(留空恢复默认)"
-                  className="w-full text-[14px] font-semibold text-ink bg-transparent outline-none border-b border-strong pb-0.5 select-text placeholder:text-faint placeholder:font-normal" />
-              : <div className="text-[14px] font-semibold text-ink truncate">{session.title || '会话'}</div>}
-            <div className="flex items-center gap-2 mt-0.5">
-              <Dot meta={session.meta} size={7} />
-              <span className="text-[11px] text-dim whitespace-nowrap">{session.meta.text}</span>
-              {session.model && <><span className="text-[11px] text-faint">·</span><span className="font-mono text-[10.5px] text-faint truncate">{session.model}</span></>}
-              {session.sub && <><span className="text-[11px] text-faint">·</span><span className="text-[11px] text-faint truncate min-w-0">{session.sub}</span></>}
-            </div>
-          </>
-        )}
+        {session && (<>
+          {editing
+            ? <input autoFocus value={val} onChange={(e) => setVal(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } else if (e.key === 'Escape') setEditing(false) }}
+                onBlur={commit} placeholder="会话名…(留空恢复默认)"
+                className="w-full text-[15px] font-semibold text-ink bg-transparent outline-none border-b border-strong pb-0.5 select-text placeholder:text-faint placeholder:font-normal" />
+            : <div className="text-[15px] font-semibold text-ink truncate leading-tight">{session.title || '会话'}</div>}
+          <div className="flex items-center gap-2 mt-1">
+            <Dot meta={session.meta} size={7} />
+            <span className="text-[11.5px] text-dim whitespace-nowrap">{session.meta.text}</span>
+            {session.model && <><span className="text-[11.5px] text-faint">·</span><span className="font-mono text-[11px] text-faint truncate">{session.model}</span></>}
+            {session.sub && <><span className="text-[11.5px] text-faint">·</span><span className="text-[11.5px] text-faint truncate min-w-0">{session.sub}</span></>}
+          </div>
+        </>)}
       </div>
-      {tri}
-      <div className="flex items-center gap-1">
+      {/* 中:三段切换(264px seg,无白盒) */}
+      <div className="shrink-0">{tri}</div>
+      {/* 右:操作(更多菜单 + barRight) */}
+      <div className="flex items-center gap-1 shrink-0">
         {renameKey && (
           <div className="relative">
             <IconBtn title="更多" onClick={() => setMenu((o) => !o)}><MoreHorizontal size={16} /></IconBtn>
@@ -739,23 +757,59 @@ function ProjectSwitcher({ projects, active, onPick, sessionCount }: {
   )
 }
 
-// ===== 新建会话(轻量菜单)=====
-function NewBtn({ workdir }: { workdir: string }) {
+// ===== 新建会话(明确选择 Claude / Codex)=====
+function AgentOption({ agent, onClick }: { agent: AgentId; onClick: () => void }) {
+  const codex = agent === 'codex'
+  const Icon = codex ? Code2 : MessageSquare
+  return (
+    <button onClick={onClick} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken">
+      <span className="w-5 h-5 rounded-[6px] flex items-center justify-center shrink-0" style={{ background: codex ? '#dce9e3' : '#ece6dd', color: codex ? '#1a7d5a' : '#b8612d' }}>
+        <Icon size={12.5} strokeWidth={2.1} />
+      </span>
+      <span className="flex-1 text-left">{codex ? 'Codex' : 'Claude'}</span>
+    </button>
+  )
+}
+
+function AgentActionMenu({ workdir, label = '新建', includeContinue = false, compact = false, align = 'right' }: {
+  workdir: string; label?: string; includeContinue?: boolean; compact?: boolean; align?: 'left' | 'right'
+}) {
   const [open, setOpen] = useState(false)
+  const close = () => setOpen(false)
+  const start = (agent: AgentId) => { cmd.newSession(workdir, agent); close() }
+  const cont = (agent: AgentId) => { cmd.continueLast(workdir, agent); close() }
   return (
     <div className="relative">
-      <button onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1 pl-1.5 pr-2.5 py-1 rounded-[7px] text-[12px] font-medium text-accentfg transition hover:brightness-110" style={{ background: 'var(--accent)' }}>
-        <Plus size={13} strokeWidth={2.4} />新建
+      <button onClick={(e) => { e.stopPropagation(); setOpen((o) => !o) }}
+        className={compact
+          ? 'w-full flex items-center gap-1.5 px-2.5 py-1.5 rounded-[8px] text-[11.5px] text-faint hover:bg-sunken hover:text-accent transition-colors'
+          : 'flex items-center gap-1 pl-1.5 pr-2.5 py-1 rounded-[7px] text-[12px] font-medium text-accentfg transition hover:brightness-110'}
+        style={compact ? undefined : { background: 'var(--accent)' }}>
+        <Plus size={compact ? 12 : 13} strokeWidth={2.4} />{label}
       </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 mt-1.5 z-40 w-36 p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
-            <button onClick={() => { cmd.continueLast(workdir); setOpen(false) }} className="w-full text-left px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken">继续最近</button>
-            <button onClick={() => { cmd.newSession(workdir); setOpen(false) }} className="w-full text-left px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken">全新会话</button>
+      {open && createPortal(
+        // 居中模态(portal 到 body):避免被侧栏 overflow / 定位祖先裁切。
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6" style={{ background: 'rgba(20,20,16,.28)' }}
+          onClick={close}>
+          <div className="w-[320px] p-3 rounded-[14px] bg-elev border border-strong shadow-pop animate-pop" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-1 pb-2">
+              <div className="text-[13.5px] font-semibold text-ink">新建会话</div>
+              <button onClick={close} className="w-6 h-6 rounded-md flex items-center justify-center text-faint hover:bg-sunken hover:text-ink transition-colors"><X size={15} /></button>
+            </div>
+            {includeContinue && (
+              <>
+                <div className="text-[10.5px] font-semibold tracking-[0.04em] text-faint px-2 pt-1 pb-1">继续最近</div>
+                <AgentOption agent="claude" onClick={() => cont('claude')} />
+                <AgentOption agent="codex" onClick={() => cont('codex')} />
+                <div className="h-px bg-line my-1.5 mx-1" />
+              </>
+            )}
+            <div className="text-[10.5px] font-semibold tracking-[0.04em] text-faint px-2 pt-1 pb-1">选择 Agent</div>
+            <AgentOption agent="claude" onClick={() => start('claude')} />
+            <AgentOption agent="codex" onClick={() => start('codex')} />
           </div>
-        </>
+        </div>,
+        document.body,
       )}
     </div>
   )
@@ -789,22 +843,23 @@ function SessionsNav({ groups, sel, activeWd, expanded, toggle, pick, onReorder 
           const active = g.p.workdir === activeWd
           const isOver = overWd === g.p.workdir && dragWd !== g.p.workdir
           return (
-            <div key={g.p.workdir} className="mb-0.5"
+            <div key={g.p.workdir}
               onDragOver={(e) => { if (dragWd) { e.preventDefault(); setOverWd(g.p.workdir) } }}
               onDrop={(e) => { e.preventDefault(); if (dragWd && dragWd !== g.p.workdir) onReorder(dragWd, g.p.workdir); setDragWd(null); setOverWd(null) }}
               style={isOver ? { boxShadow: 'inset 0 2px 0 var(--accent)' } : undefined}>
+              {/* 项目头:圆角粘性卡 + 底部 1px 发丝线(= 每个项目下面的线),对齐设计稿 */}
               <div draggable onDragStart={() => setDragWd(g.p.workdir)} onDragEnd={() => { setDragWd(null); setOverWd(null) }}
                 onClick={() => toggle(g.p.workdir)}
-                className="w-full flex items-center gap-2 px-2 py-2 rounded-[9px] hover:bg-sunken transition-colors cursor-pointer select-none"
-                style={{ opacity: dragWd === g.p.workdir ? 0.5 : 1 }}>
-                <span className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center shrink-0" style={active ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : { background: 'var(--bg-sunken)', color: 'var(--text-dim)' }}><Folder size={13} /></span>
-                <span className="flex-1 min-w-0 font-semibold text-[12px] text-ink truncate text-left">{g.p.name}</span>
+                className="sticky top-0 z-[3] flex items-center gap-[9px] px-2 py-[7px] mt-[10px] mb-1.5 rounded-[9px] cursor-pointer select-none bg-elev hover:bg-sunken transition-colors"
+                style={{ boxShadow: '0 1px 0 var(--border)', opacity: dragWd === g.p.workdir ? 0.5 : 1 }}>
+                <span className="w-[22px] h-[22px] rounded-[6px] flex items-center justify-center shrink-0 transition-colors" style={active ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : { background: 'var(--bg-sunken)', color: 'var(--text-dim)' }}><Folder size={13} /></span>
+                <span className="flex-1 min-w-0 font-semibold text-[12px] truncate text-left" style={{ color: active ? 'var(--text)' : 'var(--text-dim)' }}>{g.p.name}</span>
                 {g.running > 0 && <span title="进行中会话" className="inline-flex items-center gap-1 text-[10.5px] font-mono shrink-0" style={{ color: 'var(--green)' }}><span className="w-1.5 h-1.5 rounded-full dot-live" style={{ background: 'var(--green)' }} />{g.running}</span>}
                 {g.gitDirty > 0 && <span title="未提交更改" className="inline-flex items-center gap-1 text-[10.5px] font-mono text-faint shrink-0"><GitBranch size={10} />{g.gitDirty}</span>}
                 <ChevronRight size={13} strokeWidth={2.2} className="text-faint shrink-0 transition-transform" style={{ transform: open ? 'rotate(90deg)' : 'none' }} />
               </div>
               {open && (
-                <div className="ml-[10px] pl-2 border-l" style={{ borderColor: active ? 'var(--accent-soft)' : 'var(--border)' }}>
+                <div className="pb-1.5" style={{ marginLeft: 19, marginBottom: 8, paddingLeft: 13, borderLeft: `2px solid ${active ? 'var(--accent-soft)' : 'var(--border-strong)'}` }}>
                   {g.rows.map((r) => {
                     const on = selEq(r.sel, sel)
                     return (
@@ -814,6 +869,8 @@ function SessionsNav({ groups, sel, activeWd, expanded, toggle, pick, onReorder 
                         <div className="min-w-0 flex-1">
                           <div className="font-medium text-[13px] text-ink truncate">{r.title || '新会话'}</div>
                           <div className="mt-1 flex items-center gap-[7px]">
+                            <span className="text-[10.5px] font-medium shrink-0" style={{ color: r.meta.color }}>{r.meta.text}</span>
+                            <span className="text-[10.5px] text-faint shrink-0">·</span>
                             <span className="font-mono text-[10.5px] text-faint truncate flex-1 min-w-0">{r.model}</span>
                             <span className="text-[10.5px] text-faint shrink-0">{r.time}</span>
                           </div>
@@ -822,9 +879,7 @@ function SessionsNav({ groups, sel, activeWd, expanded, toggle, pick, onReorder 
                     )
                   })}
                   {g.rows.length === 0 && <div className="text-[11px] text-faint px-2.5 py-1.5">还没有会话</div>}
-                  <button onClick={() => cmd.newSession(g.p.workdir)} className="w-full flex items-center gap-1.5 px-2.5 py-1.5 rounded-[8px] text-[11.5px] text-faint hover:bg-sunken hover:text-accent transition-colors">
-                    <Plus size={12} strokeWidth={2.2} />新建会话
-                  </button>
+                  <AgentActionMenu workdir={g.p.workdir} label="新建会话" compact align="left" />
                 </div>
               )}
             </div>
@@ -899,9 +954,7 @@ function GitTreeNav({ projects, activeWd, branchSel, collapsed, toggle, inited, 
                       </button>
                     )
                   })}
-                  <button onClick={() => cmd.newSession(p.workdir)} className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-[8px] text-[11.5px] text-faint hover:bg-sunken hover:text-accent transition-colors">
-                    <Plus size={12} strokeWidth={2.2} />新分支会话
-                  </button>
+                  <AgentActionMenu workdir={p.workdir} label="新分支会话" compact align="left" />
                 </div>
               )}
             </div>
@@ -1001,6 +1054,9 @@ function ConsolePage() {
   const onFiles = () => setViewMode('files')
 
   const liveSession = sel?.kind === 'session' ? state.sessions.find((x) => x.id === sel.id) ?? null : null
+  const liveSid = liveSession?.id
+  // 稳定引用:否则 MessageRow 的 memo 比较器每次都失配,全部消息重渲染。
+  const onLiveRespond = useCallback((r: string, c: string[]) => { if (liveSid) cmd.respond(liveSid, r, c) }, [liveSid])
   const manualSel = sel?.kind === 'manual' ? state.manual.find((x) => x.id === sel.id) ?? null : null
   const historySel = sel?.kind === 'history' ? state.projects.flatMap((p) => p.history).find((x) => x.id === sel.id) ?? null : null
   const histWd = sel?.kind === 'history' ? sel.workdir : ''
@@ -1019,7 +1075,7 @@ function ConsolePage() {
   if (liveSession) {
     barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
     barRight = <IconBtn title="结束会话" onClick={() => cmd.closeSession(liveSession.id)}><X size={16} /></IconBtn>
-    chat = <MsgList msgs={liveSession.messages} onRespond={(r, c) => cmd.respond(liveSession.id, r, c)} working={liveSession.status === 'working'} />
+    chat = <MsgList msgs={liveSession.messages} onRespond={onLiveRespond} working={liveSession.status === 'working'} />
     footer = <Composer sid={liveSession.id} model={liveSession.model} attachments={attachments} setAttachments={setAttachments} onSend={(t) => cmd.sendInput(liveSession.id, t)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
@@ -1034,6 +1090,9 @@ function ConsolePage() {
     barRight = <button onClick={() => doResume(histWd, historySel.id)} disabled={pendingResume === historySel.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={pendingResume === historySel.id ? 'animate-spin' : ''} />{pendingResume === historySel.id ? '恢复中…' : 'Resume'}</button>
     chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
   }
+  if (!barRight && activeProject) {
+    barRight = <AgentActionMenu workdir={activeProject.workdir} includeContinue />
+  }
   const emptyChat = (
     <div className="flex-1 flex flex-col items-center justify-center text-faint gap-3 bg-bg">
       <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><PanelsTopLeft size={22} /></div>
@@ -1045,14 +1104,12 @@ function ConsolePage() {
     <div className="flex h-full flex-1 min-w-0">
       {/* 左列:会话分组 / Git Tree */}
       <div className="w-[312px] shrink-0 bg-elev border-r border-line flex flex-col min-h-0">
-        {/* 顶部空区:与右侧顶栏等高,留给红绿灯 + 拖动 */}
-        <div className="flex-none border-b border-line" style={{ height: TOPBAR_H }} />
         {navMode === 'sessions'
           ? <SessionsNav groups={orderedGroups} sel={sel} activeWd={activeWd} expanded={expanded} toggle={toggleGroup} pick={pick} onReorder={reorder} />
           : <GitTreeNav projects={state.projects} activeWd={activeWd} branchSel={branchSel} collapsed={gitCollapsed} toggle={toggleGit} inited={inited} onInit={(wd) => setInited((p) => new Set(p).add(wd))} onBranch={onBranch} />}
       </div>
 
-      {/* 工作区:常驻顶栏(三段切换一直在) + 身体 + 底部 */}
+      {/* 工作区:通栏会话头(WorkBar)在流内 + 身体 */}
       <div className="flex-1 min-w-0 flex flex-col bg-bg min-h-0">
         <WorkBar session={barSession}
           tri={<TriToggle navMode={navMode} viewMode={viewMode} onConv={onConv} onGit={onGit} onFiles={onFiles} />} right={barRight} />
@@ -1272,7 +1329,7 @@ function UsagePage() {
   )
 }
 
-// ===== Provider 管理(VibeNotch 当前单 Claude)=====
+// ===== Provider 管理 =====
 function ProvidersPage() {
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
@@ -1280,7 +1337,7 @@ function ProvidersPage() {
         <div className="flex items-end justify-between gap-4">
           <div>
             <div className="text-[20px] font-semibold text-ink">Provider 管理</div>
-            <div className="text-[12.5px] text-dim mt-1">配置 AI 服务商、密钥与可用模型(当前仅 Claude 经 VibeNotch 实际接通)</div>
+            <div className="text-[12.5px] text-dim mt-1">配置 AI 服务商、密钥与可用模型。新建会话时手动选择使用 Claude 或 Codex。</div>
           </div>
           <button className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12.5px] font-medium text-accentfg hover:brightness-110 shrink-0" style={{ background: 'var(--accent)' }}><Plus size={14} strokeWidth={2.2} />添加 Provider</button>
         </div>
@@ -1292,7 +1349,7 @@ function ProvidersPage() {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2.5">
                     <span className="text-[14px] font-semibold text-ink">{p.name}</span>
-                    {i === 0 && <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>默认</span>}
+                    {(p.id === 'claude' || p.id === 'codex') && <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>已接入</span>}
                   </div>
                   <div className="text-[11.5px] text-faint mt-0.5">{p.vendor}</div>
                 </div>
@@ -1311,7 +1368,6 @@ function ProvidersPage() {
                   <div className="text-[12px] text-dim mt-0.5 truncate">{p.models.length} 个 · {p.models[0]}</div>
                 </div>
                 <span className="flex-1" />
-                {i !== 0 && <button className="text-[12px] px-2.5 py-1 rounded-lg text-dim hover:bg-sunken transition-colors">设为默认</button>}
                 <button className="text-[12px] px-2.5 py-1 rounded-lg text-dim hover:bg-sunken transition-colors">管理</button>
               </div>
             </div>
@@ -1412,11 +1468,11 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
           </div>
         </div>
 
-        <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">默认</div>
+        <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">会话</div>
         <div className="border border-line rounded-[13px] bg-elev">
           <div className="flex items-center px-4 py-4 border-b border-line">
-            <div className="flex-1"><div className="text-[13px] font-medium text-ink">默认 Provider</div><div className="text-[11.5px] text-dim mt-0.5">新建会话时预选</div></div>
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sunken text-[12.5px] text-dim"><span className="w-[7px] h-[7px] rounded-full" style={{ background: 'var(--green)' }} />Claude</div>
+            <div className="flex-1"><div className="text-[13px] font-medium text-ink">新建会话 Agent</div><div className="text-[11.5px] text-dim mt-0.5">每次新建时手动选择,不使用默认 Provider</div></div>
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sunken text-[12.5px] text-dim"><MessageSquare size={13} />Claude / Codex</div>
           </div>
           <div className="flex items-center px-4 py-4">
             <div className="flex-1"><div className="text-[13px] font-medium text-ink">会话草稿自动保存</div><div className="text-[11.5px] text-dim mt-0.5">输入框内容随变更本地保留</div></div>
@@ -1452,20 +1508,15 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
 }
 
 // ===== 顶栏 =====
-// 顶部留给原生红绿灯 + 拖动窗口的高度(与工作区顶栏 WorkBar 对齐)
-const TOPBAR_H = 46
 
-function NavRail({ page, setPage, theme, toggleTheme }: { page: string; setPage: (p: string) => void; theme: string; toggleTheme: () => void }) {
+function NavRail({ page, setPage }: { page: string; setPage: (p: string) => void }) {
   const items = [
     { id: 'console', icon: <PanelsTopLeft size={19} />, label: '工作区' },
     { id: 'usage', icon: <BarChart3 size={19} />, label: '使用统计' },
     { id: 'providers', icon: <Server size={19} />, label: 'Provider 管理' },
   ]
   return (
-    <div className="w-[56px] shrink-0 bg-elev border-r border-line flex flex-col items-center gap-1">
-      {/* 顶部空区:红绿灯 + 拖动窗口 */}
-      <div className="flex-none w-full border-b border-line" style={{ height: TOPBAR_H }} />
-      <div className="h-1.5" />
+    <div className="w-[56px] shrink-0 bg-elev border-r border-line flex flex-col items-center gap-1 py-2.5">
       {items.map((it) => {
         const on = page === it.id
         return (
@@ -1475,12 +1526,31 @@ function NavRail({ page, setPage, theme, toggleTheme }: { page: string; setPage:
         )
       })}
       <div className="flex-1" />
-      <button onClick={toggleTheme} title="切换主题" className="w-[38px] h-[38px] rounded-[10px] flex items-center justify-center text-dim hover:bg-sunken transition-colors">
-        {theme === 'dark' ? <Sun size={18} /> : <Moon size={17} />}
-      </button>
       <button onClick={() => setPage('settings')} title="设置"
-        className={`w-[38px] h-[38px] rounded-[10px] flex items-center justify-center transition-colors mb-2.5 ${page === 'settings' ? '' : 'text-dim hover:bg-sunken'}`}
+        className={`w-[38px] h-[38px] rounded-[10px] flex items-center justify-center transition-colors ${page === 'settings' ? '' : 'text-dim hover:bg-sunken'}`}
         style={page === 'settings' ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : undefined}><SlidersHorizontal size={19} /></button>
+    </div>
+  )
+}
+
+// 全局标题栏(对齐设计稿 line 34):左留原生红绿灯位,右=主题切换 + 账号头像状态点。
+function TitleBar({ theme, toggleTheme }: { theme: string; toggleTheme: () => void }) {
+  const conn = useConn()
+  const dot = conn ? (CONN_DOT[conn.state] ?? 'var(--text-faint)') : 'var(--text-faint)'
+  const initial = (conn?.account || 'A').trim().charAt(0).toUpperCase() || 'A'
+  return (
+    <div className="flex-none h-[40px] flex items-center pl-[72px] pr-3.5 border-b border-line bg-elev">
+      <div className="flex-1" />
+      <div className="flex items-center gap-1.5">
+        <button onClick={toggleTheme} title="切换主题" className="w-[30px] h-[30px] rounded-[8px] flex items-center justify-center text-dim hover:bg-sunken hover:text-ink transition-colors">
+          {theme === 'dark' ? <Sun size={16} /> : <Moon size={15} />}
+        </button>
+        <div title={conn ? `${conn.account || ''} · ${conn.text || conn.state}` : ''}
+          className="relative w-[26px] h-[26px] rounded-full bg-sunken border border-strong flex items-center justify-center text-[11px] font-semibold text-dim select-none">
+          {initial}
+          <span className="absolute -right-px -bottom-px w-2 h-2 rounded-full" style={{ background: dot, border: '2px solid var(--bg-elev)' }} />
+        </div>
+      </div>
     </div>
   )
 }
@@ -1496,15 +1566,18 @@ export default function App() {
   const setTheme = (t: 'light' | 'dark') => setThemeState(t)
   const toggleTheme = () => setThemeState((t) => (t === 'dark' ? 'light' : 'dark'))
   return (
-    <div className="flex h-full min-h-0">
-      <NavRail page={page} setPage={setPage} theme={theme} toggleTheme={toggleTheme} />
-      {/* 控制台常驻不卸载,切页面回来仍记得选中的项目/文件/树展开 */}
-      <div className="flex flex-1 min-w-0 min-h-0" style={{ display: page === 'console' ? 'flex' : 'none' }}>
-        <ConsolePage />
+    <div className="flex flex-col h-full min-h-0">
+      <TitleBar theme={theme} toggleTheme={toggleTheme} />
+      <div className="flex flex-1 min-h-0">
+        <NavRail page={page} setPage={setPage} />
+        {/* 控制台常驻不卸载,切页面回来仍记得选中的项目/文件/树展开 */}
+        <div className="flex flex-1 min-w-0 min-h-0" style={{ display: page === 'console' ? 'flex' : 'none' }}>
+          <ConsolePage />
+        </div>
+        {page === 'usage' && <UsagePage />}
+        {page === 'providers' && <ProvidersPage />}
+        {page === 'settings' && <SettingsPage theme={theme} setTheme={setTheme} />}
       </div>
-      {page === 'usage' && <UsagePage />}
-      {page === 'providers' && <ProvidersPage />}
-      {page === 'settings' && <SettingsPage theme={theme} setTheme={setTheme} />}
     </div>
   )
 }

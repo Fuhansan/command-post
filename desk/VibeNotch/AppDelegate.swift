@@ -18,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var hoverObserver: AnyCancellable?
     private var transitionsCancellable: AnyCancellable?
+    private var consolePendingCancellable: AnyCancellable?
+    /// 上一次「有待决项」的控制台会话 id 集合,用于检测新出现的待决 → 自动展开刘海。
+    private var lastConsolePendingIDs: Set<String> = []
     private var pendingTask: Task<Void, Never>?
     private var udsServer: UDSServer?
     private var collapseDebounceTimer: Timer?
@@ -71,8 +74,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startLivenessSweep()
         setupRelayAgent()
         startCaffeinate()
-        AgentConsoleWindowController.shared.manager = agentManager
-        AgentConsoleWindowController.shared.store = store
         agentManager.restoreSessions()   // 崩溃/重启恢复:用 --resume 重建上次的控制台会话
     }
 
@@ -204,7 +205,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 vlog("relay input GUI 回退失败:终端激活失败(可能锁屏)sid=\(sid.prefix(8))")
                 return
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.focusEditableInputIfNeeded(sessionId: sid)
                 TerminalTyper.type(message)
             }
             vlog("relay input via GUI 回退 sid=\(sid.prefix(8)) len=\(message.count)")
@@ -308,6 +310,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             vlog("hook install failed: \(error)")
         }
+    }
+
+    /// 点 Dock 图标(无窗口时)→ 打开 Web 控制台,避免「图标点了没反应」。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { openWebConsole() }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -486,16 +494,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @discardableResult
     func jumpToTerminal(sessionId: String) -> Bool {
         guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return false }
-        guard let pid = entry.terminalPID else {
-            vlog("jump: no terminalPID for sid=\(sessionId.prefix(8))")
+        let resolved = hostForSession(entry)
+        let kind = resolved.0
+        guard let pid = resolved.1 else {
+            vlog("jump: no host pid for sid=\(sessionId.prefix(8)) ownerPID=\(entry.ownerPID.map(String.init) ?? "-")")
             return false
         }
         guard let app = NSRunningApplication(processIdentifier: pid) else {
-            vlog("jump: NSRunningApplication(pid=\(pid)) not found — terminal may have quit")
+            vlog("jump: NSRunningApplication(pid=\(pid)) not found — host may have quit")
             return false
         }
 
-        if Self.ideTerminalKinds.contains(entry.terminal) {
+        if Self.ideTerminalKinds.contains(kind) {
             if !WindowActivator.isAccessibilityTrusted {
                 WindowActivator.requestAccessibilityIfNeeded()
                 vlog("jump: AX not trusted — prompting; falling back to whole-app activate")
@@ -508,8 +518,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let ok = app.activate(options: [.activateAllWindows])
-        vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) ok=\(ok)")
+        vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) kind=\(kind.displayName) (\(app.localizedName ?? "?")) ok=\(ok)")
         return ok
+    }
+
+    private func hostForSession(_ entry: SessionEntry) -> (TerminalKind, pid_t?) {
+        if let pid = entry.terminalPID { return (entry.terminal, pid) }
+        if let owner = entry.ownerPID { return ProcessUtils.findTerminal(startPid: owner) }
+        return (.unknown, nil)
+    }
+
+    private func focusEditableInputIfNeeded(sessionId: String) {
+        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return }
+        let host = hostForSession(entry)
+        guard host.0 == .codex, let pid = host.1 else { return }
+        let ok = WindowActivator.focusEditableText(pid: pid)
+        vlog("relay input focus Codex sid=\(sessionId.prefix(8)) pid=\(pid) ok=\(ok)")
     }
 
     /// 45-second watchdog tripped without an Allow/Deny click. Connection is
@@ -578,15 +602,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return mi
         }())
 
-        // stream-json 新架构的桌面入口(实验):点开类终端窗口,自己 spawn 会话对话。
-        menu.addItem({
-            let mi = NSMenuItem(title: "Agent 控制台(实验)",
-                                action: #selector(openAgentConsole), keyEquivalent: "")
-            return mi
-        }())
         // Web 控制台(WKWebView + React)
         menu.addItem({
-            let mi = NSMenuItem(title: "Agent 控制台(Web)",
+            let mi = NSMenuItem(title: "Agent 控制台",
                                 action: #selector(openWebConsole), keyEquivalent: "")
             return mi
         }())
@@ -650,10 +668,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func openAgentConsole() {
-        AgentConsoleWindowController.shared.show()
-    }
-
     @objc private func openWebConsole() {
         WebConsoleWindowController.shared.manager = agentManager
         WebConsoleWindowController.shared.store = store
@@ -711,6 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let store = self.store
         let pending = self.pendingStore
+        let agentManager = self.agentManager
         let n = DynamicNotch(
             hoverBehavior: [.keepVisible, .increaseShadow],
             style: .notch,
@@ -718,6 +733,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 NotchExpandedView(
                     store: store,
                     pending: pending,
+                    agentManager: agentManager,
                     onDecide: { sid, decision in
                         self?.decide(sessionId: sid, decision: decision)
                     },
@@ -729,6 +745,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     },
                     onAnswerQuestion: { sid, picks in
                         self?.answerQuestionFromNotch(sessionId: sid, picks: picks)
+                    },
+                    onConsoleRespond: { sid, reqId, choose in
+                        self?.agentManager.respond(sid, requestId: reqId, choose: choose)
+                    },
+                    onConsolePermission: { sid, allow in
+                        self?.agentManager.respondPermission(sid, allow: allow)
                     }
                 )
             },
@@ -746,6 +768,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         transitionsCancellable = store.transitions
             .sink { [weak self] transition in
                 self?.handleTransition(transition)
+            }
+
+        // 控制台(stream-json)会话出现待决选项/审批时,自动展开刘海(与 hook 会话的 .waiting 一致)。
+        consolePendingCancellable = agentManager.$sessions
+            .sink { [weak self] sessions in
+                self?.handleConsolePending(sessions)
             }
 
         Task { @MainActor in
@@ -800,6 +828,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         rescheduleExpiryTimer()
+        decideExpansion()
+    }
+
+    /// stream-json 控制台会话的待决集合变化时:新出现待决 → 触发自动展开;变化即重判展开。
+    private func handleConsolePending(_ sessions: [AgentSession]) {
+        let now = Set(sessions.filter { s in
+            s.pending.contains { $0.kind == .choice || $0.kind == .planConfirm }
+            || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+        }.map(\.id))
+        guard now != lastConsolePendingIDs else { return }   // 只在集合真的变化时动,避免流式刷新抖动
+        let newly = now.subtracting(lastConsolePendingIDs)
+        lastConsolePendingIDs = now
+        if !newly.isEmpty {
+            autoExpandUntil = Date().addingTimeInterval(Self.waitingAutoExpandSeconds)
+            vlog("auto-expand: 控制台待决 +\(Int(Self.waitingAutoExpandSeconds))s (\(newly.count) 个)")
+            rescheduleExpiryTimer()
+        }
         decideExpansion()
     }
 

@@ -2,10 +2,11 @@ import AppKit
 import WebKit
 import Combine
 
-/// 让网页非交互区域(顶栏空白处)也能拖动窗口。配合 window.isMovableByWindowBackground。
-/// 网页里的按钮/可选文本会自行消费 mousedown,不受影响;只有空白区拖动才移动窗口。
+/// WKWebView 本身**不可**拖动窗口——否则整块网页都成「可拖背景」,把按钮点击/文本选择全吞掉
+/// (回归 bug)。窗口拖动改由顶部的原生透明拖动条 `TitleDragBar` 负责(见 WebConsoleWindowController),
+/// 普通 NSView 的 `mouseDownCanMoveWindow` 行为稳定可靠,不受 WKWebView 内部子视图/异步消息影响。
 final class DraggableWebView: WKWebView {
-    override var mouseDownCanMoveWindow: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 }
 
 /// Web 控制台桥接:持有 WKWebView,订阅会话模型变化推给 JS,接收 JS 命令调模型。
@@ -19,7 +20,13 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private let pairing = PairingController()
     private var cancellables = Set<AnyCancellable>()
     private var ready = false
-    private var pushScheduled = false
+    // 增量推送状态:记录每个会话上次推送的 JSON 指纹,只推变化的那个(流式时关键)。
+    private var lastSessionSig: [String: String] = [:]   // 控制台会话 id → sig
+    private var lastManualSig: [String: String] = [:]    // hook 会话 id → sig
+    private var lastProjectsSig: String?
+    private var sessionsScheduled = false
+    private var manualScheduled = false
+    private var projectsScheduled = false
 
     init(manager: AgentSessionManager, store: SessionStore, relayAgent: RelayAgent?) {
         self.manager = manager
@@ -39,10 +46,10 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         webView.navigationDelegate = self
         loadFrontend()
 
-        manager.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
-        manager.$projects.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
-        manager.$historyByProject.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
-        store.$sessions.sink { [weak self] _ in self?.schedulePush() }.store(in: &cancellables)
+        manager.$sessions.sink { [weak self] _ in self?.scheduleSessions() }.store(in: &cancellables)
+        manager.$projects.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
+        manager.$historyByProject.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
+        store.$sessions.sink { [weak self] _ in self?.scheduleManual() }.store(in: &cancellables)
         relayAgent?.$connState.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
         pairing.$state.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
     }
@@ -54,6 +61,20 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             return
         }
         webView.load(URLRequest(url: url))
+    }
+
+    /// 链接点击:把 http(s) 外链交给系统默认浏览器,取消 webview 内导航(否则会把控制台页面顶掉)。
+    /// 仅放行前端自身的 `app://` 资源加载。
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if let url = navigationAction.request.url,
+           let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
     }
 
     // MARK: - JS → Swift
@@ -85,7 +106,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             if panel.runModal() == .OK, let url = panel.url { manager?.openProject(url.path) }
         case "newSession":
             guard let wd = obj["workdir"] as? String, !wd.isEmpty else { return }
-            _ = manager?.newSession(agent: .claude, workdir: wd,
+            guard let rawAgent = obj["agent"] as? String,
+                  let agent = AgentKind(rawValue: rawAgent) else {
+                NSLog("VibeNotch: newSession ignored because agent is missing")
+                return
+            }
+            _ = manager?.newSession(agent: agent, workdir: wd,
                                     resume: obj["resume"] as? String,
                                     continueLast: obj["continueLast"] as? Bool ?? false)
         case "closeSession":
@@ -187,15 +213,70 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     // MARK: - Swift → JS
 
-    /// 合并高频变化,下一个 runloop 统一推一次全量,避免流式时疯狂 evaluateJavaScript。
-    private func schedulePush() {
-        guard ready, !pushScheduled else { return }
-        pushScheduled = true
-        Task { @MainActor in self.pushScheduled = false; self.pushState() }
+    // 合并高频变化,下一个 runloop 各自推一次(分片:会话/手动/项目互不牵连)。
+    private func scheduleSessions() {
+        guard ready, !sessionsScheduled else { return }
+        sessionsScheduled = true
+        Task { @MainActor in self.sessionsScheduled = false; self.pushSessionsIncremental() }
+    }
+    private func scheduleManual() {
+        guard ready, !manualScheduled else { return }
+        manualScheduled = true
+        Task { @MainActor in self.manualScheduled = false; self.pushManualIncremental() }
+    }
+    private func scheduleProjects() {
+        guard ready, !projectsScheduled else { return }
+        projectsScheduled = true
+        Task { @MainActor in self.projectsScheduled = false; self.pushProjects() }
     }
 
-    private func pushState() {
+    /// 控制台会话:逐个比对指纹,只推变化的会话(`sessionUpsert`),消失的发 `sessionRemove`。
+    /// 流式输出时只有正在说话的那个会话被序列化+推送,而不是整份 state。
+    private func pushSessionsIncremental() {
         guard ready, let manager else { return }
+        var live = Set<String>()
+        for s in manager.sessions {
+            guard let dto = sessionDTO(s), let sig = jsonSig(dto) else { continue }
+            live.insert(s.id)
+            if lastSessionSig[s.id] != sig {
+                lastSessionSig[s.id] = sig
+                pushJSON(type: "sessionUpsert", payload: dto)
+            }
+        }
+        for id in lastSessionSig.keys where !live.contains(id) {
+            lastSessionSig.removeValue(forKey: id)
+            pushJSON(type: "sessionRemove", payload: ["id": id])
+        }
+    }
+
+    /// hook(手动)会话:同样逐个增量。
+    private func pushManualIncremental() {
+        guard ready else { return }
+        var live = Set<String>()
+        for e in store?.sessions ?? [] {
+            guard let dto = manualDTO(e), let sig = jsonSig(dto) else { continue }
+            live.insert(e.id)
+            if lastManualSig[e.id] != sig {
+                lastManualSig[e.id] = sig
+                pushJSON(type: "manualUpsert", payload: dto)
+            }
+        }
+        for id in lastManualSig.keys where !live.contains(id) {
+            lastManualSig.removeValue(forKey: id)
+            pushJSON(type: "manualRemove", payload: ["id": id])
+        }
+    }
+
+    /// 项目 + 隐藏名单:变化较少,整体推,但指纹无变化时跳过(避免会话刷新时白推)。
+    private func pushProjects() {
+        guard ready, let manager else { return }
+        let payload = projectsPayload(manager)
+        guard let sig = jsonSig(payload), sig != lastProjectsSig else { return }
+        lastProjectsSig = sig
+        pushJSON(type: "projects", payload: payload)
+    }
+
+    private func projectsPayload(_ manager: AgentSessionManager) -> [String: Any] {
         let meta = SessionMetaStore.shared
         let projects = manager.projects.map { proj -> [String: Any] in
             manager.loadHistoryList(for: proj)   // 懒加载历史(已缓存则跳过)
@@ -206,10 +287,31 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             }
             return ["workdir": proj, "name": (proj as NSString).lastPathComponent, "history": hist]
         }
+        let hidden = meta.hiddenEntries().map { ["key": $0.key, "title": $0.title] }
+        return ["projects": projects, "hidden": hidden]
+    }
+
+    /// 初次/重连:推一次全量 state,并把各会话指纹种好,后续走增量。
+    private func pushState() {
+        guard ready, let manager else { return }
+        let proj = projectsPayload(manager)
         let sessions = manager.sessions.compactMap { sessionDTO($0) }
         let manual = (store?.sessions ?? []).compactMap { manualDTO($0) }
-        let hidden = meta.hiddenEntries().map { ["key": $0.key, "title": $0.title] }
-        pushJSON(type: "state", payload: ["projects": projects, "sessions": sessions, "manual": manual, "hidden": hidden])
+        // 种指纹,使随后的增量推送能正确 diff(避免全量后又逐个重推)。
+        lastSessionSig.removeAll()
+        for s in manager.sessions { if let d = sessionDTO(s), let sig = jsonSig(d) { lastSessionSig[s.id] = sig } }
+        lastManualSig.removeAll()
+        for e in store?.sessions ?? [] { if let d = manualDTO(e), let sig = jsonSig(d) { lastManualSig[e.id] = sig } }
+        lastProjectsSig = jsonSig(proj)
+        pushJSON(type: "state", payload: [
+            "projects": proj["projects"] ?? [], "sessions": sessions,
+            "manual": manual, "hidden": proj["hidden"] ?? [],
+        ])
+    }
+
+    private func jsonSig(_ obj: [String: Any]) -> String? {
+        guard let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return nil }
+        return String(data: d, encoding: .utf8)
     }
 
     // MARK: - 连接 / 配对
@@ -262,12 +364,14 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private func manualDTO(_ e: SessionEntry) -> [String: Any]? {
         let meta = SessionMetaStore.shared
         if meta.isHidden(e.id) { return nil }
-        let base = e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }
-            .map { String($0.prefix(40)) } ?? (e.promptSummary.map { String($0.prefix(40)) } ?? "手动会话")
+        let agent = e.transcriptPath.flatMap { CodingAgents.forTranscript($0)?.id } ?? "claude"
+        let base = e.promptSummary.map { String($0.prefix(40)) }
+            ?? e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }.map { String($0.prefix(40)) }
+            ?? "手动会话"
         return [
             "id": e.id, "key": e.id, "title": meta.title(for: e.id) ?? base, "cwd": e.cwd,
             "terminal": e.terminal.displayName,
-            "agent": "claude",   // hook 会话均为 Claude Code(codex 走控制台 driver)
+            "agent": agent,
             "state": manualState(e.state),
             "lastActivityAt": e.lastActivityAt.timeIntervalSince1970 * 1000,
         ]

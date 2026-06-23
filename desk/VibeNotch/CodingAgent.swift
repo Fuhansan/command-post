@@ -53,8 +53,21 @@ enum CodingAgents {
     }
 
     /// 读回复的统一入口:路由到对应适配器;没有匹配的工具(如还没实现的)→ 空。
+    ///
+    /// **缓存(P1)**:轮询每 400ms/会话调一次,原先每次全量读尾 1MB + 逐行 JSON 解析。
+    /// 这里按「文件大小 + mtime」加缓存:文件没增长就直接返回上次结果(只做一次 stat,
+    /// 不读盘不解析)。claude 在写时大小变化 → 才重解析。空闲/两轮之间几乎零开销。
+    private static var stepsCache: [String: (size: UInt64, mtime: TimeInterval, steps: [TurnStep])] = [:]
     static func turnSteps(transcriptPath: String) -> [TurnStep] {
-        forTranscript(transcriptPath)?.turnSteps(transcriptPath: transcriptPath) ?? []
+        let attrs = try? FileManager.default.attributesOfItem(atPath: transcriptPath)
+        let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        if let c = stepsCache[transcriptPath], c.size == size, c.mtime == mtime {
+            return c.steps
+        }
+        let steps = forTranscript(transcriptPath)?.turnSteps(transcriptPath: transcriptPath) ?? []
+        stepsCache[transcriptPath] = (size, mtime, steps)
+        return steps
     }
 }
 

@@ -211,7 +211,18 @@ enum TranscriptReader {
     /// 当前一轮每个文件的 diff hunks(供手机展示实际改了哪些代码)。
     /// Edit: old_string→del, new_string→add;Write: content→add;MultiEdit: 各 edit 累加。
     /// 返回 path → [{op:add|del, text}],按文件首次出现顺序无关(调用方自行排序)。
+    /// 文件未变(size+mtime)→ 返回缓存,避免 RelayAgent 每次 syncToServer 都读 256KB+解析(P3)。
+    private static var diffsCache: [String: (size: UInt64, mtime: TimeInterval, diffs: [String: [[String: String]]])] = [:]
     static func fileEditDiffs(transcriptPath: String) -> [String: [[String: String]]] {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: transcriptPath)
+        let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        if let c = diffsCache[transcriptPath], c.size == size, c.mtime == mtime { return c.diffs }
+        let diffs = computeFileEditDiffs(transcriptPath: transcriptPath)
+        diffsCache[transcriptPath] = (size, mtime, diffs)
+        return diffs
+    }
+    private static func computeFileEditDiffs(transcriptPath: String) -> [String: [[String: String]]] {
         guard let data = readTail(path: transcriptPath, maxBytes: 256 * 1024),
               let blob = String(data: data, encoding: .utf8) else { return [:] }
         let lines = blob.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)

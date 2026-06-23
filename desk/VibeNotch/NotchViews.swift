@@ -103,10 +103,16 @@ struct StateDot: View {
 struct NotchExpandedView: View {
     @ObservedObject var store: SessionStore
     @ObservedObject var pending: PendingDecisionStore
+    /// stream-json 控制台会话(不在 SessionStore 里)——把它们的待决选项/审批也渲染到刘海。
+    @ObservedObject var agentManager: AgentSessionManager
     var onDecide: (String, PermissionDecision) -> Void
     var onJump: (String) -> Void
     var onOpenFile: (String, String) -> Void
     var onAnswerQuestion: (String, [Int]) -> Void = { _, _ in }
+    /// 控制台会话作答:(sid, requestId, 选项 id 列表)→ AgentSessionManager.respond。
+    var onConsoleRespond: (String, String, [String]) -> Void = { _, _, _ in }
+    /// 控制台会话审批:(sid, 是否允许)→ AgentSessionManager.respondPermission。
+    var onConsolePermission: (String, Bool) -> Void = { _, _ in }
     @State private var expandedID: String? = nil
     @State private var lastClickAt: Date? = nil
     @State private var lastClickedID: String? = nil
@@ -135,14 +141,25 @@ struct NotchExpandedView: View {
         }
     }
 
+    /// 需要你作答的控制台(stream-json)会话:有选择题/计划确认 pending,或有待处理审批卡。
+    private var consolePendings: [AgentSession] {
+        agentManager.sessions.filter { s in
+            s.pending.contains { $0.kind == .choice || $0.kind == .planConfirm }
+            || s.messages.contains { $0.kind == .permission && $0.permState == nil }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if store.sessions.isEmpty {
+            if store.sessions.isEmpty && consolePendings.isEmpty {
                 emptyState
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
-                    sessionList
+                    VStack(spacing: 0) {
+                        if !consolePendings.isEmpty { consoleSection }
+                        if !store.sessions.isEmpty { sessionList }
+                    }
                 }
                 .frame(maxHeight: 400)
             }
@@ -151,6 +168,22 @@ struct NotchExpandedView: View {
         .padding(.top, DesignTokens.spaceSM)
         .padding(.bottom, DesignTokens.spaceSM)
         .frame(width: DesignTokens.panelWidth, alignment: .leading)
+    }
+
+    private var consoleSection: some View {
+        VStack(spacing: 0) {
+            ForEach(consolePendings) { s in
+                let key = s.pending.first { $0.kind == .choice || $0.kind == .planConfirm }?.id
+                    ?? s.messages.first { $0.kind == .permission && $0.permState == nil }?.id
+                    ?? s.id
+                NotchConsolePendingRow(
+                    session: s,
+                    onRespond: { reqId, choose in onConsoleRespond(s.id, reqId, choose) },
+                    onPermission: { allow in onConsolePermission(s.id, allow) }
+                )
+                .id(key)   // 每个不同待决项重建,避免上一个的「已提交」状态残留
+            }
+        }
     }
 
     private var sessionList: some View {
@@ -874,5 +907,126 @@ struct NotchQuestionCard: View {
         .padding(8)
         .background(Color.orange.opacity(0.10))
         .cornerRadius(8)
+    }
+}
+
+/// 控制台(stream-json)会话的待决卡。这类会话不在 SessionStore，单独从 AgentSessionManager
+/// 渲染到刘海，让「选择题 / 计划确认 / 工具审批」在刘海也能作答(与手机、Web 控制台同步)。
+struct NotchConsolePendingRow: View {
+    let session: AgentSession
+    var onRespond: (String, [String]) -> Void   // (requestId, 选项 id 列表)
+    var onPermission: (Bool) -> Void
+    @State private var picked: Set<Int> = []
+    @State private var submitted = false
+
+    private var choiceReq: PendingRequest? {
+        session.pending.first { $0.kind == .choice || $0.kind == .planConfirm }
+    }
+    private var permMsg: AgentMessage? {
+        session.messages.first { $0.kind == .permission && $0.permState == nil }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Circle().fill(Color.orange).frame(width: 6, height: 6)
+                Text(session.title.isEmpty ? "控制台会话" : session.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(DesignTokens.textPrimary)
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 4)
+                Text("控制台")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
+            }
+            if let req = choiceReq {
+                choiceCard(req)
+            } else if let m = permMsg {
+                permissionCard(m)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder private func choiceCard(_ req: PendingRequest) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            let prompt = req.detail ?? req.title
+            if !prompt.isEmpty {
+                Text(prompt)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9)).lineLimit(3)
+            }
+            ForEach(Array(req.options.enumerated()), id: \.offset) { i, opt in
+                Button {
+                    guard !submitted else { return }
+                    if req.multiSelect {
+                        if picked.contains(i) { picked.remove(i) } else { picked.insert(i) }
+                    } else {
+                        submitted = true
+                        onRespond(req.id, [opt.id])
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: picked.contains(i)
+                              ? (req.multiSelect ? "checkmark.square.fill" : "checkmark.circle.fill")
+                              : (req.multiSelect ? "square" : "circle"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(picked.contains(i) ? Color.orange : .white.opacity(0.4))
+                        Text("\(i + 1). \(opt.label)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.white.opacity(0.85)).lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color.white.opacity(picked.contains(i) ? 0.12 : 0.05))
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            if req.multiSelect {
+                Button {
+                    guard !submitted, !picked.isEmpty else { return }
+                    submitted = true
+                    onRespond(req.id, picked.sorted().map { req.options[$0].id })
+                } label: {
+                    Text(submitted ? "已提交" : "提交(已选 \(picked.count) 项)")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+                        .frame(maxWidth: .infinity).padding(.vertical, 5)
+                        .background(picked.isEmpty ? Color.white.opacity(0.08) : Color.orange.opacity(0.7))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain).disabled(submitted || picked.isEmpty)
+            }
+        }
+        .padding(8).background(Color.orange.opacity(0.10)).cornerRadius(8)
+    }
+
+    @ViewBuilder private func permissionCard(_ m: AgentMessage) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !m.text.isEmpty {
+                Text(m.text)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(3).truncationMode(.middle)
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.06)).cornerRadius(6)
+            }
+            HStack(spacing: 6) {
+                Button { guard !submitted else { return }; submitted = true; onPermission(false) } label: {
+                    Text("拒绝").font(.system(size: 11, weight: .medium))
+                        .frame(maxWidth: .infinity).padding(.vertical, 5)
+                        .background(Color(hex: 0xFF453A).opacity(0.18))
+                        .foregroundStyle(Color(hex: 0xFF453A)).cornerRadius(6)
+                }.buttonStyle(.plain)
+                Button { guard !submitted else { return }; submitted = true; onPermission(true) } label: {
+                    Text("允许").font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity).padding(.vertical, 5)
+                        .background(Color(hex: 0x0A84FF)).foregroundStyle(.white).cornerRadius(6)
+                }.buttonStyle(.plain)
+            }
+        }
     }
 }

@@ -57,9 +57,9 @@ export interface Provider {
   key: string
   models: string[]
 }
-// 真实只有 Claude 经 VibeNotch 托管;其余为设计稿里的「规划中」占位
+// Claude 与 Codex 已经通过 VibeNotch 接入;其余仍是设计稿里的「规划中」占位。
 export const PROVIDERS: Provider[] = [
   { id: 'claude', name: 'Claude', vendor: 'Anthropic · 经 VibeNotch', initial: 'C', iconBg: '#ece6dd', iconFg: '#b8612d', online: true, key: 'sk-ant-•••••3f2a', models: ['Opus 4.8', 'Sonnet 4.6', 'Haiku 4.5'] },
-  { id: 'codex', name: 'Codex', vendor: 'OpenAI · 计划中', initial: 'O', iconBg: '#dce9e3', iconFg: '#1a7d5a', online: false, key: 'sk-•••••9b1c', models: ['GPT-4o', 'GPT-4o mini', 'o1'] },
+  { id: 'codex', name: 'Codex', vendor: 'OpenAI · 经 VibeNotch', initial: 'O', iconBg: '#dce9e3', iconFg: '#1a7d5a', online: true, key: 'sk-•••••9b1c', models: ['GPT-5 Codex', 'GPT-5'] },
   { id: 'local', name: 'Local', vendor: 'Ollama · 本地', initial: 'L', iconBg: '#e3e3ec', iconFg: '#5562c9', online: false, key: '—', models: ['llama3.1', 'qwen2.5-coder'] },
 ]

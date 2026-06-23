@@ -39,7 +39,7 @@ export interface Manual {
   title: string
   cwd: string
   terminal: string
-  agent: string         // claude | codex(hook 会话目前都是 claude)
+  agent: string         // claude | codex
   state: string         // working|waiting|done|idle
   lastActivityAt: number
 }
