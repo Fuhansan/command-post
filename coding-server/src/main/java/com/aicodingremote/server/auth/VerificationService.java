@@ -61,6 +61,16 @@ public class VerificationService {
 
         String code = String.format("%06d", rnd.nextInt(1_000_000));
         codes.put(email, new Entry(code, now + TTL_MS, now));
+
+        // 开发模式:SMTP username 未配置时不真发邮件,直接把验证码打到日志(本地联调用)。
+        // 部署时在外置 application.properties 填上 spring.mail.username/password 即恢复发邮件。
+        if (mailFrom == null || mailFrom.isBlank()) {
+            log.warn("=========================================================");
+            log.warn("[DEV] 验证码 {} -> {} ({})  [SMTP 未配置,不发邮件]", code, email, purpose);
+            log.warn("=========================================================");
+            return SendOutcome.SENT;
+        }
+
         try {
             SimpleMailMessage msg = new SimpleMailMessage();
             if (mailFrom != null && !mailFrom.isBlank()) msg.setFrom(mailFrom);

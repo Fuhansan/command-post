@@ -463,19 +463,39 @@ private val photoBitmapCache = object : android.util.LruCache<String, Bitmap>(16
 /**
  * 兼容两种 images 元素:对象 {data,name,kind,size} 或纯 base64 字符串(旧格式)。
  */
-private fun decodePhotoItems(arr: List<JsonElement>): List<PhotoItem> = arr.mapNotNull { v ->
-    val obj = v.objectValue
-    val b64 = if (obj != null) obj["data"]?.stringValue else v.stringValue
-    b64 ?: return@mapNotNull null
-    val name = obj?.get("name")?.stringValue ?: ""
-    val kind = obj?.get("kind")?.stringValue ?: ""
-    val size = obj?.get("size")?.stringValue ?: ""
-    val key = "${b64.length}:${b64.take(48)}"
-    val bitmap = photoBitmapCache.get(key) ?: runCatching {
-        val bytes = Base64.decode(b64, Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }.getOrNull()?.also { photoBitmapCache.put(key, it) } ?: return@mapNotNull null
-    PhotoItem(bitmap, bitmap.width, bitmap.height, name, kind, size)
+private fun decodePhotoItems(arr: List<JsonElement>): List<PhotoItem> {
+    android.util.Log.i("PhotoMsg", "decode arr.size=${arr.size}")
+    return arr.mapNotNull { v ->
+        val obj = v.objectValue
+        val b64 = if (obj != null) obj["data"]?.stringValue else v.stringValue
+        if (b64 == null) {
+            android.util.Log.w("PhotoMsg", "no b64 data, keys=${obj?.keys}, raw v type=${v::class.simpleName}")
+            return@mapNotNull null
+        }
+        val name = obj?.get("name")?.stringValue ?: ""
+        val kind = obj?.get("kind")?.stringValue ?: ""
+        val size = obj?.get("size")?.stringValue ?: ""
+        val key = "${b64.length}:${b64.take(48)}"
+        val bitmap = photoBitmapCache.get(key) ?: run {
+            try {
+                val bytes = Base64.decode(b64, Base64.DEFAULT)
+                android.util.Log.i("PhotoMsg", "decoded bytes=${bytes.size} (b64Len=${b64.length})")
+                val bm = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                if (bm == null) {
+                    android.util.Log.e("PhotoMsg", "BitmapFactory.decodeByteArray returned NULL")
+                    null
+                } else {
+                    android.util.Log.i("PhotoMsg", "bitmap ${bm.width}x${bm.height}")
+                    photoBitmapCache.put(key, bm)
+                    bm
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("PhotoMsg", "decode threw", e)
+                null
+            }
+        } ?: return@mapNotNull null
+        PhotoItem(bitmap, bitmap.width, bitmap.height, name, kind, size)
+    }
 }
 
 /** 在 boxW × maxH 内按宽高比缩放,不裁切不留黑边。 */

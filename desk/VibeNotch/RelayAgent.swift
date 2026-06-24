@@ -1106,38 +1106,53 @@ final class RelayAgent: NSObject, ObservableObject {
         guard let sid = obj["sid"] as? String,
               let body = obj["body"] as? [String: Any] else { return }
         let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        // 控制台(stream-json)会话:文本直接路由到 AgentSessionManager(图片后续支持)
-        if sid.hasPrefix("c:") {
-            agentManager?.send(String(sid.dropFirst(2)), text: text)
+        let images = body["images"] as? [[String: Any]] ?? []
+
+        // 控制台(stream-json)会话:文本 + 图片一并送给 AgentSessionManager
+        // (driver 内部用 `[Image #N]` 占位 + 文件路径透传给 claude TUI)。
+        let isConsole = sid.hasPrefix("c:")
+
+        // 没图就直接走文本路径(避免起 Task)
+        if images.isEmpty {
+            if isConsole {
+                agentManager?.send(String(sid.dropFirst(2)), text: text)
+            } else {
+                guard !text.isEmpty else { return }
+                onRemoteInput?(sid, text, [])
+            }
             return
         }
-        let images = body["images"] as? [[String: Any]] ?? []
-        // 图片要从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程注入终端。
+
+        // 有图:从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程派发。
         Task.detached(priority: .userInitiated) { [weak self] in
             var paths: [String] = []
-            if !images.isEmpty {
-                let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
-                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                for (i, img) in images.enumerated() {
-                    let ext = (img["ext"] as? String ?? "jpg").lowercased()
-                    let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
-                    let data: Data?
-                    if let id = img["id"] as? String, !id.isEmpty {
-                        data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
-                        vlog("relay image[\(i)] 走 id=\(id) → \(data != nil ? "下载成功 \(data!.count)B" : "下载失败")")
-                    } else if let b64 = img["data"] as? String {
-                        data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
-                        vlog("relay image[\(i)] 走 base64(旧链路) \(data?.count ?? 0)B")
-                    } else {
-                        data = nil
-                        vlog("relay image[\(i)] 既无 id 也无 data,跳过 keys=\(Array(img.keys))")
-                    }
-                    guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
-                    paths.append(path)
+            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            for (i, img) in images.enumerated() {
+                let ext = (img["ext"] as? String ?? "jpg").lowercased()
+                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
+                let data: Data?
+                if let id = img["id"] as? String, !id.isEmpty {
+                    data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
+                    vlog("relay image[\(i)] 走 id=\(id) → \(data != nil ? "下载成功 \(data!.count)B" : "下载失败")")
+                } else if let b64 = img["data"] as? String {
+                    data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
+                    vlog("relay image[\(i)] 走 base64(旧链路) \(data?.count ?? 0)B")
+                } else {
+                    data = nil
+                    vlog("relay image[\(i)] 既无 id 也无 data,跳过 keys=\(Array(img.keys))")
                 }
+                guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
+                paths.append(path)
             }
             guard !text.isEmpty || !paths.isEmpty else { return }
-            await MainActor.run { self?.onRemoteInput?(sid, text, paths) }
+            await MainActor.run {
+                if isConsole {
+                    self?.agentManager?.send(String(sid.dropFirst(2)), text: text, imagePaths: paths)
+                } else {
+                    self?.onRemoteInput?(sid, text, paths)
+                }
+            }
         }
     }
 
