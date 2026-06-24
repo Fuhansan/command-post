@@ -1,6 +1,6 @@
 import Foundation
 
-/// Codex adapter backed by `codex app-server --stdio`.
+/// Codex adapter backed by `codex app-server`（默认 stdio:// 传输）。
 ///
 /// This is the structured protocol used by the Codex app/IDE surfaces. It is
 /// closer to an app-level JSON-RPC server than Claude's per-process stream-json:
@@ -56,7 +56,9 @@ final class CodexAppServerDriver: AgentDriver {
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["app-server", "--stdio"]
+        // codex 0.130+ 的 app-server 默认就是 stdio:// 传输；旧的 `--stdio` 参数已移除
+        // （传它会报 "unexpected argument '--stdio' found" 直接退出 → 会话起不来）。
+        p.arguments = ["app-server"]
         p.currentDirectoryURL = URL(fileURLWithPath: workdir)
         p.environment = Self.childEnvironment()
 

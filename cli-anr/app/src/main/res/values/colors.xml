@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0A0B0E</color>
+    <color name="card">#16181E</color>
+    <color name="card_high">#1C1F26</color>
+    <color name="field">#101216</color>
+    <color name="stroke">#262A32</color>
+    <color name="text_primary">#F2F3F5</color>
+    <color name="text_secondary">#8B919C</color>
+    <color name="brand_blue">#3B82F6</color>
+    <color name="launcher_purple">#5B5BD6</color>
+</resources>
