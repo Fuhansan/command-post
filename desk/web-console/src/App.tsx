@@ -8,7 +8,7 @@ import {
   BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff,
   Activity, DollarSign, Boxes, Database, GitBranch, MessageSquare, Clipboard, Code2,
 } from 'lucide-react'
-import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn } from './store'
+import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn, getImgUpload } from './store'
 import { cmd, type AgentId } from './bridge'
 import type { Session, Msg, Manual, History, Project, Entry, UsageData, MsgImage } from './types'
 import { mockGit, PROVIDERS } from './mock'
@@ -332,6 +332,8 @@ type Attach =
 let _aid = 0
 const newAid = () => `a${++_aid}`
 type SetAttach = (fn: (prev: Attach[]) => Attach[]) => void
+// 输入框草稿按会话 id 暂存(切会话工作区会重挂载 Composer,靠它保住未发送内容)
+const draftStore: Record<string, string> = {}
 
 function attachToText(a: Attach): string {
   if (a.kind === 'code') return `\`\`\`${a.lang}\n// ${a.file}:${a.start === a.end ? a.start : `${a.start}-${a.end}`}\n${a.snippet}\n\`\`\``
@@ -360,17 +362,19 @@ function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
 }
 
 // ===== 输入框(带附件)=====
-function Composer({ sid, model, attachments, setAttachments, onSend }: {
-  sid: string; model?: string; attachments: Attach[]; setAttachments: SetAttach
-  onSend: (t: string, images?: { name: string; data: string }[]) => void
+function Composer({ sid, model, working, attachments, setAttachments, onSend }: {
+  sid: string; model?: string; working?: boolean; attachments: Attach[]; setAttachments: SetAttach
+  onSend: (t: string, images?: Array<{ name?: string; data?: string; id?: string; ext?: string }>) => void
 }) {
-  const [draft, setDraft] = useState('')
+  const [draft, setDraft] = useState(() => draftStore[sid] ?? '')   // 草稿按会话持久化:切走再回来不丢
+  const setDraftP = (v: string) => { setDraft(v); draftStore[sid] = v }
   const [menu, setMenu] = useState(false)
   const [drag, setDrag] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
-  // 输入法组字状态:WKWebView 里 e.isComposing 不可靠,手动跟踪。compositionend 延一拍再清,
-  // 让「确认候选词的回车」(紧跟 compositionend 触发)被拦下,不误发送。
+  // 输入法组字:WKWebView 里 compositionstart/isComposing 都不稳,叠加多重信号兜底,
+  // 避免「回车选候选词(含英文候选)」被当成发送。
   const composingRef = useRef(false)
+  const lastCompEnd = useRef(0)
   const cur = modelLabel(model)
   const addFiles = (files: FileList | File[]) => {
     for (const f of Array.from(files)) {
@@ -379,7 +383,11 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
         const id = newAid()
         setAttachments((p) => [...p, { id, kind: 'image', name: f.name, dataUrl: '' }])
         const r = new FileReader()
-        r.onload = () => setAttachments((p) => p.map((a) => a.id === id ? { ...a, dataUrl: String(r.result) } : a))
+        r.onload = () => {
+          const dataUrl = String(r.result)
+          setAttachments((p) => p.map((a) => a.id === id ? { ...a, dataUrl } : a))
+          cmd.prepareImage(id, f.name, dataUrl.split(',')[1] ?? '')   // 粘贴即上传,不等回车
+        }
         r.readAsDataURL(f)
       } else {
         setAttachments((p) => [...p, { id: newAid(), kind: 'file', name: f.name, path: f.name, lang: hljsLang(f.name) ?? fileExt(f.name) ?? 'file' }])
@@ -392,9 +400,13 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
     // 图片单独走二进制通道(只发字节,消息里不塞 base64);代码/粘贴/文件引用仍拼进文字
     const imgs = attachments.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image' && !!a.dataUrl)
     const textRefs = attachments.filter((a) => a.kind !== 'image').map(attachToText)
-    const images = imgs.map((a) => ({ name: a.name, data: a.dataUrl.split(',')[1] ?? '' }))
+    // 粘贴时已预上传到就只发 id(秒发);没传完的兜底发 base64(现传)
+    const images = imgs.map((a) => {
+      const up = getImgUpload(a.id)
+      return up ? { id: up.id, ext: up.ext } : { name: a.name, data: a.dataUrl.split(',')[1] ?? '' }
+    })
     onSend([...textRefs, t].filter(Boolean).join('\n\n'), images)
-    setDraft(''); setAttachments(() => [])
+    setDraftP(''); setAttachments(() => [])
   }
   const onPaste = (e: React.ClipboardEvent) => {
     if (e.clipboardData.files.length) { e.preventDefault(); addFiles(e.clipboardData.files); return }
@@ -411,10 +423,15 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
         {drag && <div className="absolute inset-0 z-10 rounded-[14px] flex items-center justify-center text-[12.5px] font-medium" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>释放以添加图片或文件</div>}
         <input ref={fileRef} type="file" multiple className="hidden" onChange={(e) => { if (e.target.files) addFiles(e.target.files); e.target.value = '' }} />
         {attachments.length > 0 && <div className="flex flex-wrap gap-2 px-3 pt-3">{attachments.map((a) => <AttachChip key={a.id} a={a} onRemove={() => setAttachments((p) => p.filter((x) => x.id !== a.id))} />)}</div>}
-        <textarea value={draft} onChange={(e) => setDraft(e.target.value)} onPaste={onPaste}
+        <textarea value={draft} onChange={(e) => setDraftP(e.target.value)} onPaste={onPaste}
           onCompositionStart={() => { composingRef.current = true }}
-          onCompositionEnd={() => { setTimeout(() => { composingRef.current = false }, 0) }}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !composingRef.current && !e.nativeEvent.isComposing) { e.preventDefault(); submit() } }}
+          onCompositionEnd={() => { composingRef.current = false; lastCompEnd.current = Date.now() }}
+          onKeyDown={(e) => {
+            if (e.key !== 'Enter' || e.shiftKey) return
+            // 组字中 / isComposing / keyCode 229(输入法处理中)/ 刚确认候选词(150ms 内)→ 交给输入法,不发送
+            if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229 || Date.now() - lastCompEnd.current < 150) return
+            e.preventDefault(); submit()
+          }}
           rows={1} placeholder="描述需求…  选中代码可「加入对话」,拖拽 / 粘贴可加附件"
           className="w-full resize-none bg-transparent outline-none px-4 pt-3.5 pb-1.5 text-[13px] text-ink select-text placeholder:text-faint" />
         <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5">
@@ -447,10 +464,15 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
               </div>
             </>
           )}
-          <button onClick={submit} disabled={!draft.trim() && !attachments.length}
-            className="w-8 h-8 rounded-[9px] flex items-center justify-center text-accentfg disabled:opacity-40 transition hover:brightness-110" style={{ background: 'var(--accent)' }}>
-            <ArrowUp size={16} strokeWidth={2} />
-          </button>
+          {working
+            ? <button onClick={() => cmd.interrupt(sid)} title="停止"
+                className="w-8 h-8 rounded-[9px] flex items-center justify-center text-accentfg transition hover:brightness-110" style={{ background: 'var(--red)' }}>
+                <span className="w-3 h-3 rounded-[2px] bg-white" />
+              </button>
+            : <button onClick={submit} disabled={!draft.trim() && !attachments.length}
+                className="w-8 h-8 rounded-[9px] flex items-center justify-center text-accentfg disabled:opacity-40 transition hover:brightness-110" style={{ background: 'var(--accent)' }}>
+                <ArrowUp size={16} strokeWidth={2} />
+              </button>}
         </div>
       </div>
     </div>
@@ -1112,7 +1134,7 @@ function ConsolePage() {
     barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
     barRight = <IconBtn title="结束会话" onClick={() => cmd.closeSession(liveSession.id)}><X size={16} /></IconBtn>
     chat = <MsgList msgs={liveSession.messages} onRespond={onLiveRespond} working={liveSession.status === 'working'} />
-    footer = <Composer sid={liveSession.id} model={liveSession.model} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
+    footer = <Composer sid={liveSession.id} model={liveSession.model} working={liveSession.status === 'working'} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
     const mm = tmeta[manualSel.id]

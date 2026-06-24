@@ -134,6 +134,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                 if imgs.isEmpty { manager?.send(sid, text: text) }
                 else { sendWithImages(sid: sid, text: text, images: imgs) }
             }
+        case "prepareImage":
+            if let attachId = obj["attachId"] as? String, let name = obj["name"] as? String, let data = obj["data"] as? String {
+                prepareImage(attachId: attachId, name: name, b64: data)
+            }
+        case "interrupt":
+            if let sid = obj["sid"] as? String { manager?.interrupt(sid) }
         case "respond":
             if let sid = obj["sid"] as? String, let req = obj["reqId"] as? String,
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
@@ -420,19 +426,34 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     /// 桌面控制台带图发送:web 传 base64 → 落盘(喂 agent)+ 上传服务器拿 id(给手机展示)→ 入会话回显。
     /// 全图不进 relay 消息,只带 id + 小缩略图。
+    /// 粘贴即上传:不等发送,先把图传服务器拿 id + 落本地缓存,完成回推 imageReady。
+    private func prepareImage(attachId: String, name: String, b64: String) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let data = Data(base64Encoded: b64) else { return }
+            let raw = (name as NSString).pathExtension.lowercased()
+            let ext = raw.isEmpty ? "png" : raw
+            var id = "", outExt = ext
+            if let up = ImageRelay.upload(data, ext: ext) { id = up.id; outExt = up.ext; ImageRelay.saveById(id: id, ext: outExt, data: data) }
+            else if let local = ImageRelay.cacheBase64(b64, ext: ext) { id = local }
+            guard !id.isEmpty else { return }
+            await MainActor.run { self?.pushJSON(type: "imageReady", payload: ["attachId": attachId, "id": id, "ext": outExt]) }
+        }
+    }
+
     private func sendWithImages(sid: String, text: String, images: [[String: Any]]) {
         Task.detached(priority: .userInitiated) { [weak self] in
             var refs: [ImageRef] = []
             for img in images {
-                guard let b64 = img["data"] as? String, let data = Data(base64Encoded: b64) else { continue }
-                let name = (img["name"] as? String) ?? "image"
-                let raw = (name as NSString).pathExtension.lowercased()
-                var ext = raw.isEmpty ? "png" : raw
-                var id = ""
-                if let up = ImageRelay.upload(data, ext: ext) {   // 上传换 id + 按 id 落本地缓存
-                    id = up.id; ext = up.ext; ImageRelay.saveById(id: id, ext: ext, data: data)
-                } else if let local = ImageRelay.cacheBase64(b64, ext: ext) {   // 上传失败:本地缓存兜底(桌面可看,手机拉不到)
-                    id = local
+                var id = "", ext = "png"
+                if let preId = img["id"] as? String, !preId.isEmpty {   // 粘贴时已预上传:只需确保本地缓存(给 agent 当路径)
+                    id = preId; ext = (img["ext"] as? String) ?? "png"
+                    _ = ImageRelay.ensureCached(id: id, ext: ext)
+                } else if let b64 = img["data"] as? String, let data = Data(base64Encoded: b64) {   // 没预传:现传
+                    let name = (img["name"] as? String) ?? "image"
+                    let raw = (name as NSString).pathExtension.lowercased()
+                    ext = raw.isEmpty ? "png" : raw
+                    if let up = ImageRelay.upload(data, ext: ext) { id = up.id; ext = up.ext; ImageRelay.saveById(id: id, ext: ext, data: data) }
+                    else if let local = ImageRelay.cacheBase64(b64, ext: ext) { id = local }
                 }
                 guard !id.isEmpty else { continue }
                 refs.append(ImageRef(id: id, ext: ext, localPath: ImageRelay.cachePath(id: id, ext: ext)))

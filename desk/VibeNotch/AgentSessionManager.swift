@@ -402,15 +402,15 @@ final class AgentSessionManager: ObservableObject {
 
     func send(_ sid: String, text: String, imagePaths: [String] = []) {
         guard let d = managed[sid]?.driver else { return }
-        // 本地立即回显用户消息
-        mutate(sid) { s in s.messages.append(self.userEcho(text)) }
+        // 本地立即回显用户消息 + 乐观置 working:发出去就显示「思考中」,不等 agent 首 token
+        mutate(sid) { s in s.messages.append(self.userEcho(text)); s.status = .working }
         d.send(UserInput(text: text, imagePaths: imagePaths))
     }
 
     /// 带图发送:images 已落盘 + (尽量)上传服务器。driver 读本地路径喂 agent,回显/relay 带缩略图与 id。
     func send(_ sid: String, text: String, images: [ImageRef]) {
         guard let d = managed[sid]?.driver else { return }
-        mutate(sid) { s in s.messages.append(self.userEcho(text, images: images)) }
+        mutate(sid) { s in s.messages.append(self.userEcho(text, images: images)); s.status = .working }
         d.send(UserInput(text: text, imagePaths: images.map { $0.localPath }))
     }
 

@@ -31,6 +31,7 @@ final class CodexAppServerDriver: AgentDriver {
     private var threadId: String?
     private var activeTurnId: String?
     private var currentWorkdir: String = NSHomeDirectory()
+    private var streamedIds = Set<String>()   // 已逐 token 流过的 agentMessage id(item/completed 去重,避免文本翻倍)
     private var currentModel: String?
     private var stopped = false
 
@@ -250,6 +251,7 @@ final class CodexAppServerDriver: AgentDriver {
         case "item/agentMessage/delta":
             let id = params["itemId"] as? String ?? params["turnId"] as? String ?? UUID().uuidString
             if let delta = params["delta"] as? String, !delta.isEmpty {
+                streamedIds.insert(id)
                 emit.yield(.messageDelta(msgId: id, role: "assistant", text: delta))
             }
         case "item/started", "item/completed":
@@ -342,9 +344,13 @@ final class CodexAppServerDriver: AgentDriver {
         let id = item["id"] as? String ?? UUID().uuidString
         switch type {
         case "agentMessage":
-            guard completed, let text = item["text"] as? String, !text.isEmpty else { return }
-            emit.yield(.messageDelta(msgId: id, role: "assistant", text: text))
+            guard completed else { return }
+            // 已逐 token 流过就别再把整段 text 追加一遍(否则翻倍);没流过的才补全文
+            if !streamedIds.contains(id), let text = item["text"] as? String, !text.isEmpty {
+                emit.yield(.messageDelta(msgId: id, role: "assistant", text: text))
+            }
             emit.yield(.messageComplete(msgId: id))
+            streamedIds.remove(id)
         case "commandExecution":
             let cmd = item["command"] as? String ?? ""
             guard !cmd.isEmpty else { return }

@@ -64,3 +64,8 @@ export function subscribe(l: () => void): () => void {
   listeners.add(l)
   return () => { listeners.delete(l) }
 }
+
+// 图片粘贴即上传:桥上传完回推 {attachId,id,ext},发送时按 attachId 取到 id 就只发 id(不再现传)。
+const imgUploads: Record<string, { id: string; ext: string }> = {}
+export function setImgReady(p: { attachId: string; id: string; ext: string }) { imgUploads[p.attachId] = { id: p.id, ext: p.ext }; notify() }
+export function getImgUpload(attachId: string): { id: string; ext: string } | undefined { return imgUploads[attachId] }

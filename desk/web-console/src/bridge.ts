@@ -1,4 +1,4 @@
-import { setState, upsertSession, removeSession, upsertManual, removeManual, setProjects, setTranscript, setDir, setFile, setUsage, setConn } from './store'
+import { setState, upsertSession, removeSession, upsertManual, removeManual, setProjects, setTranscript, setDir, setFile, setUsage, setConn, setImgReady } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -48,6 +48,9 @@ function installReceiver() {
         case 'conn':
           setConn(msg.payload)
           break
+        case 'imageReady':
+          setImgReady(msg.payload)
+          break
         default:
           console.warn('未知推送', msg.type)
       }
@@ -72,8 +75,13 @@ export const cmd = {
   renameSession: (key: string, title: string) => send({ action: 'renameSession', key, title }),
   hideSession: (key: string) => send({ action: 'hideSession', key }),
   unhideSession: (key: string) => send({ action: 'unhideSession', key }),
-  sendInput: (sid: string, text: string, images?: { name: string; data: string }[]) =>
+  sendInput: (sid: string, text: string, images?: Array<{ name?: string; data?: string; id?: string; ext?: string }>) =>
     send({ action: 'send', sid, text, ...(images && images.length ? { images } : {}) }),
+  // 粘贴/添加图片那一刻就上传(由桥代传服务器);完成后桥回推 imageReady
+  prepareImage: (attachId: string, name: string, data: string) =>
+    send({ action: 'prepareImage', attachId, name, data }),
+  // 停止当前回合(Claude 写 {type:interrupt} 控制帧 / Codex turn/interrupt),会话仍在
+  interrupt: (sid: string) => send({ action: 'interrupt', sid }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
   raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),
