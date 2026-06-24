@@ -75,5 +75,8 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)
     implementation(libs.coil.compose)
+    // Markdown 渲染:GFM 全支持(表格 / 任务列表 / 嵌套列表 / 代码块 / 引用)。对位 iOS MarkdownUI。
+    implementation(libs.richtext.commonmark)
+    implementation(libs.richtext.ui.material3)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

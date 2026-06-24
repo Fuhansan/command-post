@@ -33,7 +33,15 @@ import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowCircleDown
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.PanTool
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Tag
 import androidx.compose.ui.graphics.vector.ImageVector
 
 /**
@@ -79,6 +87,15 @@ object IconResolver {
         "wifi" -> Icons.Default.Wifi
         "g.circle.fill" -> Icons.Default.AccountCircle
         "arrow.down.circle.fill" -> Icons.Default.ArrowCircleDown
+        "arrow.down.to.line" -> Icons.Default.Download
+        "plus" -> Icons.Default.Add
+        "folder", "folder.fill" -> Icons.Default.Folder
+        "hand.raised.fill" -> Icons.Default.PanTool
+        "number" -> Icons.Default.Tag
+        "xmark.circle.fill" -> Icons.Default.Cancel
+        "clock" -> Icons.Default.Schedule
+        "clock.badge.xmark" -> Icons.Default.HourglassEmpty   // 「图片已过期」语义
+        "exclamationmark.arrow.circlepath" -> Icons.Default.Refresh  // 重试
         null, "" -> Icons.Default.QuestionMark
         else -> Icons.Default.QuestionMark
     }

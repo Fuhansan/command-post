@@ -232,7 +232,12 @@ fun ProgressRenderer(component: Component) {
     }
 }
 
-/** PROTOCOL §5.2 —— 图片(优先内联 base64,否则按 url 走 Coil)。 */
+/**
+ * PROTOCOL §5.2 —— 图片。三链路兼容(对位 iOS):
+ * - `{id}`:控制通道只给 id,按 id 经 HTTP 拉(新链路,主流);
+ * - `{data}`:内联 base64(旧链路);
+ * - `{url}` / `{thumbUrl}`:外链(更旧)。
+ */
 @Composable
 fun ImageRenderer(component: Component) {
     val p = component.props
@@ -243,11 +248,16 @@ fun ImageRenderer(component: Component) {
         .clip(shape)
         .border(0.5.dp, Theme.stroke.copy(alpha = 0.5f), shape)
 
+    val id = p["id"]?.stringValue
     val dataStr = p["data"]?.stringValue
     val url = p["url"]?.stringValue ?: p["thumbUrl"]?.stringValue
     val alt = p["alt"]?.stringValue
 
     when {
+        !id.isNullOrEmpty() -> {
+            // 新链路:按 id 拉 — 复用 ChatRenderers 里的 IdAsyncImage(走相同的 LruCache)
+            IdAsyncImage(id = id, maxW = 240.dp, maxH = 300.dp, contentDescription = alt)
+        }
         dataStr != null -> {
             val bitmap = remember(dataStr) {
                 runCatching {

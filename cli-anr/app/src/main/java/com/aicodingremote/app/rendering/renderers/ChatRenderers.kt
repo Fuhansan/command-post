@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.DataObject
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.HourglassEmpty
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Photo
@@ -44,9 +45,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -351,20 +355,30 @@ fun PhotoMsgRenderer(component: Component) {
             .padding(pad),
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
-        items.firstOrNull()?.let { PhotoHeaderRow(it) }
+        items.firstOrNull()?.let { PhotoHeaderRow(it, total = items.size) }
         items.forEach { item ->
-            val (w, h) = fittedSize(item.width, item.height, imgW, maxImgH)
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Image(
-                    bitmap = item.bitmap.asImageBitmap(),
-                    contentDescription = item.name,
-                    modifier = Modifier
-                        .width(w)
-                        .height(h)
-                        .clip(RoundedCornerShape(10.dp)),
-                    contentScale = ContentScale.Crop,
-                    filterQuality = FilterQuality.Medium,
-                )
+                if (item.id != null) {
+                    // 新链路:按 id 异步拉图(通道只传 id)
+                    IdAsyncImage(
+                        id = item.id,
+                        maxW = imgW,
+                        maxH = maxImgH,
+                        contentDescription = item.name,
+                    )
+                } else if (item.bitmap != null) {
+                    val (w, h) = fittedSize(item.width, item.height, imgW, maxImgH)
+                    Image(
+                        bitmap = item.bitmap.asImageBitmap(),
+                        contentDescription = item.name,
+                        modifier = Modifier
+                            .width(w)
+                            .height(h)
+                            .clip(RoundedCornerShape(10.dp)),
+                        contentScale = ContentScale.Crop,
+                        filterQuality = FilterQuality.Medium,
+                    )
+                }
             }
         }
         if (text.isNotEmpty()) {
@@ -390,9 +404,9 @@ fun PhotoMsgRenderer(component: Component) {
     }
 }
 
-/** 顶部文件信息栏:图标 + 「Screenshot · PNG」 + 文件名·大小 + 下载图标。 */
+/** 顶部文件信息栏:图标 + 「Screenshot · PNG」 + 文件名·大小(id 图无名/大小时显示张数)。 */
 @Composable
-private fun PhotoHeaderRow(item: PhotoItem) {
+private fun PhotoHeaderRow(item: PhotoItem, total: Int) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -409,13 +423,14 @@ private fun PhotoHeaderRow(item: PhotoItem) {
         }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
-                if (item.kind.isEmpty()) "Screenshot" else "Screenshot · ${item.kind}",
+                if (item.kind.isEmpty()) "图片" else "Screenshot · ${item.kind}",
                 color = Theme.text,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold,
             )
+            val sub = listOf(item.name, item.size).filter { it.isNotEmpty() }.joinToString(" · ")
             Text(
-                listOf(item.name, item.size).filter { it.isNotEmpty() }.joinToString(" · "),
+                if (sub.isEmpty()) "$total 张" else sub,
                 color = Theme.textSec,
                 fontSize = 11.sp,
                 maxLines = 1,
@@ -430,6 +445,92 @@ private fun PhotoHeaderRow(item: PhotoItem) {
         )
     }
 }
+
+/**
+ * 按 id 异步拉图(对位 iOS `IdAsyncImage`)。命中进程级 bitmap 缓存避免重复请求。
+ * URL: `{REST_BASE}/api/image/{id}`,带 Bearer token。
+ * 404/失败 → 显示「图片已过期」占位(对位 iOS clock.badge.xmark)。
+ */
+@Composable
+internal fun IdAsyncImage(
+    id: String,
+    maxW: Dp,
+    maxH: Dp,
+    contentDescription: String? = null,
+) {
+    // null = loading;Result.failure = 失败;Result.success(bm) = 已加载
+    val state by produceState<Result<Bitmap>?>(initialValue = idBitmapCache.get(id)?.let { Result.success(it) }, key1 = id) {
+        if (value?.isSuccess == true) return@produceState
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val urlStr = "${com.aicodingremote.app.networking.ServerConfig.restBaseURL()}/api/image/$id"
+                val conn = java.net.URL(urlStr).openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 15_000
+                conn.readTimeout = 30_000
+                com.aicodingremote.app.auth.SessionAuth.token?.let {
+                    conn.setRequestProperty("Authorization", "Bearer $it")
+                }
+                if (conn.responseCode != 200) throw java.io.IOException("HTTP ${conn.responseCode}")
+                conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                    ?: throw java.io.IOException("decode failed")
+            }.onSuccess { idBitmapCache.put(id, it) }
+        }
+    }
+    val shape = RoundedCornerShape(10.dp)
+    when {
+        state?.isSuccess == true -> {
+            val bm = state!!.getOrNull()!!
+            val (w, h) = fittedSize(bm.width, bm.height, maxW, maxH)
+            Image(
+                bitmap = bm.asImageBitmap(),
+                contentDescription = contentDescription,
+                modifier = Modifier.width(w).height(h).clip(shape),
+                contentScale = ContentScale.Crop,
+                filterQuality = FilterQuality.Medium,
+            )
+        }
+        state?.isFailure == true -> {
+            // 图片已过期(server 端 24h TTL 清掉后 → 404)。对位 iOS `clock.badge.xmark`。
+            Column(
+                modifier = Modifier
+                    .width(150.dp)
+                    .height(100.dp)
+                    .clip(shape)
+                    .background(Theme.cardHi),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Icon(
+                    Icons.Default.HourglassEmpty,
+                    contentDescription = null,
+                    tint = Theme.textTer,
+                    modifier = Modifier.size(22.dp),
+                )
+                Spacer(Modifier.height(6.dp))
+                Text("图片已过期", color = Theme.textSec, fontSize = 12.sp)
+            }
+        }
+        else -> {
+            Box(
+                modifier = Modifier
+                    .width(maxW.coerceAtMost(120.dp))
+                    .height(90.dp)
+                    .clip(shape)
+                    .background(Theme.cardHi),
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = Theme.blue,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+    }
+}
+
+/** 按 id 拉到的 bitmap 进程级缓存,scroll 重组时不重复请求。 */
+private val idBitmapCache = object : android.util.LruCache<String, Bitmap>(16) {}
 
 /** Telegram 式双勾(已电脑端确认)。 */
 @Composable
@@ -447,11 +548,16 @@ private fun DoubleCheck(color: Color) {
     }
 }
 
-/** 一张已解码图片(尺寸用于等比布局)。 */
+/**
+ * 一张图片(新旧两种格式):
+ * - 新格式: 只带 [id] + 可选名/类型,实际像素按 id 经 HTTP 异步拉(对位 iOS IdAsyncImage)
+ * - 旧格式: 带 [bitmap](base64 内联解码)
+ */
 private data class PhotoItem(
-    val bitmap: Bitmap,
-    val width: Int,
-    val height: Int,
+    val id: String? = null,
+    val bitmap: Bitmap? = null,
+    val width: Int = 0,
+    val height: Int = 0,
     val name: String,
     val kind: String,
     val size: String,
@@ -463,39 +569,49 @@ private val photoBitmapCache = object : android.util.LruCache<String, Bitmap>(16
 /**
  * 兼容两种 images 元素:对象 {data,name,kind,size} 或纯 base64 字符串(旧格式)。
  */
-private fun decodePhotoItems(arr: List<JsonElement>): List<PhotoItem> {
-    android.util.Log.i("PhotoMsg", "decode arr.size=${arr.size}")
-    return arr.mapNotNull { v ->
-        val obj = v.objectValue
-        val b64 = if (obj != null) obj["data"]?.stringValue else v.stringValue
-        if (b64 == null) {
-            android.util.Log.w("PhotoMsg", "no b64 data, keys=${obj?.keys}, raw v type=${v::class.simpleName}")
-            return@mapNotNull null
+/**
+ * 兼容 3 种 images 元素:
+ * - `{id, ext, name?}`(新,通道只传 id,按 id HTTP 拉图,对位 iOS 新链路)
+ * - `{data, name, kind, size}`(旧,base64 内联)
+ * - 纯 base64 字符串(更旧,远古手机)
+ */
+private fun decodePhotoItems(arr: List<JsonElement>): List<PhotoItem> = arr.mapNotNull { v ->
+    val obj = v.objectValue
+
+    // 新格式:只有 id,真正的像素 IdAsyncImage 异步拉。
+    if (obj != null) {
+        val id = obj["id"]?.stringValue
+        if (!id.isNullOrEmpty()) {
+            return@mapNotNull PhotoItem(
+                id = id,
+                bitmap = null,
+                name = obj["name"]?.stringValue ?: "",
+                kind = (obj["ext"]?.stringValue ?: "").uppercase(),
+                size = "",
+            )
         }
-        val name = obj?.get("name")?.stringValue ?: ""
-        val kind = obj?.get("kind")?.stringValue ?: ""
-        val size = obj?.get("size")?.stringValue ?: ""
-        val key = "${b64.length}:${b64.take(48)}"
-        val bitmap = photoBitmapCache.get(key) ?: run {
-            try {
-                val bytes = Base64.decode(b64, Base64.DEFAULT)
-                android.util.Log.i("PhotoMsg", "decoded bytes=${bytes.size} (b64Len=${b64.length})")
-                val bm = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bm == null) {
-                    android.util.Log.e("PhotoMsg", "BitmapFactory.decodeByteArray returned NULL")
-                    null
-                } else {
-                    android.util.Log.i("PhotoMsg", "bitmap ${bm.width}x${bm.height}")
-                    photoBitmapCache.put(key, bm)
-                    bm
-                }
-            } catch (e: Throwable) {
-                android.util.Log.e("PhotoMsg", "decode threw", e)
-                null
-            }
-        } ?: return@mapNotNull null
-        PhotoItem(bitmap, bitmap.width, bitmap.height, name, kind, size)
     }
+
+    // 旧格式:base64 内联(本地回显 / 历史 photomsg)。
+    val b64 = if (obj != null) obj["data"]?.stringValue else v.stringValue
+    b64 ?: return@mapNotNull null
+    val name = obj?.get("name")?.stringValue ?: ""
+    val kind = obj?.get("kind")?.stringValue ?: ""
+    val size = obj?.get("size")?.stringValue ?: ""
+    val key = "${b64.length}:${b64.take(48)}"
+    val bitmap = photoBitmapCache.get(key) ?: runCatching {
+        val bytes = Base64.decode(b64, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()?.also { photoBitmapCache.put(key, it) } ?: return@mapNotNull null
+    PhotoItem(
+        id = null,
+        bitmap = bitmap,
+        width = bitmap.width,
+        height = bitmap.height,
+        name = name,
+        kind = kind,
+        size = size,
+    )
 }
 
 /** 在 boxW × maxH 内按宽高比缩放,不裁切不留黑边。 */

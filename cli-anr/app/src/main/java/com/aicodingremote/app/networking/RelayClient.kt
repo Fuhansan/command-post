@@ -253,12 +253,26 @@ class RelayClient : ViewModel() {
         } else if (online) {
             agents.add(AgentInfo(id, name ?: id, true))
         }
-        // 客户端隔离(双保险):电脑离线 → 它的会话立即移除,不再展示旧数据。
-        // 服务端同时会代发该设备的 reset 并清快照;电脑重连后会全量重推。
+        // 客户端隔离:电脑离线后给 15s 宽限期,避免 desk 鉴权失败 / 网络抖动
+        // 反复 presence 振荡时手机 UI 闪烁。15s 后仍未上线再清。
+        // 电脑重连成功(online=true)→ 取消挂起的清理任务。
         if (!online) {
-            sessions.removeAll { it.agentId == id }
+            offlineCleanupJobs[id]?.cancel()
+            offlineCleanupJobs[id] = viewModelScope.launch {
+                delay(15_000)
+                val a = agents.firstOrNull { it.id == id }
+                if (a == null || !a.online) {
+                    sessions.removeAll { it.agentId == id }
+                }
+                offlineCleanupJobs.remove(id)
+            }
+        } else {
+            offlineCleanupJobs.remove(id)?.cancel()
         }
     }
+
+    /** 每个 agent 的「掉线后延迟清理会话」任务,新的 online presence 到来即取消。 */
+    private val offlineCleanupJobs: MutableMap<String, Job> = mutableMapOf()
 
     /**
      * PROTOCOL §5 —— ui 帧按 `sid` 归入对应会话;`body.session` 为任务元信息(首页行用)。
