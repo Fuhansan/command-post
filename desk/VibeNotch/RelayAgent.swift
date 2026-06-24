@@ -129,6 +129,8 @@ final class RelayAgent: NSObject, ObservableObject {
     private var lastPongAt = Date()                         // 最近一次 pong,用于检测僵死连接
     private var heartbeatTimer: Timer?
     private var coolDownUntil = Date.distantPast            // 被服务器拒绝(挂起/令牌失效)后的重连冷却
+    private var rejectStreak = 0                            // 连续被拒次数,达阈值后停止自动重连
+    private static let maxRejectStreak = 3                  // 阈值:超过即停止振荡,需用户手动操作
 
     /// 消息首次出现的时间;之后同 id 始终返回同一值。
     private func stamp(for msgId: String) -> String {
@@ -271,6 +273,10 @@ final class RelayAgent: NSObject, ObservableObject {
 
     /// 凭据变化(配对成功/退出)→ 先以旧身份清掉本机数据,再以新身份重连。
     func restart() {
+        // 用户主动操作:解除「连续被拒停摆」状态,允许重新尝试
+        rejectStreak = 0
+        coolDownUntil = .distantPast
+        retry = 0
         sendReset()   // 旧账号的手机立刻看到本机会话消失(+ presence 离线)
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000)   // 给 reset 帧出门的时间
@@ -979,6 +985,7 @@ final class RelayAgent: NSObject, ObservableObject {
             connState = .online
             // 确认成功上线 → 本次首连的 reset 已送达,以后网络重连不再 reset(保留历史)。
             firstConnect = false
+            rejectStreak = 0   // 成功上线即重置被拒计数,允许后续再次进入重试节奏
             return
         }
         // 手机上线 → 服务端会向本机转发一条 client presence。电脑主动把当前所有任务
@@ -990,12 +997,24 @@ final class RelayAgent: NSObject, ObservableObject {
         }
         if t == "error", let body = obj["body"] as? [String: Any],
            (body["fatal"] as? Bool) == true {
-            // 被服务器拒绝(手机挂起了本机 / 令牌失效)→ 放慢重试,30s 一次探测
-            // (手机点「重连」解除后,下一次探测即恢复上线)
+            // 被服务器拒绝(令牌失效 / 被手机挂起)。连续被拒达阈值即停止自动重连,
+            // 避免每 10s 振荡一次扰民,等用户在设置里手动「退出登录 / 重新配对」。
             let code = body["code"] as? String ?? "?"
-            coolDownUntil = Date().addingTimeInterval(10)
-            connState = code == "suspended" ? .suspendedByPhone : .rejected(code)
-            vlog("relay: 服务器拒绝(\(code)),10s 后再试")
+            rejectStreak += 1
+            if code == "suspended" {
+                // 挂起属于用户预期状态,不计入失败次数,保持原来的探测节奏
+                coolDownUntil = Date().addingTimeInterval(10)
+                connState = .suspendedByPhone
+                vlog("relay: 被手机挂起,10s 后探测")
+            } else if rejectStreak >= Self.maxRejectStreak {
+                coolDownUntil = .distantFuture   // 停摆,不再自动重连
+                connState = .rejected(code)
+                vlog("relay: 连续 \(rejectStreak) 次被拒(\(code)),停止自动重连;请在设置「退出登录」后重新登录配对")
+            } else {
+                coolDownUntil = Date().addingTimeInterval(10)
+                connState = .rejected(code)
+                vlog("relay: 服务器拒绝(\(code)) #\(rejectStreak)/\(Self.maxRejectStreak),10s 后再试")
+            }
             return
         }
         guard t == "input" || t == "action" else { return }
@@ -1186,6 +1205,11 @@ final class RelayAgent: NSObject, ObservableObject {
         switch connState {
         case .suspendedByPhone, .rejected, .unpaired: break   // 保留具体原因
         default: connState = .offline
+        }
+        // 连续被拒达阈值:停摆,等用户在设置里手动操作(coolDownUntil = .distantFuture)
+        if coolDownUntil == .distantFuture {
+            vlog("relay: 自动重连已停摆(连续被拒 \(rejectStreak) 次),等待用户操作")
+            return
         }
         retry += 1
         let delay = max(min(pow(2.0, Double(retry)), 30),
