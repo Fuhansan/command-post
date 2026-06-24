@@ -53,6 +53,36 @@ enum WindowActivator {
         return true
     }
 
+    /// Best-effort focus for Electron-style chat inputs. This is used after
+    /// activating Codex.app so remote phone input lands in the composer rather
+    /// than whichever non-editable element happened to be focused.
+    @MainActor
+    static func focusEditableText(pid: pid_t) -> Bool {
+        guard isAccessibilityTrusted else { return false }
+
+        let app = AXUIElementCreateApplication(pid)
+        var roots: [AXUIElement] = []
+        var focusedRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+           let focusedRef {
+            let focused = focusedRef as! AXUIElement
+            roots.append(focused)
+        }
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let windows = windowsRef as? [AXUIElement] {
+            roots.append(contentsOf: windows)
+        }
+
+        for root in roots {
+            if let target = firstEditableText(in: root, depth: 0) {
+                AXUIElementSetAttributeValue(target, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                return true
+            }
+        }
+        return false
+    }
+
     /// Score each window by how well its title matches the cwd, return the best.
     /// Tie-break: prefer windows that contain the full project name as a token.
     private static func bestMatch(windows: [AXUIElement], cwd: String) -> AXUIElement? {
@@ -86,5 +116,22 @@ enum WindowActivator {
         let r = AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
         guard r == .success else { return nil }
         return titleRef as? String
+    }
+
+    private static func firstEditableText(in element: AXUIElement, depth: Int) -> AXUIElement? {
+        guard depth < 10 else { return nil }
+        var roleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String,
+           role == "AXTextArea" || role == "AXTextField" || role == "AXComboBox" {
+            return element
+        }
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+              let children = childrenRef as? [AXUIElement] else { return nil }
+        for child in children {
+            if let found = firstEditableText(in: child, depth: depth + 1) { return found }
+        }
+        return nil
     }
 }

@@ -15,7 +15,7 @@ enum ProcessUtils {
         var depth = 0
         while depth < maxDepth {
             guard let info = procInfo(pid: current) else { return (.unknown, nil) }
-            if let kind = TerminalKind.match(processName: info.name) {
+            if let kind = TerminalKind.match(processName: info.name, path: procPath(pid: current)) {
                 return (kind, current)
             }
             if info.ppid <= 1 { return (.unknown, nil) }
@@ -43,5 +43,14 @@ enum ProcessUtils {
             }
         }
         return (name, info.kp_eproc.e_ppid)
+    }
+
+    /// Full executable path for a process. `p_comm` is capped to a tiny buffer
+    /// on macOS, so app-host detection needs this for paths like Codex.app.
+    static func procPath(pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let len = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard len > 0 else { return nil }
+        return String(cString: buffer)
     }
 }

@@ -44,7 +44,10 @@ final class SessionStore: ObservableObject {
         // latest prompt from the transcript so the row doesn't show "Done"
         // alone after the user's older prompt fell off our memory.
         if !sessions.contains(where: { $0.id == sid }), let path = event.transcriptPath {
-            if let prevPrompt = TranscriptReader.lastUserPrompt(transcriptPath: path) {
+            let prevPrompt = path.contains("/.codex/")
+                ? CodexTranscriptReader.lastUserPrompt(transcriptPath: path)
+                : TranscriptReader.lastUserPrompt(transcriptPath: path)
+            if let prevPrompt {
                 let backfill = SessionEntry(
                     id: sid,
                     state: .idle,
@@ -158,6 +161,12 @@ final class SessionStore: ObservableObject {
         // 记录 owner 进程(claude/shell 的 ppid),供异常退出检测用
         if let p = event.ppid, p > 1, let idx = sessions.firstIndex(where: { $0.id == sid }) {
             sessions[idx].ownerPID = pid_t(p)
+        }
+        // 每个 hook 事件都刷新宿主应用/终端。Codex.app 的 app-server 子进程
+        // 常在 SessionStart 之后才被正确识别,不能只在创建条目时写一次。
+        if let idx = sessions.firstIndex(where: { $0.id == sid }) {
+            if terminal != .unknown { sessions[idx].terminal = terminal }
+            if let terminalPID { sessions[idx].terminalPID = terminalPID }
         }
         // 记录转录路径,供 RelayAgent 计算文件改动行数
         if let tp = event.transcriptPath, let idx = sessions.firstIndex(where: { $0.id == sid }) {

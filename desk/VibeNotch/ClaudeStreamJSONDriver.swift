@@ -32,6 +32,9 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     /// 记录最近一次 assistant 文本块的 msgId,便于 messageComplete 配对。
     private var lastAssistantMsgId: String?
     private var lastModel: String?
+    /// 流式:当前正在增量的 assistant 消息 id;已用 delta 流过的 msgId(末尾完整消息去重,避免文本翻倍)。
+    private var streamMsgId: String?
+    private var streamedTextIds = Set<String>()
 
     /// default = 权限走 PreToolUse hook(Path A,控制台默认);bypassPermissions = 全放行(测试用)。
     private let permissionMode: String
@@ -53,6 +56,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         var args = ["-p",
                     "--input-format", "stream-json",
                     "--output-format", "stream-json",
+                    "--include-partial-messages",   // 逐 token 流式(否则等整段 assistant 才出,体感卡)
                     "--verbose",
                     "--permission-mode", permissionMode]
         if let model, !model.isEmpty { args += ["--model", model] }
@@ -63,6 +67,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = args
         p.currentDirectoryURL = URL(fileURLWithPath: workdir)
+        p.environment = Self.childEnvironment()
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
@@ -90,24 +95,25 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     }
 
     func interrupt() {
-        // stream-json 有 interrupt 控制消息;先用 SIGINT 占位(Phase 后续替换为控制帧)。
-        if let pid = proc?.processIdentifier, proc?.isRunning == true {
-            kill(pid, SIGINT)
-        }
+        // stream-json 顶层控制帧:中断当前回合,但进程/会话仍活着,可继续发下一条。
+        // (SIGINT 会杀掉整个进程、丢会话,不能用)
+        guard proc?.isRunning == true else { return }
+        writeJSON(["type": "interrupt"])
     }
 
     // MARK: - 上行:发消息 / 回答待决项
 
     func send(_ input: UserInput) {
-        var content: [[String: Any]] = []
-        if !input.text.isEmpty {
-            content.append(["type": "text", "text": input.text])
+        // 图片不内联 base64:已落盘的文件路径作为文字引用发给 Claude,让它用 Read 工具查看。
+        // (像素仍会在 Claude 读取时进入上下文,但发送体积/user 消息保持精简,符合「发地址」)
+        var text = input.text
+        if !input.imagePaths.isEmpty {
+            let refs = input.imagePaths.map { "图片: \($0)" }.joined(separator: "\n")
+            let head = input.text.isEmpty ? "用户发来图片,请用 Read 工具查看后回答:" : "\n\n(用户附带图片,请用 Read 工具查看)"
+            text = input.text.isEmpty ? "\(head)\n\(refs)" : "\(input.text)\(head)\n\(refs)"
         }
-        for path in input.imagePaths {
-            if let block = Self.imageBlock(path: path) { content.append(block) }
-        }
-        guard !content.isEmpty else { return }
-        writeJSON(["type": "user", "message": ["role": "user", "content": content]])
+        guard !text.isEmpty else { return }
+        writeJSON(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
     }
 
     /// Path A 权限通道:PreToolUse hook(经 AppDelegate/SessionManager 按 ppid 路由进来)→
@@ -159,6 +165,8 @@ final class ClaudeStreamJSONDriver: AgentDriver {
                 if let sid = o["session_id"] as? String { sessionId = sid; emit.yield(.sessionId(sid)) }
                 emit.yield(.status(.idle))
             }
+        case "stream_event":
+            handleStreamEvent(o["event"] as? [String: Any] ?? [:])
         case "assistant":
             emit.yield(.status(.working))
             handleAssistant(o)
@@ -169,8 +177,31 @@ final class ClaudeStreamJSONDriver: AgentDriver {
             let r = o["result"] as? String
             emit.yield(.turnComplete(result: r))
             emit.yield(.status(.waitingInput))   // 回合结束 = 空闲挂起等输入
+            streamMsgId = nil; streamedTextIds.removeAll()
         default:
             break
+        }
+    }
+
+    /// partial 流式事件:逐 token 把文本增量推给上层(下游按 msgId 追加)。
+    private func handleStreamEvent(_ e: [String: Any]) {
+        switch e["type"] as? String {
+        case "message_start":
+            if let m = e["message"] as? [String: Any], let id = m["id"] as? String {
+                streamMsgId = id
+                if let md = m["model"] as? String, md != lastModel, md != "<synthetic>" { lastModel = md; emit.yield(.model(md)) }
+            }
+            emit.yield(.status(.working))
+        case "content_block_delta":
+            guard let delta = e["delta"] as? [String: Any] else { return }
+            if (delta["type"] as? String) == "text_delta", let t = delta["text"] as? String, !t.isEmpty {
+                let mid = streamMsgId ?? UUID().uuidString
+                streamedTextIds.insert(mid)
+                lastAssistantMsgId = mid
+                emit.yield(.messageDelta(msgId: mid, role: "assistant", text: t))
+            }
+        default:
+            break   // content_block_start/stop、message_stop、thinking_delta、input_json_delta 暂不处理
         }
     }
 
@@ -184,7 +215,8 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         for b in blocks {
             switch b["type"] as? String {
             case "text":
-                if let t = b["text"] as? String, !t.isEmpty {
+                // 已逐 token 流过的文本,末尾完整消息里跳过,避免翻倍;没流过的(短消息/边界)才补一次
+                if let t = b["text"] as? String, !t.isEmpty, !streamedTextIds.contains(msgId) {
                     lastAssistantMsgId = msgId
                     emit.yield(.messageDelta(msgId: msgId, role: "assistant", text: t))
                 }
@@ -264,6 +296,36 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     /// → 交互/登录 shell 兜底。只缓存成功结果(不永久缓存失败)。
     private static var cachedBinary: String?
     private static let pathMemo = NSString(string: "~/.vibenotch/claude-path").expandingTildeInPath
+
+    /// claude 子进程的环境变量。GUI App(launchd 启动)的环境过于精简——缺 `USER`、缺终端里
+    /// 的 `https_proxy` 等。**`USER` 缺失会让 claude 读不到 macOS 钥匙串里的订阅凭据 → API 返回
+    /// 403「Not logged in」**(实测根因)。这里抓一次登录+交互 shell 的完整 env(含
+    /// USER/HOME/PATH/代理),以当前进程 env 打底,缓存复用,确保与用户终端里跑 claude 一致。
+    private static var cachedEnv: [String: String]?
+    private static func childEnvironment() -> [String: String] {
+        if let c = cachedEnv { return c }
+        var env = ProcessInfo.processInfo.environment
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-ilc", "env"]   // 登录+交互:确保 .zprofile/.zshrc 的代理、PATH 都加载
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
+        if (try? p.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if let s = String(data: data, encoding: .utf8) {
+                for line in s.split(separator: "\n") {
+                    guard let eq = line.firstIndex(of: "=") else { continue }
+                    let k = String(line[line.startIndex..<eq])
+                    if !k.isEmpty { env[k] = String(line[line.index(after: eq)...]) }
+                }
+            }
+        }
+        // 兜底:钥匙串读凭据强依赖 USER;HOME 也确保有,否则连 ~/.claude 都找不到。
+        if env["USER"] == nil { env["USER"] = NSUserName() }
+        if env["HOME"] == nil { env["HOME"] = NSHomeDirectory() }
+        cachedEnv = env
+        return env
+    }
 
     private static func claudeBinary() -> String? {
         let fm = FileManager.default

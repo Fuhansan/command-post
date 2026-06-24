@@ -3,6 +3,13 @@ import Combine
 
 // MARK: - 统一会话模型(上层唯一依赖,agent 无关)
 
+/// 一张随消息发出的图片。通道里只带 id;字节按 id 走 HTTP 拉。本地按 id 缓存供 driver 当路径喂 agent。
+struct ImageRef: Equatable {
+    let id: String        // 图片 id(/api/image/<id> 或本地缓存 key)
+    let ext: String
+    let localPath: String // 本地按 id 缓存路径(driver 读它喂 agent)
+}
+
 /// 一条会话里的一条消息(统一)。Phase 1 先支撑文本/工具/文件三类,渲染细节 Phase 3 再丰富。
 struct AgentMessage: Identifiable, Equatable {
     enum Kind: String { case text, tool, file, permission }
@@ -11,6 +18,7 @@ struct AgentMessage: Identifiable, Equatable {
     var kind: Kind
     var text: String          // permission 时 = 命令/操作详情
     var ord: Int              // 逻辑顺序号(到达递增)
+    var images: [ImageRef] = []   // 用户消息附带的图片
     /// permission 卡的处理结果:nil=待处理(显示允许/拒绝按钮);"allow"/"deny"=已处理(显示徽标)。
     var permState: String? = nil
     var permReqId: String? = nil   // 关联 driver 的权限请求 id,回写时用
@@ -112,11 +120,11 @@ final class AgentSessionManager: ObservableObject {
         }
     }
 
-    /// driver 工厂:按 agent 类型造对应适配器(codex 后续加分支)。
+    /// driver 工厂:按 agent 类型造对应适配器。
     private func makeDriver(_ agent: AgentKind) -> AgentDriver {
         switch agent {
         case .claude: return ClaudeStreamJSONDriver()
-        case .codex:  return ClaudeStreamJSONDriver()   // TODO: CodexDriver(Phase 后续)
+        case .codex:  return CodexAppServerDriver()
         }
     }
 
@@ -208,6 +216,7 @@ final class AgentSessionManager: ObservableObject {
     /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
     nonisolated static func parseTranscriptFile(path: String)
         -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        if path.contains("/.codex/") { return CodexTranscriptReader.parseTranscriptFile(path: path) }
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
         var out: [(String, AgentMessage.Kind, String)] = []
         for line in content.split(separator: "\n") { out.append(contentsOf: parseTranscriptLine(String(line))) }
@@ -226,8 +235,13 @@ final class AgentSessionManager: ObservableObject {
             if let s = msg["content"] as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
                 out.append(("user", .text, s))
             } else if let blocks = msg["content"] as? [[String: Any]] {
+                var added = false
                 for b in blocks where (b["type"] as? String) == "text" {
-                    if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)) }
+                    if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)); added = true }
+                }
+                // 纯图片消息:占位一条空文本(图片由 transcriptImages 按 ord 补上),否则历史里整条消失
+                if !added, blocks.contains(where: { ($0["type"] as? String) == "image" }) {
+                    out.append(("user", .text, ""))
                 }
             }
         } else if type == "assistant", let blocks = msg["content"] as? [[String: Any]] {
@@ -253,6 +267,9 @@ final class AgentSessionManager: ObservableObject {
     /// ord = 该消息所在行的起始字节偏移(全局单调,跨窗稳定排序/去重);earliest = 本窗最早一条消息所在行的偏移。
     nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024)
         -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int)], earliest: Int, hasEarlier: Bool) {
+        if path.contains("/.codex/") {
+            return CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
+        }
         guard let fh = FileHandle(forReadingAtPath: path) else { return ([], 0, false) }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
@@ -284,6 +301,50 @@ final class AgentSessionManager: ObservableObject {
         return (out, earliest, earliest > 0)
     }
 
+    /// 历史图片:扫与 parseTranscriptWindow 同一窗,返回 ord → 图片([{thumb,url}],都是 data URL)。
+    /// 不动主解析链(Codex/手机端不受影响),桥按 ord 合并进历史消息 DTO。Codex 图片是 localImage 路径,暂不处理。
+    nonisolated static func transcriptImages(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024) -> [Int: [[String: String]]] {
+        guard !path.contains("/.codex/"), let fh = FileHandle(forReadingAtPath: path) else { return [:] }
+        defer { try? fh.close() }
+        let fileSize = (try? fh.seekToEnd()) ?? 0
+        let end = min(endByte ?? fileSize, fileSize)
+        let start = end > UInt64(windowBytes) ? end - UInt64(windowBytes) : 0
+        try? fh.seek(toOffset: start)
+        let bytes = [UInt8]((try? fh.read(upToCount: Int(end - start))) ?? Data())
+        var i = 0
+        if start > 0 { i = (bytes.firstIndex(of: 0x0A)).map { $0 + 1 } ?? bytes.count }
+        var result: [Int: [[String: String]]] = [:]
+        while i < bytes.count {
+            var j = i
+            while j < bytes.count && bytes[j] != 0x0A { j += 1 }
+            if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8),
+               let imgs = userImagesInLine(lineStr) {
+                // 与 parseTranscriptWindow 的 ord 对齐:用户图文消息是该行第 0 条
+                result[(Int(start) + i) * 16 + 0] = imgs
+            }
+            i = j + 1
+        }
+        return result
+    }
+
+    private nonisolated static func userImagesInLine(_ line: String) -> [[String: String]]? {
+        guard let d = line.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              (o["type"] as? String) == "user",
+              let msg = o["message"] as? [String: Any],
+              let blocks = msg["content"] as? [[String: Any]] else { return nil }
+        var imgs: [[String: String]] = []
+        for b in blocks where (b["type"] as? String) == "image" {
+            guard let src = b["source"] as? [String: Any], let data = src["data"] as? String, !data.isEmpty else { continue }
+            let mt = (src["media_type"] as? String) ?? "image/png"
+            let ext = mt.hasSuffix("png") ? "png" : mt.hasSuffix("webp") ? "webp" : mt.hasSuffix("gif") ? "gif" : "jpg"
+            // 历史图落本地缓存、用内容 hash 当本地 id;通道只带这个 id,桌面 web 按 app://__img/<id> 取
+            guard let id = ImageRelay.cacheBase64(data, ext: ext) else { continue }
+            imgs.append(["id": id, "ext": ext])
+        }
+        return imgs.isEmpty ? nil : imgs
+    }
+
     /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。
     nonisolated static func listHistory(workdir: String, limit: Int = 30) -> [HistoryEntry] {
         let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
@@ -306,6 +367,7 @@ final class AgentSessionManager: ObservableObject {
 
     /// 读转录里第一条用户文本(历史列表的标签 / 会话标题)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。
     nonisolated static func firstUserPrompt(path: String) -> String? {
+        if path.contains("/.codex/") { return CodexTranscriptReader.firstUserPrompt(path: path) }
         guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? fh.close() }
         let data = (try? fh.read(upToCount: 256 * 1024)) ?? Data()
@@ -340,9 +402,16 @@ final class AgentSessionManager: ObservableObject {
 
     func send(_ sid: String, text: String, imagePaths: [String] = []) {
         guard let d = managed[sid]?.driver else { return }
-        // 本地立即回显用户消息
-        mutate(sid) { s in s.messages.append(self.userEcho(text)) }
+        // 本地立即回显用户消息 + 乐观置 working:发出去就显示「思考中」,不等 agent 首 token
+        mutate(sid) { s in s.messages.append(self.userEcho(text)); s.status = .working }
         d.send(UserInput(text: text, imagePaths: imagePaths))
+    }
+
+    /// 带图发送:images 已落盘 + (尽量)上传服务器。driver 读本地路径喂 agent,回显/relay 带缩略图与 id。
+    func send(_ sid: String, text: String, images: [ImageRef]) {
+        guard let d = managed[sid]?.driver else { return }
+        mutate(sid) { s in s.messages.append(self.userEcho(text, images: images)); s.status = .working }
+        d.send(UserInput(text: text, imagePaths: images.map { $0.localPath }))
     }
 
     func respond(_ sid: String, requestId: String, choose: [String]) {
@@ -524,8 +593,8 @@ final class AgentSessionManager: ObservableObject {
 
     // MARK: - 工具
 
-    private func userEcho(_ text: String) -> AgentMessage {
-        AgentMessage(id: "u_\(nextOrd())", role: "user", kind: .text, text: text, ord: ordCounter)
+    private func userEcho(_ text: String, images: [ImageRef] = []) -> AgentMessage {
+        AgentMessage(id: "u_\(nextOrd())", role: "user", kind: .text, text: text, ord: ordCounter, images: images)
     }
     private func nextOrd() -> Int { ordCounter += 1; return ordCounter }
 

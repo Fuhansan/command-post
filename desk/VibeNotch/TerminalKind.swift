@@ -14,6 +14,7 @@ enum TerminalKind: String, Equatable {
     case windsurf
     case jetbrains
     case xcode
+    case codex
     case tmux
     case unknown
 
@@ -32,6 +33,7 @@ enum TerminalKind: String, Equatable {
         case .windsurf: return "Windsurf"
         case .jetbrains: return "JetBrains"
         case .xcode: return "Xcode"
+        case .codex: return "Codex"
         case .tmux: return "tmux"
         case .unknown: return "?"
         }
@@ -42,6 +44,8 @@ enum TerminalKind: String, Equatable {
         switch self {
         case .vscode, .cursor, .windsurf, .jetbrains, .xcode:
             return "chevron.left.forwardslash.chevron.right"
+        case .codex:
+            return "sparkles"
         case .unknown:
             return "questionmark.circle"
         default:
@@ -57,7 +61,32 @@ enum TerminalKind: String, Equatable {
     ]
 
     static func match(processName name: String) -> TerminalKind? {
+        match(processName: name, path: nil)
+    }
+
+    static func match(processName name: String, path: String?) -> TerminalKind? {
         let lower = name.lowercased()
+        if let path {
+            let p = path.lowercased()
+            if p.contains(".app/contents/macos/") && !p.contains("/helpers/") {
+                if p.contains("/codex.app/") { return .codex }
+                if p.contains("/terminal.app/") { return .terminal }
+                if p.contains("/iterm") { return .iterm2 }
+                if p.contains("/ghostty.app/") { return .ghostty }
+                if p.contains("/warp.app/") { return .warp }
+                if p.contains("/kitty.app/") { return .kitty }
+                if p.contains("/alacritty.app/") { return .alacritty }
+                if p.contains("/wezterm.app/") { return .wezterm }
+                if p.contains("/hyper.app/") { return .hyper }
+                if p.contains("/visual studio code.app/") { return .vscode }
+                if p.contains("/cursor.app/") { return .cursor }
+                if p.contains("/windsurf.app/") { return .windsurf }
+                if p.contains("/xcode.app/") { return .xcode }
+                if jetbrainsNames.contains(where: { p.contains("/\($0).app/") }) {
+                    return .jetbrains
+                }
+            }
+        }
         if lower.contains("iterm") { return .iterm2 }
         if lower == "terminal" { return .terminal }
         if lower.contains("ghostty") { return .ghostty }

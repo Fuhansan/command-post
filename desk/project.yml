@@ -33,7 +33,7 @@ targets:
     info:
       path: VibeNotch/Info.plist
       properties:
-        LSUIElement: true
+        LSUIElement: false   # 进 Dock + Cmd+Tab(同时保留菜单栏状态项);设 true 则只在菜单栏
         CFBundleName: VibeNotch
         CFBundleDisplayName: VibeNotch
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)

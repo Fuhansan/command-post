@@ -488,10 +488,18 @@ final class RelayAgent: NSObject, ObservableObject {
         // 懒加载:默认只推最后 limit 条消息;手机「加载更早」会扩大窗口再要更老的。
         for m in s.messages.suffix(limit) {
             switch m.kind {
+            case .text where m.role == "user" && !m.images.isEmpty:
+                // 带图用户消息 → photomsg,images 只带 id+ext(通道不放 base64),手机按 id 经 HTTP 拉
+                let items: [[String: Any]] = m.images.map { ["id": $0.id, "ext": $0.ext] }
+                var props: [String: Any] = ["images": items, "time": stamp(for: "msg:\(m.id)")]
+                if !m.text.isEmpty { props["text"] = cap(m.text, 1000) }
+                out.append(("msg:\(m.id)", "user", ["type": "photomsg", "props": props],
+                            m.text.isEmpty ? "图片" : m.text, m.ord))
             case .text where m.role == "user":
                 out.append(("msg:\(m.id)", "user", bubble(role: "user", m.text), m.text, m.ord))
             case .text:
-                out.append(("msg:\(m.id)", "agent", bubble(role: "agent", m.text), m.text, m.ord))
+                // agent 文本走 markdown 渲染(MarkdownText),否则手机端会显示裸 ## / ** / -
+                out.append(("msg:\(m.id)", "agent", text(m.text, markdown: true), m.text, m.ord))
             case .tool:
                 out.append(("msg:\(m.id)", "agent", commandComp(m.text), m.text, m.ord))
             case .file:
@@ -1107,51 +1115,33 @@ final class RelayAgent: NSObject, ObservableObject {
               let body = obj["body"] as? [String: Any] else { return }
         let text = (body["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let images = body["images"] as? [[String: Any]] ?? []
-
-        // 控制台(stream-json)会话:文本 + 图片一并送给 AgentSessionManager
-        // (driver 内部用 `[Image #N]` 占位 + 文件路径透传给 claude TUI)。
         let isConsole = sid.hasPrefix("c:")
+        let realSid = isConsole ? String(sid.dropFirst(2)) : sid
 
-        // 没图就直接走文本路径(避免起 Task)
+        // 无图:直接路由(console → AgentSessionManager;终端 → 注入)
         if images.isEmpty {
-            if isConsole {
-                agentManager?.send(String(sid.dropFirst(2)), text: text)
-            } else {
-                guard !text.isEmpty else { return }
-                onRemoteInput?(sid, text, [])
-            }
+            if isConsole { agentManager?.send(realSid, text: text) }
+            else if !text.isEmpty { onRemoteInput?(sid, text, []) }
             return
         }
-
-        // 有图:从服务器按 id 下载(阻塞 I/O),挪到后台;完成后回主线程派发。
+        // 有图:后台按 id 确保本地缓存(阻塞 I/O),再回主线程路由。console 也走图片(之前直接丢弃)。
         Task.detached(priority: .userInitiated) { [weak self] in
-            var paths: [String] = []
-            let dir = (NSString(string: "~/.vibenotch/inbox/\(sid)")).expandingTildeInPath
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            var refs: [ImageRef] = []
             for (i, img) in images.enumerated() {
                 let ext = (img["ext"] as? String ?? "jpg").lowercased()
-                let path = "\(dir)/\(Int(Date().timeIntervalSince1970))_\(i).\(ext)"
-                let data: Data?
-                if let id = img["id"] as? String, !id.isEmpty {
-                    data = Self.downloadImage(id: id)        // 新链路:凭 id 经 HTTP 下载
-                    vlog("relay image[\(i)] 走 id=\(id) → \(data != nil ? "下载成功 \(data!.count)B" : "下载失败")")
-                } else if let b64 = img["data"] as? String {
-                    data = Data(base64Encoded: b64)          // 旧链路:base64 内联(兼容老手机)
-                    vlog("relay image[\(i)] 走 base64(旧链路) \(data?.count ?? 0)B")
-                } else {
-                    data = nil
-                    vlog("relay image[\(i)] 既无 id 也无 data,跳过 keys=\(Array(img.keys))")
-                }
-                guard let d = data, FileManager.default.createFile(atPath: path, contents: d) else { continue }
-                paths.append(path)
+                let id = img["id"] as? String ?? ""
+                var keyId = id
+                if !id.isEmpty {
+                    guard ImageRelay.ensureCached(id: id, ext: ext) != nil else { vlog("relay image[\(i)] id=\(id) 拉取失败"); continue }
+                } else if let b64 = img["data"] as? String, let local = ImageRelay.cacheBase64(b64, ext: ext) {
+                    keyId = local   // 旧手机内联 base64:本地缓存兜底
+                } else { continue }
+                refs.append(ImageRef(id: keyId, ext: ext, localPath: ImageRelay.cachePath(id: keyId, ext: ext)))
             }
-            guard !text.isEmpty || !paths.isEmpty else { return }
+            guard !text.isEmpty || !refs.isEmpty else { return }
             await MainActor.run {
-                if isConsole {
-                    self?.agentManager?.send(String(sid.dropFirst(2)), text: text, imagePaths: paths)
-                } else {
-                    self?.onRemoteInput?(sid, text, paths)
-                }
+                if isConsole { self?.agentManager?.send(realSid, text: text, images: refs) }
+                else { self?.onRemoteInput?(sid, text, refs.map { $0.localPath }) }
             }
         }
     }
