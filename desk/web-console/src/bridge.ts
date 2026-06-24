@@ -72,7 +72,8 @@ export const cmd = {
   renameSession: (key: string, title: string) => send({ action: 'renameSession', key, title }),
   hideSession: (key: string) => send({ action: 'hideSession', key }),
   unhideSession: (key: string) => send({ action: 'unhideSession', key }),
-  sendInput: (sid: string, text: string) => send({ action: 'send', sid, text }),
+  sendInput: (sid: string, text: string, images?: { name: string; data: string }[]) =>
+    send({ action: 'send', sid, text, ...(images && images.length ? { images } : {}) }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
   raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),

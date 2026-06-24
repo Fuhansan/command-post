@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn } from './store'
 import { cmd, type AgentId } from './bridge'
-import type { Session, Msg, Manual, History, Project, Entry, UsageData } from './types'
+import type { Session, Msg, Manual, History, Project, Entry, UsageData, MsgImage } from './types'
 import { mockGit, PROVIDERS } from './mock'
 import type { GitStatus } from './mock'
 
@@ -108,13 +108,39 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
   return <div className="md flex-1 text-[13.5px] leading-[1.72] text-ink select-text min-w-0" dangerouslySetInnerHTML={{ __html: html }} />
 })
 
+// 用户消息里的图片:缩略图栅格 + 点击看全图(lightbox)
+function UserImages({ images }: { images: MsgImage[] }) {
+  const [zoom, setZoom] = useState<string | null>(null)
+  // 通道只给 id,字节由 VibeNotch 经 app:// 按 id 代取(本地缓存命中或回源)
+  const srcOf = (im: MsgImage) => `app://local/__img/${im.id}.${im.ext || 'png'}`
+  return (
+    <>
+      <div className="flex flex-wrap gap-1.5 justify-end max-w-[78%]">
+        {images.map((im, i) => (
+          <img key={i} src={srcOf(im)} alt="" onClick={() => setZoom(srcOf(im))}
+            className="max-w-[180px] max-h-[220px] rounded-[12px] object-cover border border-line cursor-zoom-in transition hover:brightness-90" />
+        ))}
+      </div>
+      {zoom && createPortal(
+        <div onClick={() => setZoom(null)} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
+          <img src={zoom} alt="" className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
+        </div>,
+        document.body,
+      )}
+    </>
+  )
+}
+
 // ===== 消息渲染 =====
 function MessageRowImpl({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
   if (m.kind === 'text' && m.role === 'user') {
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg"
-          style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{m.text}</div>
+      <div className="flex flex-col items-end gap-1.5">
+        {m.images && m.images.length > 0 && <UserImages images={m.images} />}
+        {m.text && (
+          <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg"
+            style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{m.text}</div>
+        )}
       </div>
     )
   }
@@ -301,7 +327,7 @@ type Attach =
   | { id: string; kind: 'code'; file: string; start: number; end: number; lang: string; snippet: string }
   | { id: string; kind: 'paste'; text: string }
   | { id: string; kind: 'file'; name: string; path: string; lang: string }
-  | { id: string; kind: 'image'; name: string; url: string }
+  | { id: string; kind: 'image'; name: string; dataUrl: string }
 
 let _aid = 0
 const newAid = () => `a${++_aid}`
@@ -315,13 +341,10 @@ function attachToText(a: Attach): string {
 }
 
 function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
-  // 卸载即释放图片 blob URL(覆盖单删/清空/切会话所有移除路径,避免内存泄漏)。
-  const imgUrl = a.kind === 'image' ? a.url : undefined
-  useEffect(() => () => { if (imgUrl) URL.revokeObjectURL(imgUrl) }, [imgUrl])
   return (
     <div className="flex items-center gap-2 pl-2 pr-1 py-1.5 rounded-[9px] border border-line bg-elev2 max-w-[230px]">
       {a.kind === 'image'
-        ? <img src={a.url} alt="" className="w-[26px] h-[26px] rounded object-cover shrink-0" />
+        ? <img src={a.dataUrl} alt="" className="w-[26px] h-[26px] rounded object-cover shrink-0" />
         : <span className="w-[22px] h-[22px] rounded-[6px] flex items-center justify-center shrink-0" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>
             {a.kind === 'code' ? <Code2 size={13} /> : a.kind === 'paste' ? <Clipboard size={13} /> : <FileText size={13} />}
           </span>}
@@ -338,7 +361,8 @@ function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
 
 // ===== 输入框(带附件)=====
 function Composer({ sid, model, attachments, setAttachments, onSend }: {
-  sid: string; model?: string; attachments: Attach[]; setAttachments: SetAttach; onSend: (t: string) => void
+  sid: string; model?: string; attachments: Attach[]; setAttachments: SetAttach
+  onSend: (t: string, images?: { name: string; data: string }[]) => void
 }) {
   const [draft, setDraft] = useState('')
   const [menu, setMenu] = useState(false)
@@ -349,18 +373,27 @@ function Composer({ sid, model, attachments, setAttachments, onSend }: {
   const composingRef = useRef(false)
   const cur = modelLabel(model)
   const addFiles = (files: FileList | File[]) => {
-    const add: Attach[] = []
     for (const f of Array.from(files)) {
-      if (f.type.startsWith('image/')) add.push({ id: newAid(), kind: 'image', name: f.name, url: URL.createObjectURL(f) })
-      else add.push({ id: newAid(), kind: 'file', name: f.name, path: f.name, lang: hljsLang(f.name) ?? fileExt(f.name) ?? 'file' })
+      if (f.type.startsWith('image/')) {
+        // 图片读成 base64 dataUrl(发送时取字节给桥,由 VibeNotch 代传服务器)
+        const id = newAid()
+        setAttachments((p) => [...p, { id, kind: 'image', name: f.name, dataUrl: '' }])
+        const r = new FileReader()
+        r.onload = () => setAttachments((p) => p.map((a) => a.id === id ? { ...a, dataUrl: String(r.result) } : a))
+        r.readAsDataURL(f)
+      } else {
+        setAttachments((p) => [...p, { id: newAid(), kind: 'file', name: f.name, path: f.name, lang: hljsLang(f.name) ?? fileExt(f.name) ?? 'file' }])
+      }
     }
-    if (add.length) setAttachments((p) => [...p, ...add])
   }
   const submit = () => {
     const t = draft.trim()
     if (!t && !attachments.length) return
-    const refs = attachments.map(attachToText).join('\n\n')
-    onSend([refs, t].filter(Boolean).join('\n\n'))
+    // 图片单独走二进制通道(只发字节,消息里不塞 base64);代码/粘贴/文件引用仍拼进文字
+    const imgs = attachments.filter((a): a is Extract<Attach, { kind: 'image' }> => a.kind === 'image' && !!a.dataUrl)
+    const textRefs = attachments.filter((a) => a.kind !== 'image').map(attachToText)
+    const images = imgs.map((a) => ({ name: a.name, data: a.dataUrl.split(',')[1] ?? '' }))
+    onSend([...textRefs, t].filter(Boolean).join('\n\n'), images)
     setDraft(''); setAttachments(() => [])
   }
   const onPaste = (e: React.ClipboardEvent) => {
@@ -1013,13 +1046,16 @@ function ConsolePage() {
   }, [state, sel])
 
   const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd + '/')
+  // 手动/终端会话只归到「最具体」的项目(最长匹配前缀);workplace 这类父目录只兜底放不属于任何更具体项目的会话
+  const projBySpecificity = [...state.projects].sort((a, b) => b.workdir.length - a.workdir.length)
+  const bestProjectWd = (cwd: string) => projBySpecificity.find((p) => inProject(cwd, p.workdir))?.workdir
 
   // 每个项目 → 一个分组(会话 + 手动 + 历史 合并)
   const groups: Group[] = state.projects.map((p) => {
     const cs = state.sessions.filter((s) => s.workdir === p.workdir)
     // 同一个 session_id 已在桌面端打开(console 会话),就不再把它的「手动/终端」会话重复列出
     const consoleSids = new Set<string>(cs.map((s) => s.agentSessionId).filter(Boolean) as string[])
-    const ms = state.manual.filter((m) => inProject(m.cwd, p.workdir) && !consoleSids.has(m.id))
+    const ms = state.manual.filter((m) => bestProjectWd(m.cwd) === p.workdir && !consoleSids.has(m.id))
     const liveIds = new Set<string>([...consoleSids, ...ms.map((m) => m.id)])
     const hs = p.history.filter((h) => !liveIds.has(h.id))
     const rows: RowItem[] = [
@@ -1076,7 +1112,7 @@ function ConsolePage() {
     barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
     barRight = <IconBtn title="结束会话" onClick={() => cmd.closeSession(liveSession.id)}><X size={16} /></IconBtn>
     chat = <MsgList msgs={liveSession.messages} onRespond={onLiveRespond} working={liveSession.status === 'working'} />
-    footer = <Composer sid={liveSession.id} model={liveSession.model} attachments={attachments} setAttachments={setAttachments} onSend={(t) => cmd.sendInput(liveSession.id, t)} />
+    footer = <Composer sid={liveSession.id} model={liveSession.model} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
     const mm = tmeta[manualSel.id]

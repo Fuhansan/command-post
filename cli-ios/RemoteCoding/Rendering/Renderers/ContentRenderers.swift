@@ -167,13 +167,58 @@ struct ProgressRenderer: View {
     }
 }
 
+/// 按 id 拉图显示(控制通道只给 id,字节经 HTTP 拉 + 缓存)。兼容旧 base64。
+struct IdAsyncImage: View {
+    let id: String
+    var corner: CGFloat = 12
+    var maxW: CGFloat = 240
+    var maxH: CGFloat = 300
+    var fill: Bool = false
+    @State private var image: UIImage?
+    @State private var failed = false
+    var body: some View {
+        Group {
+            if let ui = image {
+                let s = fitted(ui.size)
+                Image(uiImage: ui).resizable().aspectRatio(contentMode: fill ? .fill : .fit)
+                    .frame(width: s.width, height: s.height)
+                    .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
+            } else if failed {
+                VStack(spacing: 6) {
+                    Image(systemName: "clock.badge.xmark").font(.system(size: 22)).foregroundStyle(Theme.textTer)
+                    Text("图片已过期").font(.system(size: 12)).foregroundStyle(Theme.textSec)
+                }
+                .frame(width: 150, height: 100).background(Theme.cardHi)
+                .clipShape(RoundedRectangle(cornerRadius: corner))
+            } else {
+                ProgressView().tint(Theme.blue)
+                    .frame(width: 120, height: 90).background(Theme.cardHi)
+                    .clipShape(RoundedRectangle(cornerRadius: corner))
+            }
+        }
+        .task(id: id) {
+            failed = false; image = nil
+            if let ui = await ImageStore.load(id: id) { image = ui } else { failed = true }
+        }
+    }
+    private func fitted(_ size: CGSize) -> CGSize {
+        guard size.width > 0, size.height > 0 else { return CGSize(width: maxW, height: maxW) }
+        let scale = min(min(maxW / size.width, maxH / size.height), 1)
+        return CGSize(width: size.width * scale, height: size.height * scale)
+    }
+}
+
 struct ImageRenderer: View {
     let component: Component
     var body: some View {
         let p = component.props
-        // 优先内联 base64(Mac 本地图片经 agent 缩略图内联);否则走 url。
-        if let dataStr = p["data"]?.stringValue,
-           let data = Data(base64Encoded: dataStr), let ui = UIImage(data: data) {
+        // 通道只给 id → 按 id 拉;兼容旧 base64 / url。
+        if let id = p["id"]?.stringValue, !id.isEmpty {
+            IdAsyncImage(id: id)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke.opacity(0.5), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
+        } else if let dataStr = p["data"]?.stringValue,
+                  let data = Data(base64Encoded: dataStr), let ui = UIImage(data: data) {
             Image(uiImage: ui).resizable().scaledToFit()
                 .frame(maxWidth: 240, maxHeight: 300)
                 .clipShape(RoundedRectangle(cornerRadius: 16))

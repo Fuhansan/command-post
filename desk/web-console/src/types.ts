@@ -1,11 +1,13 @@
 export type MsgKind = 'text' | 'tool' | 'file' | 'permission'
 
+export interface MsgImage { id: string; ext?: string }   // 通道只带 id;web 按 app://__img/<id> 取字节
 export interface Msg {
   id: string
   role: string          // user | assistant | system
   kind: MsgKind
   text: string
   ord: number
+  images?: MsgImage[]
   permState?: string | null   // null=待处理 allow/deny=已处理
   permReqId?: string | null
 }

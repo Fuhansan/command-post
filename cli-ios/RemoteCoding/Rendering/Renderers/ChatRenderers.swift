@@ -32,6 +32,63 @@ struct MarkdownText: View {
                     .overlay(Rectangle().fill(Theme.stroke).frame(width: 3), alignment: .leading)
                     .foregroundStyle(Theme.textSec)
             }
+            // 段落:行距 + 段距(避免默认贴在一起)
+            .markdownBlockStyle(\.paragraph) { configuration in
+                configuration.label
+                    .relativeLineSpacing(.em(0.22))
+                    .markdownMargin(top: 0, bottom: 8)
+            }
+            // 标题分级(对齐 web .md:h1 1.3 / h2 1.18 / h3 1.06 / 其余递减)
+            .markdownBlockStyle(\.heading1) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(1.3)); ForegroundColor(Theme.text) }
+                    .relativeLineSpacing(.em(0.1)).markdownMargin(top: 18, bottom: 7)
+            }
+            .markdownBlockStyle(\.heading2) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(1.18)); ForegroundColor(Theme.text) }
+                    .relativeLineSpacing(.em(0.1)).markdownMargin(top: 16, bottom: 6)
+            }
+            .markdownBlockStyle(\.heading3) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(1.06)); ForegroundColor(Theme.text) }
+                    .relativeLineSpacing(.em(0.1)).markdownMargin(top: 14, bottom: 5)
+            }
+            .markdownBlockStyle(\.heading4) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(1.0)); ForegroundColor(Theme.text) }
+                    .markdownMargin(top: 12, bottom: 4)
+            }
+            .markdownBlockStyle(\.heading5) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(0.92)); ForegroundColor(Theme.textSec) }
+                    .markdownMargin(top: 12, bottom: 4)
+            }
+            .markdownBlockStyle(\.heading6) { c in
+                c.label.markdownTextStyle { FontWeight(.semibold); FontSize(.em(0.85)); ForegroundColor(Theme.textSec) }
+                    .markdownMargin(top: 12, bottom: 4)
+            }
+            // 列表项:项与项之间留点距离
+            .markdownBlockStyle(\.listItem) { configuration in
+                configuration.label.markdownMargin(top: .em(0.2))
+            }
+            // 表格:描边 + 隔行底色 + 表头加粗(默认无边框,会糊成一团)
+            .markdownBlockStyle(\.table) { configuration in
+                configuration.label
+                    .fixedSize(horizontal: false, vertical: true)
+                    .markdownTableBorderStyle(.init(color: Theme.stroke))
+                    .markdownTableBackgroundStyle(.alternatingRows(Theme.card, Theme.field))
+                    .markdownMargin(top: 2, bottom: 10)
+            }
+            .markdownBlockStyle(\.tableCell) { configuration in
+                configuration.label
+                    .markdownTextStyle {
+                        if configuration.row == 0 { FontWeight(.semibold) }
+                        ForegroundColor(Theme.text)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 5).padding(.horizontal, 11)
+                    .relativeLineSpacing(.em(0.2))
+            }
+            // 分隔线
+            .markdownBlockStyle(\.thematicBreak) {
+                Divider().overlay(Theme.stroke).markdownMargin(top: 14, bottom: 14)
+            }
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -223,7 +280,8 @@ struct PhotoMsgRenderer: View {
     private let maxImgH: CGFloat = 300
 
     private struct Item {
-        let image: UIImage
+        let id: String?       // 新:按 id 拉(通道只给 id)
+        let image: UIImage?   // 旧:base64 内联
         let name: String
         let kind: String
         let size: String
@@ -237,13 +295,18 @@ struct PhotoMsgRenderer: View {
         let imgW = cardW - pad * 2
 
         VStack(alignment: .leading, spacing: 9) {
-            if let first = items.first { headerRow(first) }
+            if let first = items.first { headerRow(first, count: items.count) }
             ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                let s = fitted(item.image.size, boxW: imgW)
-                Image(uiImage: item.image).resizable().scaledToFill()
-                    .frame(width: s.width, height: s.height)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .frame(maxWidth: .infinity)   // 窄图水平居中
+                if let id = item.id {
+                    IdAsyncImage(id: id, corner: 10, maxW: imgW, maxH: maxImgH, fill: true)
+                        .frame(maxWidth: .infinity)
+                } else if let ui = item.image {
+                    let s = fitted(ui.size, boxW: imgW)
+                    Image(uiImage: ui).resizable().scaledToFill()
+                        .frame(width: s.width, height: s.height)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .frame(maxWidth: .infinity)   // 窄图水平居中
+                }
             }
             if !text.isEmpty {
                 Text(text)
@@ -273,8 +336,8 @@ struct PhotoMsgRenderer: View {
         .shadow(color: .black.opacity(0.25), radius: 6, y: 3)
     }
 
-    /// 顶部文件信息栏:图标 + 「Screenshot · PNG」 + 文件名·大小。
-    private func headerRow(_ item: Item) -> some View {
+    /// 顶部文件信息栏:图标 + 「Screenshot · PNG」 + 文件名·大小(id 图没有名/大小时显示张数)。
+    private func headerRow(_ item: Item, count: Int) -> some View {
         HStack(spacing: 9) {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(Theme.cardHi)
@@ -282,9 +345,10 @@ struct PhotoMsgRenderer: View {
                 .overlay(Image(systemName: "photo")
                     .font(.system(size: 15)).foregroundStyle(Theme.textSec))
             VStack(alignment: .leading, spacing: 2) {
-                Text(item.kind.isEmpty ? "Screenshot" : "Screenshot · \(item.kind)")
+                Text(item.kind.isEmpty ? "图片" : "Screenshot · \(item.kind)")
                     .font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.text)
-                Text([item.name, item.size].filter { !$0.isEmpty }.joined(separator: " · "))
+                let sub = [item.name, item.size].filter { !$0.isEmpty }.joined(separator: " · ")
+                Text(sub.isEmpty ? "\(count) 张" : sub)
                     .font(.system(size: 11)).foregroundStyle(Theme.textSec)
                     .lineLimit(1).truncationMode(.middle)
             }
@@ -294,31 +358,34 @@ struct PhotoMsgRenderer: View {
         }
     }
 
-    /// 兼容两种 images 元素:对象 {data,name,kind,size} 或纯 base64 字符串(旧格式)。
-    /// 解码结果缓存 —— 列表重渲染时不再重复 base64 解码(消灭闪烁)。
+    /// 兼容:{id,ext}(新,按 id 拉)/ {data,name,kind,size}(旧 base64)/ 纯 base64 字符串(更旧)。
     private static let imageCache = NSCache<NSString, UIImage>()
 
     private func decodeItems(_ arr: [JSONValue]) -> [Item] {
         arr.compactMap { v in
-            let b64: String?
-            var name = "", kind = "", size = ""
             if let obj = v.objectValue {
-                b64 = obj["data"]?.stringValue
-                name = obj["name"]?.stringValue ?? ""
-                kind = obj["kind"]?.stringValue ?? ""
-                size = obj["size"]?.stringValue ?? ""
-            } else {
-                b64 = v.stringValue
+                if let id = obj["id"]?.stringValue, !id.isEmpty {
+                    return Item(id: id, image: nil, name: obj["name"]?.stringValue ?? "",
+                                kind: (obj["ext"]?.stringValue ?? "").uppercased(), size: "")
+                }
+                if let s = obj["data"]?.stringValue, let ui = cachedDecode(s) {
+                    return Item(id: nil, image: ui, name: obj["name"]?.stringValue ?? "",
+                                kind: obj["kind"]?.stringValue ?? "", size: obj["size"]?.stringValue ?? "")
+                }
+                return nil
             }
-            guard let s = b64 else { return nil }
-            let key = "\(s.count):\(s.prefix(48))" as NSString
-            if let cached = Self.imageCache.object(forKey: key) {
-                return Item(image: cached, name: name, kind: kind, size: size)
+            if let s = v.stringValue, let ui = cachedDecode(s) {
+                return Item(id: nil, image: ui, name: "", kind: "", size: "")
             }
-            guard let d = Data(base64Encoded: s), let ui = UIImage(data: d) else { return nil }
-            Self.imageCache.setObject(ui, forKey: key)
-            return Item(image: ui, name: name, kind: kind, size: size)
+            return nil
         }
+    }
+    private func cachedDecode(_ s: String) -> UIImage? {
+        let key = "\(s.count):\(s.prefix(48))" as NSString
+        if let c = Self.imageCache.object(forKey: key) { return c }
+        guard let d = Data(base64Encoded: s), let ui = UIImage(data: d) else { return nil }
+        Self.imageCache.setObject(ui, forKey: key)
+        return ui
     }
 
     /// 在 boxW × maxImgH 内按宽高比缩放,不裁切不留黑边。

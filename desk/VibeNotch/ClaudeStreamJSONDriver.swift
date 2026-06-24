@@ -100,15 +100,16 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     // MARK: - 上行:发消息 / 回答待决项
 
     func send(_ input: UserInput) {
-        var content: [[String: Any]] = []
-        if !input.text.isEmpty {
-            content.append(["type": "text", "text": input.text])
+        // 图片不内联 base64:已落盘的文件路径作为文字引用发给 Claude,让它用 Read 工具查看。
+        // (像素仍会在 Claude 读取时进入上下文,但发送体积/user 消息保持精简,符合「发地址」)
+        var text = input.text
+        if !input.imagePaths.isEmpty {
+            let refs = input.imagePaths.map { "图片: \($0)" }.joined(separator: "\n")
+            let head = input.text.isEmpty ? "用户发来图片,请用 Read 工具查看后回答:" : "\n\n(用户附带图片,请用 Read 工具查看)"
+            text = input.text.isEmpty ? "\(head)\n\(refs)" : "\(input.text)\(head)\n\(refs)"
         }
-        for path in input.imagePaths {
-            if let block = Self.imageBlock(path: path) { content.append(block) }
-        }
-        guard !content.isEmpty else { return }
-        writeJSON(["type": "user", "message": ["role": "user", "content": content]])
+        guard !text.isEmpty else { return }
+        writeJSON(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
     }
 
     /// Path A 权限通道:PreToolUse hook(经 AppDelegate/SessionManager 按 ppid 路由进来)→

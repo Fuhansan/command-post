@@ -129,7 +129,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "unhideSession":
             if let key = obj["key"] as? String { SessionMetaStore.shared.unhide(key); pushState() }
         case "send":
-            if let sid = obj["sid"] as? String, let text = obj["text"] as? String { manager?.send(sid, text: text) }
+            if let sid = obj["sid"] as? String, let text = obj["text"] as? String {
+                let imgs = obj["images"] as? [[String: Any]] ?? []
+                if imgs.isEmpty { manager?.send(sid, text: text) }
+                else { sendWithImages(sid: sid, text: text, images: imgs) }
+            }
         case "respond":
             if let sid = obj["sid"] as? String, let req = obj["reqId"] as? String,
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
@@ -200,8 +204,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         guard let path else { return }
         Task.detached(priority: .userInitiated) { [weak self] in
             let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: beforeByte)
+            let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: beforeByte)
             let msgs = win.messages.map { m -> [String: Any] in
-                ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
+                var d: [String: Any] = ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
+                if let imgs = imgMap[m.ord] { d["images"] = imgs }   // 历史图片(thumb/url 都是 data URL)
+                return d
             }
             await MainActor.run {
                 self?.pushJSON(type: "transcript", payload: [
@@ -402,9 +409,36 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
     private func msgDTO(_ m: AgentMessage) -> [String: Any] {
         var d: [String: Any] = ["id": m.id, "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
+        if !m.images.isEmpty {
+            // 通道只带 id;web 用 app://__img/<id>.<ext> 按 id 取字节(scheme handler 本地缓存命中或回源)
+            d["images"] = m.images.map { ["id": $0.id, "ext": $0.ext] }
+        }
         if let ps = m.permState { d["permState"] = ps }
         if let pr = m.permReqId { d["permReqId"] = pr }
         return d
+    }
+
+    /// 桌面控制台带图发送:web 传 base64 → 落盘(喂 agent)+ 上传服务器拿 id(给手机展示)→ 入会话回显。
+    /// 全图不进 relay 消息,只带 id + 小缩略图。
+    private func sendWithImages(sid: String, text: String, images: [[String: Any]]) {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            var refs: [ImageRef] = []
+            for img in images {
+                guard let b64 = img["data"] as? String, let data = Data(base64Encoded: b64) else { continue }
+                let name = (img["name"] as? String) ?? "image"
+                let raw = (name as NSString).pathExtension.lowercased()
+                var ext = raw.isEmpty ? "png" : raw
+                var id = ""
+                if let up = ImageRelay.upload(data, ext: ext) {   // 上传换 id + 按 id 落本地缓存
+                    id = up.id; ext = up.ext; ImageRelay.saveById(id: id, ext: ext, data: data)
+                } else if let local = ImageRelay.cacheBase64(b64, ext: ext) {   // 上传失败:本地缓存兜底(桌面可看,手机拉不到)
+                    id = local
+                }
+                guard !id.isEmpty else { continue }
+                refs.append(ImageRef(id: id, ext: ext, localPath: ImageRelay.cachePath(id: id, ext: ext)))
+            }
+            await MainActor.run { self?.manager?.send(sid, text: text, images: refs) }
+        }
     }
     private func pendingDTO(_ p: PendingRequest) -> [String: Any] {
         ["id": p.id, "title": p.title, "detail": p.detail ?? "",
@@ -433,8 +467,21 @@ final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url else { task.didFinish(); return }
         var path = url.path
-        if path.isEmpty || path == "/" { path = "/index.html" }
-        let fileURL = root.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+        let fileURL: URL
+        if path.hasPrefix("/__img/") {
+            // 会话图片:按 id 取字节(本地缓存命中或回源下载)。通道里只有这个 id。
+            let name = String(path.dropFirst("/__img/".count))   // <id>.<ext>
+            let id = (name as NSString).deletingPathExtension
+            let ext = (name as NSString).pathExtension
+            guard !id.isEmpty, let local = ImageRelay.ensureCached(id: id, ext: ext) else {
+                let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
+                task.didReceive(resp); task.didFinish(); return
+            }
+            fileURL = URL(fileURLWithPath: local)
+        } else {
+            if path.isEmpty || path == "/" { path = "/index.html" }
+            fileURL = root.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+        }
         guard let data = try? Data(contentsOf: fileURL) else {
             let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
             task.didReceive(resp); task.didFinish(); return
@@ -454,6 +501,9 @@ final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
         case "json": return "application/json; charset=utf-8"
         case "svg": return "image/svg+xml"
         case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
         case "woff2": return "font/woff2"
         default: return "application/octet-stream"
         }

@@ -32,14 +32,14 @@ import java.util.Set;
  *       电脑端 VibeNotch GET /{id} 凭同账号 token 把图拉下来,按原逻辑落盘给 claude。
  *
  * 存储:data/images/&lt;account&gt;/&lt;id&gt;.&lt;ext&gt;,按账号隔离(手机与其配对的电脑端
- *       是同一账号,故能互取;跨账号取不到)。上传时顺带清掉该账号 24h 前的旧图。
+ *       是同一账号,故能互取;跨账号取不到)。上传时顺带清掉该账号 7 天前的旧图。
  */
 @RestController
 @RequestMapping("/api/image")
 public class ImageController {
 
     private static final File ROOT = new File("data/images");
-    private static final long TTL_MS = 24L * 3600 * 1000;     // 旧图保留 24h
+    private static final long TTL_MS = 7L * 24 * 3600 * 1000;  // 旧图保留 7 天(一周)
     private static final long MAX_BYTES = 12L * 1024 * 1024;  // 单图上限 12MB(压缩后远小于此)
     private static final Set<String> ALLOWED = Set.of("jpg", "jpeg", "png", "gif", "webp");
 
