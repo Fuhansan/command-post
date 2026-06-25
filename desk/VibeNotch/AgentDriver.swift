@@ -80,11 +80,19 @@ struct FileEditInfo: Equatable {
     let additions: Int        // +N 行(hunks 细节后续补)
 }
 
+/// 一个可切换的模型。`id` 是切换时传给 agent 的值(claude 用稳定别名 opus/sonnet/haiku;
+/// codex 用 model/list 返回的真实 slug);`label` 是展示名。动态获取,避免写死随版本过时。
+struct AgentModel: Equatable {
+    let id: String
+    let label: String
+}
+
 /// driver 把原生协议翻译成的统一事件。上层据此增量更新会话模型。
 enum SessionEvent {
     case status(SessionStatus)
     case sessionId(String)                                  // 供 --resume
     case model(String)                                      // 当前模型(从流里读到)
+    case availableModels([AgentModel])                      // 可切换模型列表(动态获取)
     case messageDelta(msgId: String, role: String, text: String)  // AI 文本(可流式拼接)
     case messageComplete(msgId: String)
     case toolCall(ToolCallInfo)                             // 工具调用展示

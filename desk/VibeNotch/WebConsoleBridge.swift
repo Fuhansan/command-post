@@ -407,6 +407,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             "id": s.id, "key": key, "title": meta.title(for: key) ?? base, "workdir": s.workdir,
             "agent": s.agent.rawValue, "status": statusKey(s.status),
             "model": s.model ?? "",
+            "models": s.availableModels.map { ["id": $0.id, "label": $0.label] },
             "agentSessionId": s.agentSessionId ?? "",
             "startedAt": s.startedAt.timeIntervalSince1970 * 1000,
             "messages": s.messages.map { msgDTO($0) },

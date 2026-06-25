@@ -35,6 +35,12 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     /// 流式:当前正在增量的 assistant 消息 id;已用 delta 流过的 msgId(末尾完整消息去重,避免文本翻倍)。
     private var streamMsgId: String?
     private var streamedTextIds = Set<String>()
+    /// claude 子进程 stderr 的滚动尾巴(只留尾部一段),启动失败时回吐给 UI/日志。
+    private var stderrTail = ""
+    private func appendStderr(_ s: String) {
+        for line in s.split(separator: "\n") { vlog("claude stderr: \(line.prefix(240))") }
+        stderrTail = String((stderrTail + s).suffix(1500))
+    }
 
     /// default = 权限走 PreToolUse hook(Path A,控制台默认);bypassPermissions = 全放行(测试用)。
     private let permissionMode: String
@@ -68,10 +74,12 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         p.arguments = args
         p.currentDirectoryURL = URL(fileURLWithPath: workdir)
         p.environment = Self.childEnvironment()
-        let inPipe = Pipe(), outPipe = Pipe()
+        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
-        p.standardError = outPipe            // stream-json 下 stderr 也并进来(verbose 噪声靠解析过滤)
+        // stderr 单独收:既保证 stdout 只剩干净 JSON,也能把启动期报错(鉴权失败 / 崩溃)
+        // 落日志并在进程未初始化就退出时回吐给 UI —— 否则会话只会静默卡在 starting(「启动不了」)。
+        p.standardError = errPipe
         stdinHandle = inPipe.fileHandleForWriting
 
         outPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
@@ -79,13 +87,36 @@ final class ClaudeStreamJSONDriver: AgentDriver {
             if d.isEmpty { return }
             self?.feed(d)
         }
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
+            self?.appendStderr(s)
+        }
         p.terminationHandler = { [weak self] _ in
-            self?.emit.yield(.status(.done))
-            self?.emit.finish()
+            guard let self else { return }
+            // 从没收到 init/session_id 就退出 = 启动失败,把 stderr 尾巴报给 UI(否则用户看不到原因)。
+            if self.sessionId == nil {
+                let tail = self.stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
+                vlog("console claude 启动失败(未初始化即退出):\(tail.isEmpty ? "无 stderr 输出" : tail)")
+                self.emit.yield(.error("Claude 启动失败:\(tail.isEmpty ? "进程未初始化即退出(可能未登录 / 二进制异常)" : tail)"))
+            }
+            self.emit.yield(.status(.done))
+            self.emit.finish()
         }
         proc = p
         emit.yield(.status(.starting))
         try p.run()
+        // claude -p(stream-json)要等收到首条输入才吐 system/init;但进程一旦拉起就已就绪等输入。
+        // 不靠 init 翻状态——否则新会话永远停在「启动中」(其实此时已能直接发消息)。
+        // 真启动失败由 terminationHandler(未初始化即退出)回吐 .error,不会被这条掩盖。
+        emit.yield(.status(.waitingInput))
+        // 模型用稳定别名:opus/sonnet/haiku 永远指向当前最新版,不随版本过时(claude 无 list 接口)。
+        // 展示的具体版本号由上层从实际 model 串(claude-opus-4-8)解析,不写死。
+        emit.yield(.availableModels([
+            AgentModel(id: "opus", label: "Opus"),
+            AgentModel(id: "sonnet", label: "Sonnet"),
+            AgentModel(id: "haiku", label: "Haiku"),
+        ]))
     }
 
     func stop() {

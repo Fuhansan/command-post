@@ -111,6 +111,21 @@ final class CodexAppServerDriver: AgentDriver {
         applyThreadResponse(resp)
         emit.yield(.status(.waitingInput))
 
+        // 可切换模型:异步问 app-server 的 model/list,拿真实 slug + 展示名(动态,不写死、不会过时)。
+        // model/list 偶尔较慢/超时,放后台不阻塞会话就绪;拿到再推给上层。
+        Task { [weak self] in
+            guard let self else { return }
+            guard let resp = try? await self.request(method: "model/list", params: ["includeHidden": false]),
+                  let data = resp["data"] as? [[String: Any]] else { return }
+            let models = data.compactMap { m -> AgentModel? in
+                guard let slug = m["model"] as? String, !slug.isEmpty,
+                      !((m["hidden"] as? Bool) ?? false) else { return nil }
+                let label = (m["displayName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? slug
+                return AgentModel(id: slug, label: label)
+            }
+            if !models.isEmpty { self.emit.yield(.availableModels(models)) }
+        }
+
         if continueLast {
             emit.yield(.messageDelta(
                 msgId: "codex_continue_hint",

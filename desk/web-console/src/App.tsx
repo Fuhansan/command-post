@@ -321,6 +321,34 @@ function modelLabel(m?: string): string {
   return MODELS.find((x) => x.alias === fam)?.label ?? (fam.charAt(0).toUpperCase() + fam.slice(1))
 }
 
+type ModelOpt = { id: string; label: string }
+// claude 兜底(availableModels 还没到的瞬间用):稳定别名,版本无关、永不过时。
+const CLAUDE_FALLBACK: ModelOpt[] = [
+  { id: 'opus', label: 'Opus' }, { id: 'sonnet', label: 'Sonnet' }, { id: 'haiku', label: 'Haiku' },
+]
+// 可切换模型:优先用 driver 动态下发的列表(claude 别名 / codex 真实 slug);
+// 为空时 claude 用兜底别名,codex 留空(model/list 还在加载)。不再写死。
+function modelOptions(agent?: string, models?: ModelOpt[]): ModelOpt[] {
+  if (models && models.length) return models
+  return agent === 'codex' ? [] : CLAUDE_FALLBACK
+}
+// 当前模型命中哪个选项:先精确(codex slug 完全相等),再包含(claude-opus-4-8 含 opus);
+// 按 id 长度降序匹配,避免 gpt-5.4 误命中 gpt-5.4-mini。
+function activeModelId(opts: ModelOpt[], model?: string): string | null {
+  if (!model) return null
+  const s = model.toLowerCase()
+  const exact = opts.find((o) => o.id.toLowerCase() === s)
+  if (exact) return exact.id
+  const inc = [...opts].sort((a, b) => b.id.length - a.id.length).find((o) => s.includes(o.id.toLowerCase()))
+  return inc?.id ?? null
+}
+// 切换按钮显示的当前模型名:claude 用动态解析的版本号(Opus 4.8);codex 用命中项的展示名。
+function curModelLabel(agent: string | undefined, model: string | undefined, opts: ModelOpt[]): string {
+  if (!model) return '默认'
+  if (agent !== 'codex') return modelLabel(model)
+  return opts.find((o) => o.id === activeModelId(opts, model))?.label ?? model
+}
+
 // ===== 附件(选中代码 / 粘贴长文本 / 图片 / 文件)=====
 // 后端 send 只收纯文本 → 发送时把附件拼成文本前缀。代码引用真发,图片/文件仅本地展示并降级为说明。
 type Attach =
@@ -362,8 +390,8 @@ function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
 }
 
 // ===== 输入框(带附件)=====
-function Composer({ sid, model, working, attachments, setAttachments, onSend }: {
-  sid: string; model?: string; working?: boolean; attachments: Attach[]; setAttachments: SetAttach
+function Composer({ sid, agent, model, models, working, attachments, setAttachments, onSend }: {
+  sid: string; agent?: string; model?: string; models?: ModelOpt[]; working?: boolean; attachments: Attach[]; setAttachments: SetAttach
   onSend: (t: string, images?: Array<{ name?: string; data?: string; id?: string; ext?: string }>) => void
 }) {
   const [draft, setDraft] = useState(() => draftStore[sid] ?? '')   // 草稿按会话持久化:切走再回来不丢
@@ -375,7 +403,9 @@ function Composer({ sid, model, working, attachments, setAttachments, onSend }: 
   // 避免「回车选候选词(含英文候选)」被当成发送。
   const composingRef = useRef(false)
   const lastCompEnd = useRef(0)
-  const cur = modelLabel(model)
+  const opts = modelOptions(agent, models)
+  const cur = curModelLabel(agent, model, opts)
+  const activeId = activeModelId(opts, model)
   const addFiles = (files: FileList | File[]) => {
     for (const f of Array.from(files)) {
       if (f.type.startsWith('image/')) {
@@ -449,10 +479,11 @@ function Composer({ sid, model, working, attachments, setAttachments, onSend }: 
             <>
               <div className="fixed inset-0 z-30" onClick={() => setMenu(false)} />
               <div className="absolute right-12 bottom-12 z-40 min-w-[150px] p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
-                {MODELS.map((m) => {
-                  const on = modelFamily(model) === m.alias
+                {opts.length === 0 && <div className="text-[11.5px] text-faint px-2.5 py-1.5">模型列表加载中…</div>}
+                {opts.map((m) => {
+                  const on = activeId === m.id
                   return (
-                    <button key={m.alias} onClick={() => { setMenu(false); if (!on) cmd.switchModel(sid, m.alias) }}
+                    <button key={m.id} onClick={() => { setMenu(false); if (!on) cmd.switchModel(sid, m.id) }}
                       className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-[12.5px] text-ink hover:bg-sunken"
                       style={on ? { background: 'var(--bg-sunken)' } : undefined}>
                       <span className="font-mono flex-1 text-left">{m.label}</span>
@@ -1134,7 +1165,7 @@ function ConsolePage() {
     barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
     barRight = <IconBtn title="结束会话" onClick={() => cmd.closeSession(liveSession.id)}><X size={16} /></IconBtn>
     chat = <MsgList msgs={liveSession.messages} onRespond={onLiveRespond} working={liveSession.status === 'working'} />
-    footer = <Composer sid={liveSession.id} model={liveSession.model} working={liveSession.status === 'working'} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
+    footer = <Composer sid={liveSession.id} agent={liveSession.agent} model={liveSession.model} models={liveSession.models} working={liveSession.status === 'working'} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
     const mm = tmeta[manualSel.id]
