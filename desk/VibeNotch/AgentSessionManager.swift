@@ -36,11 +36,12 @@ struct AgentSession: Identifiable, Equatable {
     var agentSessionId: String?       // agent 报告的 session_id(供 resume)
     var startedAt: Date = Date()      // 会话开始时间(列表展示相对时间)
     var model: String? = nil          // 当前模型(从流里读到 / 用户切换)
+    var availableModels: [AgentModel] = []   // 可切换模型列表(driver 动态获取)
 
     static func == (l: AgentSession, r: AgentSession) -> Bool {
         l.id == r.id && l.status == r.status && l.messages == r.messages &&
         l.pending == r.pending && l.title == r.title && l.agentSessionId == r.agentSessionId &&
-        l.model == r.model
+        l.model == r.model && l.availableModels == r.availableModels
     }
 }
 
@@ -534,6 +535,8 @@ final class AgentSessionManager: ObservableObject {
             loadHistory(sessionId: aid, into: sid)   // resume/continue 时把历史读回来(空会话无害)
         case .model(let m):
             mutate(sid) { $0.model = m }
+        case .availableModels(let ms):
+            mutate(sid) { $0.availableModels = ms }
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {

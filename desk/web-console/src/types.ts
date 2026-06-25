@@ -23,6 +23,7 @@ export interface Session {
   agent: string          // claude | codex
   status: string         // starting|idle|working|waitingInput|needsResponse|done|error
   model?: string         // 当前模型(完整 id,如 claude-opus-4-8)
+  models?: { id: string; label: string }[]   // 可切换模型(driver 动态获取,不写死)
   agentSessionId?: string
   startedAt?: number
   messages: Msg[]
