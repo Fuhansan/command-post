@@ -26,16 +26,23 @@ public class UserStore {
     private final File dataDir = new File("data");
     private final File usersFile = new File(dataDir, "users.json");
     private final File tokensFile = new File(dataDir, "tokens.json");
+    private final File devicesFile = new File(dataDir, "devices.json");
+
+    /** 登录过的设备记录(便于区分是哪台设备;不再单活动踢人,多设备可同时在线)。 */
+    public record DeviceRec(String id, String name, String role, long lastSeen) {}
 
     /** email → User */
     private final Map<String, User> users = new ConcurrentHashMap<>();
     /** token → account(email) */
     private final Map<String, String> tokens = new ConcurrentHashMap<>();
+    /** account → (deviceId → 设备记录)。 */
+    private final Map<String, Map<String, DeviceRec>> devices = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
 
     public UserStore() {
         boolean migrated = loadUsers();
         loadTokens();
+        loadDevices();
         if (migrated) persistUsers();   // 旧格式 → 升级落盘一次
     }
 
@@ -68,7 +75,7 @@ public class UserStore {
 
     // ── 令牌 ───────────────────────────────────────────────
 
-    /** 签发令牌(登录成功后调用)。 */
+    /** 签发令牌(电脑配对用;不动单活动表)。 */
     public String issueToken(String account) {
         byte[] raw = new byte[24];
         random.nextBytes(raw);
@@ -76,6 +83,25 @@ public class UserStore {
         tokens.put(token, account);
         persistTokens();
         return token;
+    }
+
+    /** 签发**手机/登录**令牌。已不再单活动,等同 issueToken(保留方法名,免改调用方)。 */
+    public String issueClientToken(String account) {
+        return issueToken(account);
+    }
+
+    /** 记录某账号登录/上线的设备(不踢人,只留档,便于区分是哪台设备)。 */
+    public void recordDevice(String account, String deviceId, String name, String role) {
+        if (account == null || account.isEmpty() || deviceId == null || deviceId.isEmpty()) return;
+        devices.computeIfAbsent(account, k -> new ConcurrentHashMap<>())
+               .put(deviceId, new DeviceRec(deviceId, name, role, System.currentTimeMillis()));
+        persistDevices();
+    }
+
+    /** 某账号登录过的设备列表(便于区分)。 */
+    public java.util.Collection<DeviceRec> devicesOf(String account) {
+        Map<String, DeviceRec> m = devices.get(account);
+        return m == null ? java.util.List.of() : m.values();
     }
 
     /** 令牌 → 账号;无效返回 null。 */
@@ -180,6 +206,28 @@ public class UserStore {
         try {
             JsonNode n = M.readTree(tokensFile);
             n.fields().forEachRemaining(e -> tokens.put(e.getKey(), e.getValue().asText()));
+        } catch (Exception ignored) {
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void loadDevices() {
+        if (!devicesFile.isFile()) return;
+        try {
+            Map<String, Map<String, DeviceRec>> loaded = M.readValue(
+                    devicesFile,
+                    M.getTypeFactory().constructMapType(java.util.HashMap.class,
+                        M.constructType(String.class),
+                        M.getTypeFactory().constructMapType(java.util.HashMap.class, String.class, DeviceRec.class)));
+            loaded.forEach((acc, m) -> devices.put(acc, new ConcurrentHashMap<>(m)));
+        } catch (Exception ignored) {
+        }
+    }
+
+    private synchronized void persistDevices() {
+        try {
+            dataDir.mkdirs();
+            M.writerWithDefaultPrettyPrinter().writeValue(devicesFile, devices);
         } catch (Exception ignored) {
         }
     }

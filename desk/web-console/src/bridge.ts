@@ -1,4 +1,4 @@
-import { setState, upsertSession, removeSession, upsertManual, removeManual, setProjects, setTranscript, setDir, setFile, setUsage, setConn, setImgReady } from './store'
+import { setState, upsertSession, removeSession, upsertManual, removeManual, setProjects, setTranscript, setDir, setFile, setUsage, setConn, setPrefs, setImgReady } from './store'
 
 // JS → Swift:发命令。WKWebView 里走 messageHandlers;浏览器 dev 模式只打印。
 export function send(cmd: Record<string, unknown>) {
@@ -6,6 +6,20 @@ export function send(cmd: Record<string, unknown>) {
   const h = w.webkit?.messageHandlers?.agent
   if (h) h.postMessage(JSON.stringify(cmd))
   else console.log('[cmd]', cmd)
+}
+
+// 登录类请求:reqId → Promise,Swift 经 "authResult" push 回带同一 reqId 解决/拒绝。
+let authSeq = 0
+const authPending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void }>()
+function authCall(action: string, params: Record<string, unknown> = {}): Promise<any> {
+  const reqId = `auth${++authSeq}`
+  return new Promise((resolve, reject) => {
+    authPending.set(reqId, { resolve, reject })
+    send({ action, reqId, ...params })
+    setTimeout(() => {
+      if (authPending.has(reqId)) { authPending.delete(reqId); reject(new Error('请求超时,检查网络')) }
+    }, 20000)
+  })
 }
 
 // Swift → JS:推事件。Swift 用 evaluateJavaScript("window.__agent.push(...)") 调。
@@ -30,11 +44,11 @@ function installReceiver() {
           removeManual(msg.payload.id)
           break
         case 'projects':
-          setProjects(msg.payload.projects, msg.payload.hidden)
+          setProjects(msg.payload.projects, msg.payload.hidden, msg.payload.defaultWorkdir, msg.payload.defaultRoots, msg.payload.defaultSessionDirs)
           break
         case 'transcript':
           setTranscript(msg.payload.id, msg.payload.messages,
-            { earliest: msg.payload.earliest ?? 0, hasEarlier: !!msg.payload.hasEarlier })
+            { earliest: msg.payload.earliest ?? 0, hasEarlier: !!msg.payload.hasEarlier, queued: msg.payload.queued ?? [] })
           break
         case 'dirList':
           setDir(msg.payload.path, msg.payload.entries)
@@ -48,9 +62,18 @@ function installReceiver() {
         case 'conn':
           setConn(msg.payload)
           break
+        case 'prefs':
+          setPrefs(msg.payload)
+          break
         case 'imageReady':
           setImgReady(msg.payload)
           break
+        case 'authResult': {
+          const { reqId, ok, error, ...rest } = msg.payload || {}
+          const p = authPending.get(reqId)
+          if (p) { authPending.delete(reqId); ok ? p.resolve(rest) : p.reject(new Error(error || '请求失败')) }
+          break
+        }
         default:
           console.warn('未知推送', msg.type)
       }
@@ -67,6 +90,10 @@ export type AgentId = 'claude' | 'codex'
 
 export const cmd = {
   openProject: () => send({ action: 'openProject' }),
+  removeProject: (workdir: string) => send({ action: 'removeProject', workdir }),
+  pickDefaultWorkdir: () => send({ action: 'pickDefaultWorkdir' }),
+  addDefaultSessionDir: () => send({ action: 'addDefaultSessionDir' }),
+  removeDefaultSessionDir: (dir: string) => send({ action: 'removeDefaultSessionDir', dir }),
   newSession: (workdir: string, agent: AgentId) => send({ action: 'newSession', workdir, agent }),
   continueLast: (workdir: string, agent: AgentId) => send({ action: 'newSession', workdir, agent, continueLast: true }),
   resume: (workdir: string, id: string, agent: AgentId = 'claude') => send({ action: 'newSession', workdir, agent, resume: id }),
@@ -93,7 +120,25 @@ export const cmd = {
   loadUsage: (days: number) => send({ action: 'loadUsage', days }),
   setTheme: (dark: boolean) => send({ action: 'theme', dark }),
   setHost: (host: string) => send({ action: 'setHost', host }),
-  pairStart: () => send({ action: 'pairStart' }),
-  pairCancel: () => send({ action: 'pairCancel' }),
-  unpair: () => send({ action: 'unpair' }),
+  setLaunchAtLogin: (value: boolean) => send({ action: 'setLaunchAtLogin', value }),
+  setMute: (value: boolean) => send({ action: 'setMute', value }),
+  logout: () => send({ action: 'logout' }),
+}
+
+// 账号登录:调用走桥接(原生帮发请求,和会话/项目同一套),结果经 authResult push await 回来。
+// 流程与手机端一致:邮箱 → check 分流 → 密码 / 验证码 / 注册;另有忘记密码。
+export const auth = {
+  check: (account: string) =>
+    authCall('checkAccount', { account }) as Promise<{ exists: boolean; hasPassword: boolean }>,
+  login: (account: string, password: string) =>
+    authCall('login', { account, password }) as Promise<{ account: string }>,
+  sendCode: (account: string) => authCall('sendCode', { account }) as Promise<{}>,
+  loginWithCode: (account: string, code: string) =>
+    authCall('loginWithCode', { account, code }) as Promise<{ account: string }>,
+  sendRegisterCode: (account: string) => authCall('sendRegisterCode', { account }) as Promise<{}>,
+  register: (account: string, code: string, password: string) =>
+    authCall('register', { account, code, password }) as Promise<{ account: string }>,
+  sendForgotCode: (account: string) => authCall('sendForgotCode', { account }) as Promise<{}>,
+  resetPassword: (account: string, code: string, password: string) =>
+    authCall('resetPassword', { account, code, password }) as Promise<{}>,
 }

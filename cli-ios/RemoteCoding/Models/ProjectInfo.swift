@@ -7,6 +7,7 @@ struct ProjectInfo: Identifiable, Hashable {
     let workdir: String          // 工作目录(项目唯一键)
     let name: String             // 目录末段,做标题
     let history: [ProjectHistory]   // 该项目可恢复的历史会话(新→旧)
+    var isDefault: Bool = false  // 默认工作目录文件夹:置顶 + 蓝标,收纳归属目录下的散会话
 }
 
 /// 项目下一条可恢复的历史会话(--resume 用)。

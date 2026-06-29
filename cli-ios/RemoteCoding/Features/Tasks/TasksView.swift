@@ -45,7 +45,8 @@ struct TasksView: View {
                         if relay.projects.isEmpty && singleTasks.isEmpty {
                             emptyState
                         } else {
-                            ForEach(relay.projects) { proj in
+                            // 默认工作目录文件夹置顶,其它项目随后
+                            ForEach(relay.projects.filter { $0.isDefault } + relay.projects.filter { !$0.isDefault }) { proj in
                                 NavigationLink(value: ProjectRoute(workdir: proj.workdir)) {
                                     ProjectRow(project: proj,
                                                sessions: relay.sessions.filter { relay.project(forCwd: $0.cwd)?.workdir == proj.workdir })
@@ -110,8 +111,8 @@ struct TasksView: View {
         case .connected:    return agentOnline ? "已连接 · 电脑在线" : "已连接中转 · 等待电脑"
         case .connecting:   return "连接中…"
         case .reconnecting: return "重连中…"
-        case .failed:       return "连接失败"
-        case .disconnected: return "未连接"
+        case .failed:       return "网络异常"
+        case .disconnected: return "网络异常"
         }
     }
 

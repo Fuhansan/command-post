@@ -5,12 +5,12 @@ import { marked } from 'marked'
 import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
-  BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff,
+  BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff, Trash2,
   Activity, DollarSign, Boxes, Database, GitBranch, MessageSquare, Clipboard, Code2,
 } from 'lucide-react'
-import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn, getImgUpload } from './store'
-import { cmd, type AgentId } from './bridge'
-import type { Session, Msg, Manual, History, Project, Entry, UsageData, MsgImage } from './types'
+import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn, getPrefs, getImgUpload } from './store'
+import { cmd, auth, type AgentId } from './bridge'
+import type { Session, Msg, Manual, History, Project, Entry, UsageData, MsgImage, Pending } from './types'
 import { mockGit, PROVIDERS } from './mock'
 import type { GitStatus } from './mock'
 
@@ -31,6 +31,7 @@ function useDirs() { return useSyncExternalStore(subscribe, getDirs, getDirs) }
 function useFiles() { return useSyncExternalStore(subscribe, getFiles, getFiles) }
 function useUsage() { return useSyncExternalStore(subscribe, getUsage, getUsage) }
 function useConn() { return useSyncExternalStore(subscribe, getConn, getConn) }
+function usePrefs() { return useSyncExternalStore(subscribe, getPrefs, getPrefs) }
 
 // ===== 状态 → 圆点 + 文案 =====
 type DotMeta = { text: string; color: string; pulse?: boolean; hollow?: boolean }
@@ -131,84 +132,271 @@ function UserImages({ images }: { images: MsgImage[] }) {
   )
 }
 
-// ===== 消息渲染 =====
-function MessageRowImpl({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
-  if (m.kind === 'text' && m.role === 'user') {
-    return (
-      <div className="flex flex-col items-end gap-1.5">
-        {m.images && m.images.length > 0 && <UserImages images={m.images} />}
-        {m.text && (
-          <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg"
-            style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{m.text}</div>
-        )}
-      </div>
-    )
+// ===== 消息渲染:助手回合 = 思考文本 + 动作时间线(读取/编辑/新建/命令)=====
+// verb / 配色 / 节点(对齐设计稿 opMeta）
+type OpKindT = 'read' | 'edit' | 'write' | 'bash' | 'other'
+const OP_META: Record<OpKindT, { label: string; c: string; bg: string; node: string; icon: string }> = {
+  read: { label: '读取', c: 'var(--text-dim)', bg: 'var(--bg-sunken)', node: 'var(--bg-sunken)', icon: 'var(--text-dim)' },
+  edit: { label: '编辑', c: 'var(--amber)', bg: 'color-mix(in srgb,var(--amber) 15%,transparent)', node: 'color-mix(in srgb,var(--amber) 15%,transparent)', icon: 'var(--amber)' },
+  write: { label: '新建', c: 'var(--green)', bg: 'color-mix(in srgb,var(--green) 15%,transparent)', node: 'color-mix(in srgb,var(--green) 15%,transparent)', icon: 'var(--green)' },
+  bash: { label: '命令', c: 'var(--accent)', bg: 'var(--accent-soft)', node: 'var(--term-bg)', icon: 'var(--term-green)' },
+  other: { label: '工具', c: 'var(--text-dim)', bg: 'var(--bg-sunken)', node: 'var(--bg-sunken)', icon: 'var(--text-dim)' },
+}
+// 节点图标(SVG path,对齐设计稿 TOOL_ICON)
+const TOOL_ICON: Record<OpKindT, string> = {
+  read: 'M14 3v4a1 1 0 0 0 1 1h4 M6 3h8l5 5v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z',
+  edit: 'M12 20h9 M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z',
+  write: 'M14 3v4a1 1 0 0 0 1 1h4 M6 3h8l5 5v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M12 11v6 M9 14h6',
+  bash: 'M4 17l6-6-6-6 M12 19h8',
+  other: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35',
+}
+const NAME_KIND: Record<string, OpKindT> = {
+  Read: 'read', NotebookRead: 'read', Edit: 'edit', MultiEdit: 'edit', NotebookEdit: 'edit',
+  Write: 'write', Create: 'write', Bash: 'bash', Shell: 'bash',
+}
+
+// 一条标准化动作:有 m.op 用之,否则从 m.text(旧式 "Name: arg" / 文件路径)兜底合成
+type NormOp = {
+  kind: OpKindT; verb: string; file: string; dir: string; path: string
+  add?: number; del?: number; sameFile?: boolean; command?: string
+  diff?: { k: string; t: string }[]; output?: string[]
+}
+function opOf(m: Msg): NormOp {
+  const raw = m.kind === 'file' ? m.text
+    : m.text.includes(':') ? m.text.slice(m.text.indexOf(':') + 1).trim() : m.text
+  if (m.op) {
+    const o = m.op
+    return {
+      kind: o.kind, verb: o.label || OP_META[o.kind]?.label || '工具',
+      file: o.file || (raw.split('/').pop() || raw), dir: o.dir, path: raw,
+      add: o.add, del: o.del, sameFile: o.sameFile, command: o.command, diff: o.diff, output: o.output,
+    }
   }
-  if (m.kind === 'text') {
-    return (
-      <div className="flex gap-2.5">
-        <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0 mt-0.5" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
-        <Markdown text={m.text} />
-      </div>
-    )
+  // 兜底:kind:file(无 op,如 codex)→ 当编辑;kind:tool 旧式 "Name: arg"
+  if (m.kind === 'file') {
+    return { kind: 'edit', verb: '编辑', file: raw.split('/').pop() || raw, dir: raw.split('/').slice(-3, -1).join('/'), path: raw }
   }
-  if (m.kind === 'tool') {
-    const i = m.text.indexOf(':')
-    const name = i > 0 ? m.text.slice(0, i) : m.text
-    const arg = i > 0 ? m.text.slice(i + 1).trim() : ''
-    if (name === 'Bash') {
-      return (
-        <div className="rounded-[11px] overflow-hidden border" style={{ background: 'var(--term-bg)', borderColor: 'var(--term-border)' }}>
-          <div className="flex items-center gap-2 px-3.5 py-2.5 border-b" style={{ borderColor: 'var(--term-border)' }}>
-            <span className="w-2 h-2 rounded-full shrink-0" style={{ background: 'var(--term-green)' }} />
-            <span className="text-[12px] font-medium" style={{ color: 'var(--term-text)' }}>{name}</span>
-          </div>
-          {arg && (
-            <pre className="px-4 py-3 font-mono text-[12px] leading-[1.75] overflow-x-auto whitespace-pre-wrap break-words select-text" style={{ color: 'var(--term-text)' }}>
-              <span style={{ color: 'var(--term-dim)' }} className="select-none">$ </span>{arg}
-            </pre>
+  const name = m.text.includes(':') ? m.text.slice(0, m.text.indexOf(':')) : m.text
+  const kind = NAME_KIND[name] || 'other'
+  return {
+    kind, verb: kind === 'other' ? name : OP_META[kind].label,
+    file: kind === 'bash' ? (raw.split(' ')[0] || 'bash') : (raw.split('/').pop() || raw),
+    dir: kind === 'bash' ? '' : raw.split('/').slice(-3, -1).join('/'),
+    path: raw, command: kind === 'bash' ? raw : undefined,
+  }
+}
+
+// 时间线里一行动作:
+//  · edit → 点行展开 diff;点文件名直接跳到 Files 打开
+//  · bash → 点行展开终端(始终显示完整 $ 命令 + 输出)
+//  · read/write/other → 点行/点文件名跳到 Files 打开
+function OpRow({ op, first, last, root, onOpenFile }: { op: NormOp; first: boolean; last: boolean; root?: string; onOpenFile?: (p: string) => void }) {
+  const meta = OP_META[op.kind]
+  const isBash = op.kind === 'bash'
+  const hasDiff = op.kind === 'edit' && !!op.diff?.length
+  const expandable = hasDiff || (isBash && !!op.command)            // bash 始终可展开看全命令
+  const [open, setOpen] = useState(expandable)   // edit(改文件)/ bash 默认展开:用户要直接看改了啥 / 命令
+  // 只有「项目内的文件操作」才允许跳转打开:other(Monitor 等命令)/bash/项目外路径一律不可点
+  const inProj = !!root && !!op.path && (op.path === root || op.path.startsWith(root.endsWith('/') ? root : root + '/'))
+  const openable = (op.kind === 'read' || op.kind === 'edit' || op.kind === 'write') && !!op.path && !!onOpenFile && inProj
+  // 点整行:可展开的(edit/bash)→ 切换展开;否则可打开 → 跳转
+  const rowClick = expandable ? () => setOpen(v => !v) : openable ? () => onOpenFile!(op.path) : undefined
+  // 文件名单独点:始终优先「打开文件」(edit 行点文件名也能直接跳转)
+  const fileClick = openable ? (e: React.MouseEvent) => { e.stopPropagation(); onOpenFile!(op.path) } : undefined
+  const action = isBash ? (open ? '收起' : '终端') : hasDiff ? (open ? '收起' : 'diff') : '打开'
+  return (
+    <div className="relative flex gap-[13px]">
+      <div className="w-[24px] flex-none flex justify-center relative">
+        <span className="absolute top-0 h-[15px] w-[1.5px]" style={{ background: first ? 'transparent' : 'var(--border-strong)' }} />
+        <span className="absolute top-[15px] bottom-0 w-[1.5px]" style={{ background: last ? 'transparent' : 'var(--border-strong)' }} />
+        <span className="absolute top-[5px] w-[21px] h-[21px] rounded-[6px] flex items-center justify-center" style={{ background: meta.node, boxShadow: '0 0 0 3px var(--bg-elev)' }}>
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={meta.icon} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            {TOOL_ICON[op.kind].split(' M').map((d, i) => <path key={i} d={i === 0 ? d : 'M' + d} />)}
+          </svg>
+        </span>
+      </div>
+      <div className="flex-1 min-w-0" style={{ paddingBottom: last ? 0 : '3px' }}>
+        <div onClick={rowClick} className="group flex items-center gap-[9px] px-[11px] py-[7px] rounded-[9px] transition-colors hover:bg-sunken min-w-0"
+          style={{ cursor: rowClick ? 'pointer' : 'default' }}>
+          <span className="text-[10.5px] font-semibold flex-none" style={{ color: meta.c, background: meta.bg, padding: '2px 7px', borderRadius: 5, letterSpacing: '.02em' }}>{op.verb}</span>
+          <span onClick={fileClick} title={fileClick ? '在 Files 里打开' : op.file}
+            className={'font-mono text-[12.5px] font-semibold text-ink truncate flex-none' + (fileClick ? ' hover:underline cursor-pointer' : '')}
+            style={{ maxWidth: op.dir || op.sameFile ? '52%' : '88%' }}>{op.file}</span>
+          {op.sameFile
+            ? <span className="text-[10.5px] text-faint flex-1 min-w-0">同一文件</span>
+            : op.dir && <span className="font-mono text-[11px] text-faint whitespace-nowrap overflow-hidden text-ellipsis min-w-0 flex-1" style={{ direction: 'rtl', textAlign: 'left' }}>{op.dir}</span>}
+          <span className="flex-1 min-w-[8px]" />
+          {op.add != null && op.add > 0 && <span className="font-mono text-[11px] flex-none" style={{ color: 'var(--green)' }}>+{op.add}</span>}
+          {op.del != null && op.del > 0 && <span className="font-mono text-[11px] flex-none" style={{ color: 'var(--red)' }}>−{op.del}</span>}
+          {(expandable || openable) && (
+            <span className="flex items-center gap-[3px] text-[11px] text-faint flex-none opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
+              {action}<ChevronRight size={12} style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .18s' }} />
+            </span>
           )}
         </div>
-      )
-    }
-    return (
-      <div className="rounded-[11px] overflow-hidden border border-line bg-elev">
-        <div className="flex items-center gap-2 px-3.5 py-2.5"><span className="text-[12.5px] font-semibold text-ink">{name}</span></div>
-        {arg && <pre className="px-4 py-2.5 font-mono text-[12px] leading-relaxed bg-sunken text-dim whitespace-pre-wrap break-words select-text border-t border-line">{arg}</pre>}
-      </div>
-    )
-  }
-  if (m.kind === 'permission') {
-    const r = m.permState
-    const tone = r == null ? 'var(--amber)' : r === 'allow' ? 'var(--green)' : 'var(--red)'
-    const label = r == null ? '需要你处理' : r === 'allow' ? '✓ 已允许' : '✕ 已拒绝'
-    return (
-      <div className="rounded-[11px] border p-3.5 animate-pop" style={{ borderColor: tone, background: 'var(--bg-elev2)' }}>
-        <div className="text-[12px] font-semibold mb-2" style={{ color: tone }}>{label}</div>
-        <pre className="font-mono text-[12px] rounded-lg p-2.5 bg-sunken text-ink whitespace-pre-wrap break-words select-text">{m.text}</pre>
-        {r == null && onRespond && (
-          <div className="mt-2.5 flex gap-2">
-            <button onClick={() => onRespond(m.permReqId ?? '', ['deny'])} className="px-3.5 py-1.5 rounded-[9px] text-[12px] border border-strong text-dim hover:bg-sunken">拒绝</button>
-            <button onClick={() => onRespond(m.permReqId ?? '', ['allow'])} className="px-4 py-1.5 rounded-[9px] text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}>允许</button>
+        {isBash && open && (
+          <div className="mt-[7px] rounded-[10px] overflow-hidden" style={{ background: 'var(--term-bg)', border: '1px solid var(--term-border)' }}>
+            <div className="px-3 py-2 flex items-start gap-2" style={{ borderBottom: op.output?.length ? '1px solid var(--term-border)' : 'none' }}>
+              <span className="font-mono text-[12px] mt-px" style={{ color: 'var(--term-green)' }}>$</span>
+              <span className="font-mono text-[11.5px] flex-1 break-all select-text" style={{ color: 'var(--term-text)' }}>{op.command}</span>
+            </div>
+            {!!op.output?.length && (
+              <div className="px-3 py-2.5 font-mono text-[11.5px] leading-[1.7] max-h-[280px] overflow-auto select-text">
+                {op.output!.map((l, i) => <div key={i} className="whitespace-pre" style={{ color: 'var(--term-text)' }}>{l}</div>)}
+              </div>
+            )}
+          </div>
+        )}
+        {hasDiff && open && (
+          <div className="mt-[7px] border border-line rounded-[10px] bg-elev font-mono text-[11.5px] leading-[1.65] max-h-[320px] overflow-auto select-text">
+            {op.diff!.map((d, i) => {
+              const st: React.CSSProperties = d.k === 'add' ? { background: 'color-mix(in srgb,var(--green) 12%,transparent)', color: 'var(--green)' }
+                : d.k === 'del' ? { background: 'color-mix(in srgb,var(--red) 12%,transparent)', color: 'var(--red)' } : { color: 'var(--text-dim)' }
+              return <div key={i} className="whitespace-pre px-3 py-[2px]" style={st}>{(d.k === 'add' ? '+ ' : d.k === 'del' ? '− ' : '  ') + d.t}</div>
+            })}
           </div>
         )}
       </div>
-    )
-  }
-  return null
+    </div>
+  )
 }
-// 增量推送后 DTO 会重建消息对象,引用必变 → 按字段比对,未变的消息跳过重渲染(流式时关键)。
-const MessageRow = memo(MessageRowImpl, (a, b) =>
-  a.onRespond === b.onRespond &&
-  a.m.id === b.m.id && a.m.kind === b.m.kind && a.m.role === b.m.role &&
-  a.m.text === b.m.text && a.m.permState === b.m.permState && a.m.permReqId === b.m.permReqId)
 
-function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadEarlier }: {
-  msgs: Msg[]; onRespond?: (r: string, c: string[]) => void; working?: boolean
-  animate?: boolean; hasEarlier?: boolean; onLoadEarlier?: () => void
+// 一段连续工具/文件 → 时间线(共用左侧轨道)
+const OpsTimeline = memo(function OpsTimeline({ ops, root, onOpenFile }: { ops: { id: string; op: NormOp }[]; root?: string; onOpenFile?: (p: string) => void }) {
+  return (
+    <div className="relative my-[2px]">
+      {ops.map((x, i) => <OpRow key={x.id} op={x.op} first={i === 0} last={i === ops.length - 1} root={root} onOpenFile={onOpenFile} />)}
+    </div>
+  )
+}, (a, b) => a.onOpenFile === b.onOpenFile && a.root === b.root && a.ops.length === b.ops.length &&
+  a.ops.every((x, i) => x.id === b.ops[i].id && (x.op.output?.length ?? 0) === (b.ops[i].op.output?.length ?? 0) &&
+    x.op.add === b.ops[i].op.add && x.op.del === b.ops[i].op.del))
+
+// 审批/权限卡(Bash 等就地审批)
+function PermissionCard({ m, onRespond }: { m: Msg; onRespond?: (reqId: string, choose: string[]) => void }) {
+  const r = m.permState
+  const tone = r == null ? 'var(--amber)' : r === 'allow' ? 'var(--green)' : 'var(--red)'
+  const label = r == null ? '需要你处理' : r === 'allow' ? '✓ 已允许' : '✕ 已拒绝'
+  return (
+    <div className="rounded-[11px] border p-3.5 animate-pop" style={{ borderColor: tone, background: 'var(--bg-elev2)' }}>
+      <div className="text-[12px] font-semibold mb-2" style={{ color: tone }}>{label}</div>
+      <pre className="font-mono text-[12px] rounded-lg p-2.5 bg-sunken text-ink whitespace-pre-wrap break-words select-text">{m.text}</pre>
+      {r == null && onRespond && (
+        <div className="mt-2.5 flex gap-2">
+          <button onClick={() => onRespond(m.permReqId ?? '', ['deny'])} className="px-3.5 py-1.5 rounded-[9px] text-[12px] border border-strong text-dim hover:bg-sunken">拒绝</button>
+          <button onClick={() => onRespond(m.permReqId ?? '', ['allow'])} className="px-4 py-1.5 rounded-[9px] text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}>允许</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 待办/任务编排类工具在终端里不作为动作行出现,时间线里也隐藏,避免噪音
+const HIDE_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'TaskOutput', 'TaskStop'])
+function isHiddenTool(m: Msg): boolean {
+  if (m.kind !== 'tool') return false
+  const name = m.text.includes(':') ? m.text.slice(0, m.text.indexOf(':')) : m.text
+  return HIDE_TOOLS.has(name.trim())
+}
+
+// claude 模型 id → 友好名(忠实展示实际模型):claude-3-5-sonnet-… → "Claude 3.5 Sonnet";claude-opus-4-8 → "Claude Opus 4.8"
+function prettyModelName(id?: string): string {
+  if (!id) return ''
+  const m = id.toLowerCase()
+  const fam = m.includes('opus') ? 'Opus' : m.includes('sonnet') ? 'Sonnet' : m.includes('haiku') ? 'Haiku' : ''
+  if (!fam) return id
+  const vm = m.match(/(\d+)-(\d+)/)
+  if (!vm) return `Claude ${fam}`
+  const ver = `${vm[1]}.${vm[2]}`
+  const famIdx = m.search(/opus|sonnet|haiku/)
+  const verIdx = vm.index ?? -1
+  return verIdx >= 0 && verIdx < famIdx ? `Claude ${ver} ${fam}` : `Claude ${fam} ${ver}`
+}
+// 聊天头的相对时间:刚刚 / N 分钟前 / HH:MM / M-D HH:MM(比列表的 relTime 更细)
+function chatTime(ms?: number): string {
+  if (!ms) return ''
+  const diff = Date.now() - ms
+  if (diff < 0) return ''
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  const d = new Date(ms)
+  const hh = String(d.getHours()).padStart(2, '0'), mm = String(d.getMinutes()).padStart(2, '0')
+  if (diff < 86_400_000) return `${hh}:${mm}`
+  return `${d.getMonth() + 1}-${d.getDate()} ${hh}:${mm}`
+}
+
+// 一个助手回合:头(✦+模型+时间) + 按文档顺序铺开 思考文本 / 动作时间线 / 审批卡
+function AssistantTurn({ items, model, root, onRespond, onOpenFile }: { items: Msg[]; model?: string; root?: string; onRespond?: (r: string, c: string[]) => void; onOpenFile?: (p: string) => void }) {
+  const blocks: React.ReactNode[] = []
+  let seg: { id: string; op: NormOp }[] = []
+  const flush = (key: string) => { if (seg.length) { const s = seg; blocks.push(<OpsTimeline key={'ops' + key} ops={s} root={root} onOpenFile={onOpenFile} />); seg = [] } }
+  for (const m of items) {
+    if (m.kind === 'text') { flush(m.id); if (m.text) blocks.push(<Markdown key={m.id} text={m.text} />) }
+    else if (m.kind === 'permission') { flush(m.id); blocks.push(<PermissionCard key={m.id} m={m} onRespond={onRespond} />) }
+    else if (!isHiddenTool(m)) seg.push({ id: m.id, op: opOf(m) })   // tool / file(隐藏待办/任务编排)
+  }
+  flush('end')
+  if (blocks.length === 0) return null   // 整回合只剩被隐藏的工具 → 不渲染空头
+  // 模型/时间:优先用该回合消息上真实记录的(转录里 jsonl 的 model + timestamp),没有再回退会话当前模型
+  const head = items.find((m) => m.model || m.ts)
+  const turnModel = head?.model || model
+  const turnTime = head?.ts
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-2">
+        <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px]" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
+        {turnModel && <span className="text-[11.5px] font-medium text-dim">{prettyModelName(turnModel)}</span>}
+        {turnTime ? <span className="text-[11px] text-faint">{chatTime(turnTime)}</span> : null}
+      </div>
+      {blocks}
+    </div>
+  )
+}
+
+// 待处理请求(审批 / 多选 / 计划确认)——之前桌面 web 没渲染,只到手机。点选项即应答。
+function PendingCard({ p, onRespond }: { p: Pending; onRespond?: (reqId: string, choose: string[]) => void }) {
+  return (
+    <div className="rounded-[11px] border p-3.5 animate-pop" style={{ borderColor: 'var(--amber)', background: 'var(--bg-elev2)' }}>
+      <div className="flex items-center gap-2 mb-2">
+        <span className="w-2 h-2 rounded-full" style={{ background: 'var(--amber)' }} />
+        <span className="text-[12.5px] font-semibold" style={{ color: 'var(--amber)' }}>{p.title || '需要你处理'}</span>
+      </div>
+      {p.detail && <pre className="font-mono text-[12px] rounded-lg p-2.5 bg-sunken text-ink whitespace-pre-wrap break-words select-text mb-2.5">{p.detail}</pre>}
+      <div className="flex flex-wrap gap-2">
+        {p.options.map((o, i) => {
+          const primary = i === p.options.length - 1   // 末项一般是肯定项(允许/确认),高亮
+          return (
+            <button key={o.id} onClick={() => onRespond?.(p.id, [o.id])}
+              className={`px-3.5 py-1.5 rounded-[9px] text-[12px] font-medium transition-colors ${primary ? 'text-accentfg hover:brightness-110' : 'border border-strong text-dim hover:bg-sunken'}`}
+              style={primary ? { background: 'var(--accent)' } : undefined}>
+              {o.label}
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+type Block = { type: 'user'; m: Msg } | { type: 'system'; m: Msg } | { type: 'assistant'; items: Msg[]; key: string }
+const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, working, model, root, animate = true, hasEarlier, onLoadEarlier }: {
+  msgs: Msg[]; pending?: Pending[]; onRespond?: (r: string, c: string[]) => void; onOpenFile?: (path: string) => void; working?: boolean
+  model?: string; root?: string; animate?: boolean; hasEarlier?: boolean; onLoadEarlier?: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
+  // 按助手回合分组:user/system 独立成块;连续助手消息(文本/工具/文件/审批)并成一个回合
+  const blocks = useMemo(() => {
+    const out: Block[] = []
+    for (const m of ordered) {
+      if (m.kind === 'text' && m.role === 'user') { out.push({ type: 'user', m }); continue }
+      if (m.role === 'system') { out.push({ type: 'system', m }); continue }
+      const last = out[out.length - 1]
+      if (last && last.type === 'assistant') last.items.push(m)
+      else out.push({ type: 'assistant', items: [m], key: m.id })
+    }
+    return out
+  }, [ordered])
   const prevFirst = useRef<number | undefined>(undefined)
   const prevH = useRef(0)
   const [loading, setLoading] = useState(false)
@@ -222,7 +410,7 @@ function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadE
       el.scrollTop = el.scrollHeight
     prevFirst.current = firstOrd
     prevH.current = el.scrollHeight
-  }, [ordered, working])
+  }, [ordered, working, pending?.length])
   useEffect(() => { setLoading(false) }, [ordered.length, hasEarlier])
   return (
     <div ref={ref} className="flex-1 overflow-y-auto overflow-x-hidden">
@@ -235,7 +423,23 @@ function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadE
             </button>
           </div>
         )}
-        {ordered.map((m) => <div key={m.id} className={animate ? 'animate-msg' : undefined}><MessageRow m={m} onRespond={onRespond} /></div>)}
+        {blocks.map((b) => b.type === 'user' ? (
+          <div key={b.m.id} className={animate ? 'animate-msg' : undefined}>
+            <div className="flex flex-col items-end gap-1.5">
+              {b.m.images && b.m.images.length > 0 && <UserImages images={b.m.images} />}
+              {b.m.text && <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg" style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{b.m.text}</div>}
+            </div>
+          </div>
+        ) : b.type === 'system' ? (
+          <div key={b.m.id} className={animate ? 'animate-msg' : undefined}>
+            <div className="text-[12.5px] text-dim bg-sunken rounded-[11px] px-3.5 py-2.5 whitespace-pre-wrap break-words select-text">{b.m.text}</div>
+          </div>
+        ) : (
+          <div key={b.key} className={animate ? 'animate-msg' : undefined}>
+            <AssistantTurn items={b.items} model={model} root={root} onRespond={onRespond} onOpenFile={onOpenFile} />
+          </div>
+        ))}
+        {pending?.map((p) => <div key={p.id} className="animate-msg"><PendingCard p={p} onRespond={onRespond} /></div>)}
         {working && (
           <div className="flex gap-2.5 animate-msg">
             <div className="w-[22px] h-[22px] rounded-[7px] flex items-center justify-center text-[12px] shrink-0" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>✦</div>
@@ -249,7 +453,10 @@ function MsgList({ msgs, onRespond, working, animate = true, hasEarlier, onLoadE
       </div>
     </div>
   )
-}
+}, (a, b) =>
+  // 只比数据,忽略每次渲染都新建的回调:数据没变就不重渲染(背景会话在跑时不拖累当前列表)。
+  a.msgs === b.msgs && a.pending === b.pending && a.working === b.working &&
+  a.model === b.model && a.root === b.root && a.animate === b.animate && a.hasEarlier === b.hasEarlier)
 
 function IconBtn({ title, onClick, children }: { title: string; onClick?: () => void; children: React.ReactNode }) {
   return (
@@ -390,7 +597,7 @@ function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
 }
 
 // ===== 输入框(带附件)=====
-function Composer({ sid, agent, model, models, working, attachments, setAttachments, onSend }: {
+const Composer = memo(function Composer({ sid, agent, model, models, working, attachments, setAttachments, onSend }: {
   sid: string; agent?: string; model?: string; models?: ModelOpt[]; working?: boolean; attachments: Attach[]; setAttachments: SetAttach
   onSend: (t: string, images?: Array<{ name?: string; data?: string; id?: string; ext?: string }>) => void
 }) {
@@ -508,7 +715,10 @@ function Composer({ sid, agent, model, models, working, attachments, setAttachme
       </div>
     </div>
   )
-}
+}, (a, b) =>
+  // 只比会变的数据;onSend 每次渲染新建、setAttachments 是稳定 setter → 忽略。
+  // 这样运行中会话的高频 store 更新不再重渲染输入框,打字不卡。
+  a.sid === b.sid && a.model === b.model && a.models === b.models && a.working === b.working && a.attachments === b.attachments)
 
 // ===== 工作区顶部三段切换:会话 / Git Tree / 文件 =====
 function TriToggle({ navMode, viewMode, onConv, onGit, onFiles }: {
@@ -533,29 +743,19 @@ function TriToggle({ navMode, viewMode, onConv, onGit, onFiles }: {
 }
 
 // ===== 会话工作区头(标题 + 状态 + 三段切换 + 重命名/隐藏/结束)=====
-type BarSession = { title: string; meta: DotMeta; model?: string; sub?: string; renameKey?: string }
+type BarSession = { title: string; meta: DotMeta; model?: string; sub?: string; renameKey?: string; manualId?: string }
 // 常驻工作区顶栏(像任务栏一直存在):左=会话信息(无会话时留空,可拖动窗口),中=三段切换,右=操作
 function WorkBar({ session, tri, right }: {
   session?: BarSession | null; tri: React.ReactNode; right?: React.ReactNode
 }) {
-  const [menu, setMenu] = useState(false)
-  const [editing, setEditing] = useState(false)
-  const [val, setVal] = useState(session?.title ?? '')
-  useEffect(() => { if (!editing) setVal(session?.title ?? '') }, [session?.title, editing])
-  const renameKey = session?.renameKey
-  const commit = () => { setEditing(false); if (renameKey) cmd.renameSession(renameKey, val.trim()) }
   return (
-    // 通栏会话头(对齐设计稿 line 205):标题左、三段切换中右、操作右,底部边线。
+    // 通栏会话头:标题左、三段切换中右、操作右,底部边线。重命名/隐藏/结束已挪到左侧会话列表
+    //(双击改名、右键菜单、标签 ×),WorkBar 不再放「...」菜单与结束 X。
     <div className="flex-none flex items-center gap-3 px-5 py-[13px] border-b border-line">
-      {/* 左:标题 + 状态(纯文本) */}
+      {/* 左:标题 + 状态(纯展示) */}
       <div className="flex-1 min-w-0">
         {session && (<>
-          {editing
-            ? <input autoFocus value={val} onChange={(e) => setVal(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commit() } else if (e.key === 'Escape') setEditing(false) }}
-                onBlur={commit} placeholder="会话名…(留空恢复默认)"
-                className="w-full text-[15px] font-semibold text-ink bg-transparent outline-none border-b border-strong pb-0.5 select-text placeholder:text-faint placeholder:font-normal" />
-            : <div className="text-[15px] font-semibold text-ink truncate leading-tight">{session.title || '会话'}</div>}
+          <div className="text-[15px] font-semibold text-ink truncate leading-tight">{session.title || '会话'}</div>
           <div className="flex items-center gap-2 mt-1">
             <Dot meta={session.meta} size={7} />
             <span className="text-[11.5px] text-dim whitespace-nowrap">{session.meta.text}</span>
@@ -564,26 +764,10 @@ function WorkBar({ session, tri, right }: {
           </div>
         </>)}
       </div>
-      {/* 中:三段切换(264px seg,无白盒) */}
+      {/* 中:三段切换 */}
       <div className="shrink-0">{tri}</div>
-      {/* 右:操作(更多菜单 + barRight) */}
-      <div className="flex items-center gap-1 shrink-0">
-        {renameKey && (
-          <div className="relative">
-            <IconBtn title="更多" onClick={() => setMenu((o) => !o)}><MoreHorizontal size={16} /></IconBtn>
-            {menu && (
-              <>
-                <div className="fixed inset-0 z-30" onClick={() => setMenu(false)} />
-                <div className="absolute right-0 mt-1.5 z-40 w-32 p-1.5 rounded-[11px] bg-elev border border-strong shadow-pop animate-pop">
-                  <button onClick={() => { setMenu(false); setVal(session?.title ?? ''); setEditing(true) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-ink rounded-lg hover:bg-sunken"><Pencil size={13} />重命名</button>
-                  <button onClick={() => { setMenu(false); cmd.hideSession(renameKey) }} className="w-full flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] rounded-lg hover:bg-sunken" style={{ color: 'var(--red)' }}><EyeOff size={13} />隐藏</button>
-                </div>
-              </>
-            )}
-          </div>
-        )}
-        {right}
-      </div>
+      {/* 右:操作(唤起 / Resume 等,在 barRight 里) */}
+      <div className="flex items-center gap-1 shrink-0">{right}</div>
     </div>
   )
 }
@@ -657,8 +841,9 @@ function FilesViewer({ path, onClose, onAddSel }: {
 }
 
 // ===== 文件模式(文件树 + 预览)=====
-function FilesMode({ project, openFile, setOpenFile, onAddSel, onAddFile }: {
-  project: Project; openFile: string | null; setOpenFile: (p: string | null) => void
+function FilesMode({ project, openFile, fileTabs, onPickFile, onCloseFile, onAddSel, onAddFile }: {
+  project: Project; openFile: string | null; fileTabs: string[]
+  onPickFile: (p: string) => void; onCloseFile: (p: string) => void
   onAddSel?: (start: number, end: number, snippet: string, file: string, lang: string) => void
   onAddFile?: (path: string) => void
 }) {
@@ -676,12 +861,29 @@ function FilesMode({ project, openFile, setOpenFile, onAddSel, onAddFile }: {
           {onAddFile && <div className="text-[10.5px] text-faint px-1 pt-2">右键 / ⌘+点击 文件可放入输入框</div>}
         </div>
         <div className="flex-1 overflow-auto px-2 pb-3">
-          <FileTree root={project.workdir} active={openFile} openFile={setOpenFile} onAddFile={onAddFile} />
+          <FileTree root={project.workdir} active={openFile} openFile={onPickFile} onAddFile={onAddFile} />
         </div>
       </div>
       <div className="flex-1 min-w-0 flex flex-col min-h-0">
+        {/* 文件多标签:打开过的文件像会话一样排开,可切换/关闭 */}
+        {fileTabs.length > 0 && (
+          <div className="flex-none flex items-stretch gap-1 px-2 pt-1.5 overflow-x-auto bg-elev border-b border-line">
+            {fileTabs.map((f) => {
+              const on = f === openFile
+              return (
+                <div key={f} onClick={() => onPickFile(f)} title={f}
+                  className="group flex items-center gap-1.5 pl-2.5 pr-1 py-1.5 rounded-t-[8px] cursor-pointer max-w-[180px] shrink-0 border-b-2 transition-colors"
+                  style={on ? { borderColor: 'var(--accent)', background: 'var(--bg)' } : { borderColor: 'transparent' }}>
+                  <FileText size={12} className="shrink-0 text-faint" />
+                  <span className="font-mono text-[12px] truncate" style={{ color: on ? 'var(--text)' : 'var(--text-dim)' }}>{f.split('/').pop()}</span>
+                  <button onClick={(e) => { e.stopPropagation(); onCloseFile(f) }} title="关闭" className="shrink-0 opacity-0 group-hover:opacity-100 text-faint hover:text-ink rounded p-0.5"><X size={11} /></button>
+                </div>
+              )
+            })}
+          </div>
+        )}
         {openFile
-          ? <FilesViewer path={openFile} onClose={() => setOpenFile(null)} onAddSel={onAddSel} />
+          ? <FilesViewer path={openFile} onClose={() => onCloseFile(openFile)} onAddSel={onAddSel} />
           : <div className="flex-1 flex flex-col items-center justify-center text-faint gap-3 bg-elev"><FileText size={22} /><div className="text-[13px]">从左侧选择文件预览</div></div>}
       </div>
     </div>
@@ -689,13 +891,14 @@ function FilesMode({ project, openFile, setOpenFile, onAddSel, onAddFile }: {
 }
 
 // 工作区身体:文件模式 → 文件树+预览(可加文件/选中代码);否则渲染传入对话
-function WorkBody({ viewMode, project, openFile, setOpenFile, onAddSel, onAddFile, chat }: {
-  viewMode: 'chat' | 'files'; project: Project | null; openFile: string | null; setOpenFile: (p: string | null) => void
+function WorkBody({ viewMode, project, openFile, fileTabs, onPickFile, onCloseFile, onAddSel, onAddFile, chat }: {
+  viewMode: 'chat' | 'files'; project: Project | null; openFile: string | null; fileTabs: string[]
+  onPickFile: (p: string) => void; onCloseFile: (p: string) => void
   onAddSel?: (start: number, end: number, snippet: string, file: string, lang: string) => void
   onAddFile?: (path: string) => void; chat: React.ReactNode
 }) {
   if (viewMode === 'files') {
-    if (project) return <FilesMode project={project} openFile={openFile} setOpenFile={setOpenFile} onAddSel={onAddSel} onAddFile={onAddFile} />
+    if (project) return <FilesMode project={project} openFile={openFile} fileTabs={fileTabs} onPickFile={onPickFile} onCloseFile={onCloseFile} onAddSel={onAddSel} onAddFile={onAddFile} />
     return <div className="flex-1 flex items-center justify-center text-faint text-[13px]">没有可浏览的项目目录</div>
   }
   return <>{chat}</>
@@ -909,69 +1112,130 @@ function gitDot(status: GitStatus): DotMeta {
   return { text: '已完成', color: 'var(--text-faint)', hollow: true }
 }
 
-type RowItem = { key: string; sel: Sel; title: string; meta: DotMeta; model: string; time: string; running: boolean }
+type RowItem = { key: string; sel: Sel; title: string; meta: DotMeta; model: string; time: string; running: boolean; path?: string; ts: number; renameKey?: string }
 type Group = { p: Project; rows: RowItem[]; running: number; gitDirty: number }
 const selEq = (a: Sel, b: Sel) => !!a && !!b && a.kind === b.kind && a.id === b.id
 
-// ===== 左列:项目文件夹分组的会话列表(默认折叠 + 可拖拽排序)=====
-function SessionsNav({ groups, sel, activeWd, expanded, toggle, pick, onReorder }: {
-  groups: Group[]; sel: Sel; activeWd: string | null
+// 单条会话行(默认目录平铺 + 项目文件夹内 复用)。showPath:散会话标完整路径(左侧省略、末级目录必显)区分。
+const SessionRow = memo(function SessionRow({ r, on, showPath, onClick }: { r: RowItem; on: boolean; showPath?: boolean; onClick: () => void }) {
+  const [editing, setEditing] = useState(false)
+  const [val, setVal] = useState(r.title)
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  useEffect(() => { if (!editing) setVal(r.title) }, [r.title, editing])
+  const commitRename = () => { setEditing(false); if (r.renameKey) cmd.renameSession(r.renameKey, val.trim()) }
+  const isConsole = r.sel?.kind === 'session'
+  const startRename = () => { setMenu(null); setVal(r.title); setEditing(true) }
+  const doDelete = () => {
+    setMenu(null)
+    if (isConsole) { cmd.closeSession(r.sel!.id); if (r.renameKey) cmd.hideSession(r.renameKey) }  // 结束进程 + 隐藏结果历史 = 一步彻底删除
+    else if (r.renameKey) cmd.hideSession(r.renameKey)  // 手动/历史:从列表隐藏(转录不删)
+  }
+  return (
+    <div onClick={editing ? undefined : onClick} onDoubleClick={() => { setVal(r.title); setEditing(true) }}
+      onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY }) }}
+      className="group relative w-full text-left flex gap-2.5 rounded-[9px] px-2.5 py-2 transition-colors hover:bg-sunken cursor-pointer"
+      style={on ? { background: 'var(--accent-soft)' } : undefined}>
+      <span className="mt-[5px]"><Dot meta={r.meta} /></span>
+      <div className="min-w-0 flex-1">
+        {editing
+          ? <input autoFocus value={val} onClick={(e) => e.stopPropagation()} onChange={(e) => setVal(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitRename() } else if (e.key === 'Escape') setEditing(false) }}
+              onBlur={commitRename} placeholder="会话名…(留空恢复默认)"
+              className="w-full bg-sunken border border-strong rounded-md px-1.5 py-0.5 text-[13px] text-ink outline-none" />
+          : <div className="font-medium text-[13px] text-ink truncate">{r.title || '新会话'}</div>}
+        {showPath && r.path && (
+          <div className="font-mono text-[10px] text-faint truncate mt-0.5" style={{ direction: 'rtl', textAlign: 'left' }} title={r.path}>{r.path}</div>
+        )}
+        <div className="mt-1 flex items-center gap-[7px]">
+          <span className="text-[10.5px] font-medium shrink-0" style={{ color: r.meta.color }}>{r.meta.text}</span>
+          <span className="text-[10.5px] text-faint shrink-0">·</span>
+          <span className="font-mono text-[10.5px] text-faint truncate flex-1 min-w-0">{r.model}</span>
+          <span className="text-[10.5px] text-faint shrink-0">{r.time}</span>
+        </div>
+      </div>
+      {menu && createPortal(
+        <>
+          <div className="fixed inset-0 z-[60]" onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }} />
+          <div className="fixed z-[61] min-w-[156px] p-1 rounded-[10px] bg-elev border border-line shadow-pop animate-pop" style={{ left: menu.x, top: menu.y }}>
+            <button onClick={startRename} className="w-full flex items-center gap-2.5 px-2.5 py-[7px] text-[12.5px] text-ink rounded-md hover:bg-sunken transition-colors">
+              <Pencil size={14} className="text-dim shrink-0" />重命名
+            </button>
+            <div className="my-1 h-px bg-line" />
+            <button onClick={doDelete} className="w-full flex items-center gap-2.5 px-2.5 py-[7px] text-[12.5px] rounded-md hover:bg-sunken transition-colors" style={{ color: 'var(--red)' }}>
+              {isConsole ? <Trash2 size={14} className="shrink-0" /> : <EyeOff size={14} className="shrink-0" />}
+              {isConsole ? '删除会话' : '从列表隐藏'}
+            </button>
+          </div>
+        </>, document.body)}
+    </div>
+  )
+}, (a, b) =>
+  // 只比展示字段;onClick 每次渲染新建但行为相同 → 忽略。运行中会话每 token 更新 state.sessions
+  // 时,标题/状态/时间没变的行直接跳过,会话列表不再整列重渲染。
+  a.on === b.on && a.showPath === b.showPath &&
+  a.r.key === b.r.key && a.r.title === b.r.title && a.r.time === b.r.time && a.r.model === b.r.model &&
+  a.r.meta.text === b.r.meta.text && a.r.meta.color === b.r.meta.color && a.r.renameKey === b.r.renameKey)
+
+// ===== 左列:默认目录(workplace)文件夹置顶+默认展开,散会话归入并标路径;其它项目文件夹可移除 =====
+function SessionsNav({ groups, sel, activeWd, defaultWd, expanded, toggle, pick, onReorder, onRemove }: {
+  groups: Group[]; sel: Sel; activeWd: string | null; defaultWd?: string
   expanded: Set<string>; toggle: (wd: string) => void; pick: (s: Sel, wd: string) => void
-  onReorder: (fromWd: string, toWd: string) => void
+  onReorder: (fromWd: string, toWd: string) => void; onRemove: (wd: string) => void
 }) {
   const [dragWd, setDragWd] = useState<string | null>(null)
   const [overWd, setOverWd] = useState<string | null>(null)
+  const PAGE = 20
+  const [limits, setLimits] = useState<Record<string, number>>({})   // 每个文件夹已展示条数(分页懒加载)
+  const defaultGroup = defaultWd ? groups.find((g) => g.p.workdir === defaultWd) : undefined
+  const others = groups.filter((g) => g.p.workdir !== defaultWd)
+  const ordered = defaultGroup ? [defaultGroup, ...others] : others   // 默认文件夹永远置顶
   return (
     <div className="flex-1 flex flex-col min-h-0">
       <div className="flex-1 overflow-y-auto px-2 pt-2.5 pb-3">
-        {groups.map((g) => {
-          const open = expanded.has(g.p.workdir)
+        {ordered.map((g) => {
+          const isDefault = !!defaultGroup && g.p.workdir === defaultGroup.p.workdir
+          const open = expanded.has(g.p.workdir)   // 全部默认折叠(会话多时不一次性铺开)
           const active = g.p.workdir === activeWd
           const isOver = overWd === g.p.workdir && dragWd !== g.p.workdir
+          const shown = limits[g.p.workdir] ?? (isDefault ? 5 : PAGE)   // 默认文件夹会话多,先只显示 5 条
+          const visibleRows = g.rows.slice(0, shown)
+          const moreCount = g.rows.length - visibleRows.length
           return (
             <div key={g.p.workdir}
-              onDragOver={(e) => { if (dragWd) { e.preventDefault(); setOverWd(g.p.workdir) } }}
-              onDrop={(e) => { e.preventDefault(); if (dragWd && dragWd !== g.p.workdir) onReorder(dragWd, g.p.workdir); setDragWd(null); setOverWd(null) }}
+              onDragOver={isDefault ? undefined : (e) => { if (dragWd) { e.preventDefault(); setOverWd(g.p.workdir) } }}
+              onDrop={isDefault ? undefined : (e) => { e.preventDefault(); if (dragWd && dragWd !== g.p.workdir) onReorder(dragWd, g.p.workdir); setDragWd(null); setOverWd(null) }}
               style={isOver ? { boxShadow: 'inset 0 2px 0 var(--accent)' } : undefined}>
-              {/* 项目头:圆角粘性卡 + 底部 1px 发丝线(= 每个项目下面的线),对齐设计稿 */}
-              <div draggable onDragStart={() => setDragWd(g.p.workdir)} onDragEnd={() => { setDragWd(null); setOverWd(null) }}
-                onClick={() => toggle(g.p.workdir)}
-                className="sticky top-0 z-[3] flex items-center gap-[9px] px-2 py-[7px] mt-[10px] mb-1.5 rounded-[9px] cursor-pointer select-none bg-elev hover:bg-sunken transition-colors"
-                style={{ boxShadow: '0 1px 0 var(--border)', opacity: dragWd === g.p.workdir ? 0.5 : 1 }}>
-                <span className="w-[22px] h-[22px] rounded-[6px] flex items-center justify-center shrink-0 transition-colors" style={active ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : { background: 'var(--bg-sunken)', color: 'var(--text-dim)' }}><Folder size={13} /></span>
-                <span className="flex-1 min-w-0 font-semibold text-[12px] truncate text-left" style={{ color: active ? 'var(--text)' : 'var(--text-dim)' }}>{g.p.name}</span>
-                {g.running > 0 && <span title="进行中会话" className="inline-flex items-center gap-1 text-[10.5px] font-mono shrink-0" style={{ color: 'var(--green)' }}><span className="w-1.5 h-1.5 rounded-full dot-live" style={{ background: 'var(--green)' }} />{g.running}</span>}
-                {g.gitDirty > 0 && <span title="未提交更改" className="inline-flex items-center gap-1 text-[10.5px] font-mono text-faint shrink-0"><GitBranch size={10} />{g.gitDirty}</span>}
-                <ChevronRight size={13} strokeWidth={2.2} className="text-faint shrink-0 transition-transform" style={{ transform: open ? 'rotate(90deg)' : 'none' }} />
+              {/* 外层 sticky 套不透明 bg-elev:盖住 mt 间隙,滚动时会话不再从头顶冒出 */}
+              <div className="sticky top-0 z-[3] bg-elev">
+                <div draggable={!isDefault} onDragStart={isDefault ? undefined : () => setDragWd(g.p.workdir)} onDragEnd={() => { setDragWd(null); setOverWd(null) }}
+                  onClick={() => toggle(g.p.workdir)}
+                  className="group flex items-center gap-[9px] px-2 py-[7px] mt-[10px] mb-1.5 rounded-[9px] cursor-pointer select-none hover:bg-sunken transition-colors"
+                  style={{ boxShadow: '0 1px 0 var(--border)', opacity: dragWd === g.p.workdir ? 0.5 : 1 }}>
+                  <span className="w-[22px] h-[22px] rounded-[6px] flex items-center justify-center shrink-0 transition-colors" style={(isDefault || active) ? { background: 'var(--accent-soft)', color: 'var(--accent)' } : { background: 'var(--bg-sunken)', color: 'var(--text-dim)' }}>{isDefault ? <Boxes size={13} /> : <Folder size={13} />}</span>
+                  <span className="flex-1 min-w-0 font-semibold text-[12px] truncate text-left" style={{ color: isDefault ? 'var(--accent)' : active ? 'var(--text)' : 'var(--text-dim)' }}>{g.p.name || (isDefault ? 'workplace' : '')}</span>
+                  {isDefault && <span className="text-[9.5px] font-semibold shrink-0 px-1.5 py-0.5 rounded" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>默认</span>}
+                  {g.rows.length > 0 && <span className="text-[10.5px] font-mono text-faint shrink-0">{g.rows.length}</span>}
+                  {g.running > 0 && <span title="进行中会话" className="inline-flex items-center gap-1 text-[10.5px] font-mono shrink-0" style={{ color: 'var(--green)' }}><span className="w-1.5 h-1.5 rounded-full dot-live" style={{ background: 'var(--green)' }} />{g.running}</span>}
+                  {!isDefault && <button onClick={(e) => { e.stopPropagation(); onRemove(g.p.workdir) }} title="从项目栏移除(不动磁盘文件、不结束会话)"
+                    className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 text-faint hover:text-[var(--red)] p-0.5 rounded"><X size={13} /></button>}
+                  <ChevronRight size={13} strokeWidth={2.2} className="text-faint shrink-0 transition-transform" style={{ transform: open ? 'rotate(90deg)' : 'none' }} />
+                </div>
               </div>
               {open && (
                 <div className="pb-1.5" style={{ marginLeft: 19, marginBottom: 8, paddingLeft: 13, borderLeft: `2px solid ${active ? 'var(--accent-soft)' : 'var(--border-strong)'}` }}>
-                  {g.rows.map((r) => {
-                    const on = selEq(r.sel, sel)
-                    return (
-                      <button key={r.key} onClick={() => pick(r.sel, g.p.workdir)}
-                        className="w-full text-left flex gap-2.5 rounded-[9px] px-2.5 py-2 transition-colors hover:bg-sunken" style={on ? { background: 'var(--accent-soft)' } : undefined}>
-                        <span className="mt-[5px]"><Dot meta={r.meta} /></span>
-                        <div className="min-w-0 flex-1">
-                          <div className="font-medium text-[13px] text-ink truncate">{r.title || '新会话'}</div>
-                          <div className="mt-1 flex items-center gap-[7px]">
-                            <span className="text-[10.5px] font-medium shrink-0" style={{ color: r.meta.color }}>{r.meta.text}</span>
-                            <span className="text-[10.5px] text-faint shrink-0">·</span>
-                            <span className="font-mono text-[10.5px] text-faint truncate flex-1 min-w-0">{r.model}</span>
-                            <span className="text-[10.5px] text-faint shrink-0">{r.time}</span>
-                          </div>
-                        </div>
-                      </button>
-                    )
-                  })}
-                  {g.rows.length === 0 && <div className="text-[11px] text-faint px-2.5 py-1.5">还没有会话</div>}
+                  {visibleRows.map((r) => <SessionRow key={r.key} r={r} on={selEq(r.sel, sel)} showPath={isDefault} onClick={() => pick(r.sel, g.p.workdir)} />)}
+                  {moreCount > 0 && (
+                    <button onClick={() => setLimits((m) => ({ ...m, [g.p.workdir]: shown + 30 }))}
+                      className="w-full text-left text-[11.5px] text-dim hover:text-accent px-2.5 py-1.5 rounded-[9px] hover:bg-sunken transition-colors">显示更多 · 还有 {moreCount} 条</button>
+                  )}
+                  {g.rows.length === 0 && <div className="text-[11px] text-faint px-2.5 py-1.5">{isDefault ? '还没有散会话;新建、或在别处启动的会话会归到这里' : '还没有会话'}</div>}
                   <AgentActionMenu workdir={g.p.workdir} label="新建会话" compact align="left" />
                 </div>
               )}
             </div>
           )
         })}
-        {groups.length === 0 && <div className="text-[12px] text-dim px-2 py-3">还没有项目,点下方「添加项目」打开一个目录。</div>}
+        {ordered.length === 0 && <div className="text-[12px] text-dim px-2 py-3">还没有项目,点下方「添加项目」打开一个目录。</div>}
       </div>
       <div className="flex-none p-2.5 border-t border-line">
         <button onClick={() => cmd.openProject()} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-[9px] text-[12.5px] font-medium text-dim border border-dashed border-strong hover:bg-sunken hover:text-accent hover:border-accent transition-colors">
@@ -1058,10 +1322,28 @@ function ConsolePage() {
   const tmeta = useTranscriptMeta()
   const [selectedProject, setSelectedProject] = useState<string | null>(() => localStorage.getItem('console.project'))
   const [sel, setSel] = useState<Sel>(null)
-  const [openFile, setOpenFile] = useState<string | null>(() => localStorage.getItem('console.file'))
+  const [openTabs, setOpenTabs] = useState<NonNullable<Sel>[]>([])   // 已打开会话(右侧多标签)
+  // 控制台会话内部 id → claude session_id 映射;会话被终端抢占消失后,用它把选中/标签翻牌到同 id 的终端会话。
+  const sidToAid = useRef<Map<string, string>>(new Map())
+  // 文件视图按会话记忆:每个会话各自的「打开的文件标签 / 当前文件 / chat-files 视图」——切走再切回不丢
+  const [filesBySession, setFilesBySession] = useState<Record<string, string[]>>({})
+  const [activeFileBySession, setActiveFileBySession] = useState<Record<string, string | null>>({})
+  const [viewBySession, setViewBySession] = useState<Record<string, 'chat' | 'files'>>({})
   const [navMode, setNavMode] = useState<'sessions' | 'gittree'>(() => (localStorage.getItem('console.navMode') as 'sessions' | 'gittree') || 'sessions')
-  const [viewMode, setViewMode] = useState<'chat' | 'files'>('chat')
   const [attachments, setAttachments] = useState<Attach[]>([])
+  // 当前会话 key + 按会话派生的文件/视图状态
+  const sessionKey = sel ? sel.kind + ':' + sel.id : '_none'
+  const fileTabs = filesBySession[sessionKey] ?? []
+  const openFile = activeFileBySession[sessionKey] ?? null
+  const viewMode = viewBySession[sessionKey] ?? 'chat'
+  const setViewMode = (v: 'chat' | 'files') => setViewBySession((m) => ({ ...m, [sessionKey]: v }))
+  const setActiveFile = (p: string | null) => setActiveFileBySession((m) => ({ ...m, [sessionKey]: p }))
+  const closeFileTab = (p: string) => {
+    const cur = filesBySession[sessionKey] ?? []
+    const next = cur.filter((x) => x !== p)
+    setFilesBySession((m) => ({ ...m, [sessionKey]: next }))
+    if (openFile === p) { const fb = next[next.length - 1] ?? null; setActiveFile(fb); if (!fb) setViewMode('chat') }
+  }
   // 项目分组:默认折叠、可拖拽排序,展开态与顺序都持久化(关闭后不变)
   const [expanded, setExpanded] = useState<Set<string>>(() => { try { return new Set(JSON.parse(localStorage.getItem('console.expanded') || '[]')) } catch { return new Set() } })
   const [projectOrder, setProjectOrder] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('console.order') || '[]') } catch { return [] } })
@@ -1074,8 +1356,23 @@ function ConsolePage() {
   useEffect(() => {
     if (!pendingResume) return
     const s = state.sessions.find((x) => x.agentSessionId === pendingResume)
-    if (s) { setSel({ kind: 'session', id: s.id }); setOpenFile(null); setAttachments([]); setViewMode('chat'); setPendingResume(null) }
+    if (s) {
+      // 该历史会话已恢复成 live:把它的「历史」标签去掉,只留 live,避免同一会话开两个标签
+      setOpenTabs((prev) => prev.filter((t) => !(t.kind === 'history' && t.id === pendingResume)))
+      setSel({ kind: 'session', id: s.id }); setAttachments([]); setPendingResume(null)
+    }
   }, [state.sessions, pendingResume])
+
+  // 新建会话后自动跳到它:检测到新出现的 console 会话就选中(跳过初始加载,避免开机抢焦点)。
+  const prevSessionIds = useRef<Set<string> | null>(null)
+  useEffect(() => {
+    const cur = new Set(state.sessions.map((s) => s.id))
+    if (prevSessionIds.current !== null) {
+      const fresh = state.sessions.find((s) => !prevSessionIds.current!.has(s.id))
+      if (fresh) { setSel({ kind: 'session', id: fresh.id }); setAttachments([]) }
+    }
+    prevSessionIds.current = cur
+  }, [state.sessions])
 
   useEffect(() => {
     if ((!selectedProject || !state.projects.some((p) => p.workdir === selectedProject)) && state.projects.length)
@@ -1084,7 +1381,6 @@ function ConsolePage() {
 
   // 记住上次选择/项目顺序/展开态(切页面/重启都不丢)
   useEffect(() => { if (selectedProject) localStorage.setItem('console.project', selectedProject) }, [selectedProject])
-  useEffect(() => { if (openFile) localStorage.setItem('console.file', openFile); else localStorage.removeItem('console.file') }, [openFile])
   useEffect(() => { localStorage.setItem('console.navMode', navMode) }, [navMode])
   useEffect(() => { localStorage.setItem('console.expanded', JSON.stringify([...expanded])) }, [expanded])
   useEffect(() => { localStorage.setItem('console.order', JSON.stringify(projectOrder)) }, [projectOrder])
@@ -1093,29 +1389,67 @@ function ConsolePage() {
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
     if (sel?.kind === 'manual' && !transcripts[sel.id]) cmd.loadTranscript('manual', sel.id)
   }, [sel, transcripts])
+  // 持续记录 控制台会话 id → claude session_id(供翻牌时把选中/标签改指到同 id 的终端会话)
+  useEffect(() => { state.sessions.forEach((s) => { if (s.agentSessionId) sidToAid.current.set(s.id, s.agentSessionId) }) }, [state.sessions])
   useEffect(() => {
-    if (sel?.kind === 'session' && !state.sessions.some((s) => s.id === sel.id)) setSel(null)
+    if (sel?.kind === 'session' && !state.sessions.some((s) => s.id === sel.id)) {
+      // 控制台会话消失:被终端抢占(同 session_id 的终端会话已接管)→ 选中平滑翻牌过去,否则清空
+      const aid = sidToAid.current.get(sel.id)
+      const m = aid ? state.manual.find((x) => x.id === aid) : undefined
+      setSel(m ? { kind: 'manual', id: m.id } : null)
+    }
     if (sel?.kind === 'manual' && !state.manual.some((m) => m.id === sel.id)) setSel(null)
+    // 历史会话被隐藏/消失 → 清掉选中,否则顶部残留「历史会话」预览标签
+    if (sel?.kind === 'history' && !state.projects.flatMap((p) => p.history).some((h) => h.id === sel.id)) setSel(null)
   }, [state, sel])
+  // 选中即加入标签;但「历史(只读)」只预览、不固定 —— 只有 resume 成 live 才会进标签栏。
+  // 会话消失(结束/移除)时从标签里剔除。
+  useEffect(() => { if (sel && sel.kind !== 'history') setOpenTabs((prev) => prev.some((t) => t.kind === sel.kind && t.id === sel.id) ? prev : [...prev, sel]) }, [sel])
+  useEffect(() => {
+    setOpenTabs((prev) => prev.flatMap((t): NonNullable<Sel>[] => {
+      if (t.kind === 'session') {
+        if (state.sessions.some((s) => s.id === t.id)) return [t]
+        // 控制台会话被终端抢占 → 标签翻牌成同 id 的终端会话(不丢标签)
+        const aid = sidToAid.current.get(t.id)
+        return aid && state.manual.some((m) => m.id === aid) ? [{ kind: 'manual', id: aid }] : []
+      }
+      if (t.kind === 'manual') return state.manual.some((m) => m.id === t.id) ? [t] : []
+      return [t]
+    }))
+  }, [state.sessions, state.manual])
 
-  const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd + '/')
-  // 手动/终端会话只归到「最具体」的项目(最长匹配前缀);workplace 这类父目录只兜底放不属于任何更具体项目的会话
-  const projBySpecificity = [...state.projects].sort((a, b) => b.workdir.length - a.workdir.length)
-  const bestProjectWd = (cwd: string) => projBySpecificity.find((p) => inProject(cwd, p.workdir))?.workdir
+  const defWd = state.defaultWorkdir || ''
+  const defaultRoots = state.defaultRoots && state.defaultRoots.length ? state.defaultRoots : (defWd ? [defWd] : [])
+  const isRoot = (wd: string) => defaultRoots.includes(wd)
+  const inProject = (cwd: string, wd: string) => cwd === wd || cwd.startsWith(wd.replace(/\/+$/, '') + '/')
+  // 归属优先级:① 在某导入项目下(排除默认根/归属目录,最长前缀)→ 该项目(显式添加优先,carve-out);
+  //            ② 否则在任一「归属目录/默认根」下 → 默认文件夹(捞散会话+历史);③ 都不是 → 不显示
+  const importedBySpec = state.projects.filter((p) => p.workdir !== defWd && !isRoot(p.workdir)).sort((a, b) => b.workdir.length - a.workdir.length)
+  const ownerWd = (cwd: string): string | null =>
+    importedBySpec.find((p) => inProject(cwd, p.workdir))?.workdir
+    ?? (defaultRoots.some((r) => inProject(cwd, r)) ? defWd : null)
+  // 渲染的项目 = 默认文件夹 + 导入项目;归属目录不渲染成文件夹(它们的历史并进默认组)
+  const visibleProjects = state.projects.filter((p) => p.workdir === defWd || !isRoot(p.workdir))
+  const rootProjects = state.projects.filter((p) => isRoot(p.workdir))   // 默认根 + 归属目录(历史来源)
 
-  // 每个项目 → 一个分组(会话 + 手动 + 历史 合并)
-  const groups: Group[] = state.projects.map((p) => {
-    const cs = state.sessions.filter((s) => s.workdir === p.workdir)
+  // 每个可见项目 → 一个分组;默认文件夹收纳归属目录下的散会话 + 各归属目录的历史
+  const groups: Group[] = visibleProjects.map((p) => {
+    const isDefault = p.workdir === defWd
+    const cs = state.sessions.filter((s) => ownerWd(s.workdir) === p.workdir)
     // 同一个 session_id 已在桌面端打开(console 会话),就不再把它的「手动/终端」会话重复列出
     const consoleSids = new Set<string>(cs.map((s) => s.agentSessionId).filter(Boolean) as string[])
-    const ms = state.manual.filter((m) => bestProjectWd(m.cwd) === p.workdir && !consoleSids.has(m.id))
+    const ms = state.manual.filter((m) => ownerWd(m.cwd) === p.workdir && !consoleSids.has(m.id))
     const liveIds = new Set<string>([...consoleSids, ...ms.map((m) => m.id)])
-    const hs = p.history.filter((h) => !liveIds.has(h.id))
+    // 历史:默认组并入所有归属目录的历史(各按来源 workdir 取转录);普通组用自己的
+    const histSources = isDefault ? rootProjects : [p]
+    const hsRows = histSources.flatMap((src) => src.history.filter((h) => !liveIds.has(h.id)).map((h) => ({ h, wd: src.workdir })))
     const rows: RowItem[] = [
-      ...cs.map((s): RowItem => ({ key: 's' + s.id, sel: { kind: 'session', id: s.id }, title: s.title, meta: sessionMeta(s.status), model: s.agent === 'codex' ? 'Codex' : 'Claude', time: relTime(s.startedAt), running: !['done', 'error'].includes(s.status) })),
-      ...ms.map((m): RowItem => ({ key: 'm' + m.id, sel: { kind: 'manual', id: m.id }, title: m.title, meta: manualMeta(m.state), model: `${m.agent === 'codex' ? 'Codex' : 'Claude'} · ${m.terminal}`, time: relTime(m.lastActivityAt), running: m.state === 'working' || m.state === 'waiting' })),
-      ...hs.map((h): RowItem => ({ key: 'h' + h.id, sel: { kind: 'history', id: h.id, workdir: p.workdir }, title: h.label, meta: { text: '已结束', color: 'var(--text-faint)', hollow: true }, model: 'Claude', time: relTime(h.mtime), running: false })),
+      ...cs.map((s): RowItem => ({ key: 's' + s.id, sel: { kind: 'session', id: s.id }, title: s.title, meta: sessionMeta(s.status), model: s.agent === 'codex' ? 'Codex' : 'Claude', time: relTime(s.startedAt), running: !['done', 'error'].includes(s.status), path: s.workdir, ts: s.startedAt ?? 0, renameKey: s.key || s.agentSessionId || s.id })),
+      ...ms.map((m): RowItem => ({ key: 'm' + m.id, sel: { kind: 'manual', id: m.id }, title: m.title, meta: manualMeta(m.state), model: `${m.agent === 'codex' ? 'Codex' : 'Claude'} · ${m.terminal}`, time: relTime(m.lastActivityAt), running: m.state === 'working' || m.state === 'waiting', path: m.cwd, ts: m.lastActivityAt, renameKey: m.key || m.id })),
+      ...hsRows.map(({ h, wd }): RowItem => ({ key: 'h' + h.id, sel: { kind: 'history', id: h.id, workdir: wd }, title: h.label, meta: { text: '已结束', color: 'var(--text-faint)', hollow: true }, model: 'Claude', time: relTime(h.mtime), running: false, path: wd, ts: h.mtime, renameKey: h.key || h.id })),
     ]
+    // 运行中优先,其余按时间倒序(最近的在前)——配合分页,先看到的是最相关的
+    rows.sort((a, b) => (b.running ? 1 : 0) - (a.running ? 1 : 0) || b.ts - a.ts)
     const git = mockGit(p)
     return { p, rows, running: rows.filter((r) => r.running).length, gitDirty: git.initialized ? git.dirty : 0 }
   })
@@ -1130,13 +1464,30 @@ function ConsolePage() {
     setProjectOrder(cur)
   }
 
-  const pick = (s: Sel, wd: string) => { setSel(s); setSelectedProject(wd); setOpenFile(null); setAttachments([]); setViewMode('chat') }
+  const pick = (s: Sel, wd: string) => { setSel(s); setSelectedProject(wd); setAttachments([]) }
+  // 会话标签页:已打开的会话在右侧顶部多标签展示,可切换/关闭
+  const selKey = (s: NonNullable<Sel>) => s.kind + ':' + s.id
+  const closeTab = (s: NonNullable<Sel>) => {
+    // 标签 × = 收起这个标签。console 会话顺带结束进程(变成「已结束」,**仍留在项目列表**,不删除);
+    // 手动/历史:只收起标签,完全不动会话(手动在终端还活着;历史保留)。
+    // 想彻底删除请用会话行右键「删除会话」(那个才结束+隐藏)。
+    if (s.kind === 'session') cmd.closeSession(s.id)
+    const next = openTabs.filter((t) => selKey(t) !== selKey(s))
+    setOpenTabs(next)
+    if (sel && selKey(sel) === selKey(s)) setSel(next[next.length - 1] ?? null)
+  }
+  const tabMeta = (t: NonNullable<Sel>): { title: string; dot: DotMeta } => {
+    if (t.kind === 'session') { const s = state.sessions.find((x) => x.id === t.id); return { title: s?.title || '新会话', dot: sessionMeta(s?.status || 'idle') } }
+    if (t.kind === 'manual') { const m = state.manual.find((x) => x.id === t.id); return { title: m?.title || '会话', dot: manualMeta(m?.state || 'idle') } }
+    const h = state.projects.flatMap((p) => p.history).find((x) => x.id === t.id)
+    return { title: h?.label || '历史会话', dot: { text: '历史', color: 'var(--text-faint)', hollow: true } }
+  }
   const toggleGroup = (wd: string) => setExpanded((prev) => { const n = new Set(prev); n.has(wd) ? n.delete(wd) : n.add(wd); return n })
   const toggleGit = (wd: string) => setGitCollapsed((prev) => { const n = new Set(prev); n.has(wd) ? n.delete(wd) : n.add(wd); return n })
   const onBranch = (wd: string, branch: string) => {
     setBranchSel({ wd, branch }); setSelectedProject(wd)
     const s = state.sessions.find((x) => x.workdir === wd)   // 该项目有真实会话就顺带选中
-    if (s) { setSel({ kind: 'session', id: s.id }); setOpenFile(null); setAttachments([]); setViewMode('chat') }
+    if (s) { setSel({ kind: 'session', id: s.id }); setAttachments([]) }
   }
   const onConv = () => { setNavMode('sessions'); setViewMode('chat') }
   const onGit = () => { setNavMode('gittree'); setViewMode('chat') }
@@ -1152,6 +1503,14 @@ function ConsolePage() {
   const activeWd = liveSession?.workdir ?? (manualSel ? (state.projects.find((p) => inProject(manualSel.cwd, p.workdir))?.workdir ?? null) : null) ?? (sel?.kind === 'history' ? sel.workdir : null) ?? selectedProject
   const activeProject = state.projects.find((p) => p.workdir === activeWd) ?? null
 
+  // 聊天里点文件/工具卡 → 在当前会话开一个文件标签并切到「文件」视图(相对路径补成绝对)
+  const openFileInConsole = useCallback((path: string) => {
+    const abs = path.startsWith('/') || path.startsWith('~') ? path : (activeWd ? `${activeWd}/${path}` : path)
+    setFilesBySession((m) => { const cur = m[sessionKey] ?? []; return cur.includes(abs) ? m : { ...m, [sessionKey]: [...cur, abs] } })
+    setActiveFileBySession((m) => ({ ...m, [sessionKey]: abs }))
+    setViewBySession((m) => ({ ...m, [sessionKey]: 'files' }))
+  }, [activeWd, sessionKey])
+
   // 选中代码 / 文件 → 放入输入框(仅活动会话有输入框)
   const addCode = (start: number, end: number, snippet: string, file: string, lang: string) =>
     setAttachments((p) => [...p, { id: newAid(), kind: 'code', file, start, end, lang, snippet }])
@@ -1159,33 +1518,56 @@ function ConsolePage() {
     setAttachments((p) => p.some((a) => a.kind === 'file' && a.path === path) ? p : [...p, { id: newAid(), kind: 'file', name: path.split('/').pop() ?? path, path, lang: hljsLang(path) ?? fileExt(path) ?? 'file' }])
 
   // 顶栏 + 身体 + 底部(随会话类型变,但顶栏三段切换一直在)
-  let barSession: BarSession | null = null, barRight: React.ReactNode = null, footer: React.ReactNode = null, chat: React.ReactNode = null
+  let barSession: BarSession | null = null, barRight: React.ReactNode = null, footer: React.ReactNode = null, chat: React.ReactNode = null, queueOverlay: React.ReactNode = null
   let bodyAddSel: typeof addCode | undefined, bodyAddFile: typeof addFile | undefined
   if (liveSession) {
     barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
-    barRight = <IconBtn title="结束会话" onClick={() => cmd.closeSession(liveSession.id)}><X size={16} /></IconBtn>
-    chat = <MsgList msgs={liveSession.messages} onRespond={onLiveRespond} working={liveSession.status === 'working'} />
+    // 结束会话改由「标签 ×」/「会话行右键菜单」接管,WorkBar 不再放 X
+    chat = <MsgList msgs={liveSession.messages} pending={liveSession.pending} onRespond={onLiveRespond} onOpenFile={openFileInConsole} working={liveSession.status === 'working'} model={liveSession.model} root={liveSession.workdir} />
     footer = <Composer sid={liveSession.id} agent={liveSession.agent} model={liveSession.model} models={liveSession.models} working={liveSession.status === 'working'} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
     const mm = tmeta[manualSel.id]
-    barSession = { title: manualSel.title, meta: manualMeta(manualSel.state), sub: manualSel.cwd, renameKey: manualSel.key || manualSel.id }
-    barRight = <button onClick={() => cmd.raiseWindow(manualSel.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {manualSel.terminal}</button>
-    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
+    barSession = { title: manualSel.title, meta: manualMeta(manualSel.state), sub: manualSel.cwd, renameKey: manualSel.key || manualSel.id, manualId: manualSel.id }
+    // 终端未知(? = 无法识别的进程,如重启后存活的孤儿 console 进程)→ 没有窗口可顶,不显示唤起。
+    barRight = (manualSel.terminal && manualSel.terminal !== '?')
+      ? <button onClick={() => cmd.raiseWindow(manualSel.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {manualSel.terminal}</button>
+      : null
+    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
     footer = viewMode === 'chat' ? <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {manualSel.terminal} 里输入,这里只读。</div> : null
+    // 排队消息:抖音直播间评论流。绝对定位的浮层(不占容器空间),悬在 chat 底部、背景透明、
+    // 新的在底、旧的往上滑出渐隐、pointer-events-none 不挡操作。
+    if (viewMode === 'chat' && (mm?.queued?.length ?? 0) > 0) {
+      queueOverlay = (
+        <div className="absolute left-0 right-0 bottom-1 z-20 pointer-events-none flex flex-col justify-end gap-1.5 px-7 overflow-hidden"
+          style={{ height: '130px', WebkitMaskImage: 'linear-gradient(to bottom, transparent, #000 45%)', maskImage: 'linear-gradient(to bottom, transparent, #000 45%)' }}>
+          {mm!.queued!.map((q, i) => (
+            <div key={i} className="flex items-center gap-2 animate-msg text-[13px]" style={{ textShadow: '0 1px 4px var(--bg-elev), 0 1px 4px var(--bg-elev)' }}>
+              <span className="shrink-0 text-[10px] font-semibold px-1.5 py-[1px] rounded-full" style={{ color: 'var(--amber)', border: '1px solid var(--amber)' }}>排队</span>
+              <span className="truncate" style={{ color: 'var(--text)' }} title={q}>{q}</span>
+            </div>
+          ))}
+        </div>
+      )
+    }
   } else if (historySel) {
     const hm = tmeta[historySel.id]
     barSession = { title: historySel.label, meta: { text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }, renameKey: historySel.key || historySel.id }
     barRight = <button onClick={() => doResume(histWd, historySel.id)} disabled={pendingResume === historySel.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={pendingResume === historySel.id ? 'animate-spin' : ''} />{pendingResume === historySel.id ? '恢复中…' : 'Resume'}</button>
-    chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
+    chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={histWd} hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
   }
-  if (!barRight && activeProject) {
+  // 仅「无选中会话」(项目空视图)时给项目新建/继续菜单;选了 console 会话不冒它出来。
+  if (!barRight && activeProject && !sel) {
     barRight = <AgentActionMenu workdir={activeProject.workdir} includeContinue />
   }
+  // 当前选中但「未固定」的会话(= 正在预览的历史会话)作为一个临时标签露出;
+  // 切到别的会话时它自动消失,不会越点越多。固定标签(live)仍常驻。
+  const previewTab = sel && !openTabs.some((t) => selKey(t) === selKey(sel)) ? sel : null
+  const tabList = previewTab ? [...openTabs, previewTab] : openTabs
   const emptyChat = (
     <div className="flex-1 flex flex-col items-center justify-center text-faint gap-3 bg-bg">
       <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}><PanelsTopLeft size={22} /></div>
-      <div className="text-[13px]">选择左侧会话,或点「文件」浏览项目</div>
+      <div className="text-[13px]">选择左侧会话开始</div>
     </div>
   )
 
@@ -1194,16 +1576,37 @@ function ConsolePage() {
       {/* 左列:会话分组 / Git Tree */}
       <div className="w-[312px] shrink-0 bg-elev border-r border-line flex flex-col min-h-0">
         {navMode === 'sessions'
-          ? <SessionsNav groups={orderedGroups} sel={sel} activeWd={activeWd} expanded={expanded} toggle={toggleGroup} pick={pick} onReorder={reorder} />
+          ? <SessionsNav groups={orderedGroups} sel={sel} activeWd={activeWd} defaultWd={state.defaultWorkdir} expanded={expanded} toggle={toggleGroup} pick={pick} onReorder={reorder} onRemove={(wd) => cmd.removeProject(wd)} />
           : <GitTreeNav projects={state.projects} activeWd={activeWd} branchSel={branchSel} collapsed={gitCollapsed} toggle={toggleGit} inited={inited} onInit={(wd) => setInited((p) => new Set(p).add(wd))} onBranch={onBranch} />}
       </div>
 
-      {/* 工作区:通栏会话头(WorkBar)在流内 + 身体 */}
+      {/* 工作区:已打开会话标签 + 通栏会话头(WorkBar)+ 身体 */}
       <div className="flex-1 min-w-0 flex flex-col bg-bg min-h-0">
-        <WorkBar session={barSession}
-          tri={<TriToggle navMode={navMode} viewMode={viewMode} onConv={onConv} onGit={onGit} onFiles={onFiles} />} right={barRight} />
-        <div key={sel ? sel.kind + sel.id : 'empty'} className="flex-1 flex flex-col min-h-0 animate-conv">
-          <WorkBody viewMode={viewMode} project={activeProject} openFile={openFile} setOpenFile={setOpenFile} onAddSel={bodyAddSel} onAddFile={bodyAddFile} chat={chat ?? emptyChat} />
+        {tabList.length > 0 && (
+          <div className="flex-none flex items-stretch gap-1 px-2 pt-1.5 overflow-x-auto bg-elev border-b border-line">
+            {tabList.map((t) => {
+              const on = !!sel && selKey(sel) === selKey(t)
+              const info = tabMeta(t)
+              const preview = !!previewTab && selKey(t) === selKey(previewTab)   // 预览标签:斜体提示「未固定」
+              return (
+                <div key={selKey(t)} onClick={() => setSel(t)}
+                  className="group flex items-center gap-2 pl-2.5 pr-1 py-1.5 rounded-t-[8px] cursor-pointer max-w-[170px] shrink-0 border-b-2 transition-colors"
+                  style={on ? { borderColor: 'var(--accent)', background: 'var(--bg)' } : { borderColor: 'transparent' }}>
+                  <Dot meta={info.dot} size={6} />
+                  <span className="text-[12px] truncate" style={{ color: on ? 'var(--text)' : 'var(--text-dim)', fontStyle: preview ? 'italic' : 'normal' }}>{info.title}</span>
+                  <button onClick={(e) => { e.stopPropagation(); closeTab(t) }} title="关闭标签" className="shrink-0 opacity-0 group-hover:opacity-100 text-faint hover:text-ink rounded p-0.5"><X size={12} /></button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+        {sel && (
+          <WorkBar session={barSession}
+            tri={<TriToggle navMode={navMode} viewMode={viewMode} onConv={onConv} onGit={onGit} onFiles={onFiles} />} right={barRight} />
+        )}
+        <div key={sel ? sel.kind + sel.id : 'empty'} className="flex-1 flex flex-col min-h-0 animate-conv relative">
+          <WorkBody viewMode={viewMode} project={activeProject} openFile={openFile} fileTabs={fileTabs} onPickFile={openFileInConsole} onCloseFile={closeFileTab} onAddSel={bodyAddSel} onAddFile={bodyAddFile} chat={chat ?? emptyChat} />
+          {queueOverlay}
           {footer}
         </div>
       </div>
@@ -1469,7 +1872,7 @@ function ProvidersPage() {
 
 const CONN_DOT: Record<string, string> = {
   online: 'var(--green)', connecting: 'var(--amber)', offline: 'var(--text-faint)',
-  unpaired: 'var(--text-faint)', suspended: 'var(--amber)', rejected: 'var(--red)',
+  unpaired: 'var(--text-faint)', paused: 'var(--amber)', rejected: 'var(--red)',
 }
 function ConnSection() {
   const conn = useConn()
@@ -1477,12 +1880,10 @@ function ConnSection() {
   const [editing, setEditing] = useState(false)
   useEffect(() => { if (!editing && conn) setHost(conn.host) }, [conn?.host, editing])
   if (!conn) return null
-  const p = conn.pair
-  const pairing = p.phase === 'fetching' || p.phase === 'waiting'
   const dot = CONN_DOT[conn.state] ?? 'var(--text-faint)'
   return (
     <>
-      <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mb-2.5">连接手机</div>
+      <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mb-2.5">账号</div>
       <div className="border border-line rounded-[13px] bg-elev mb-6">
         {/* 服务器地址 */}
         <div className="flex items-center px-4 py-4 border-b border-line">
@@ -1500,33 +1901,14 @@ function ConnSection() {
         <div className="flex items-center gap-2.5 px-4 py-3.5 border-b border-line">
           <span className="w-2 h-2 rounded-full shrink-0" style={{ background: dot }} />
           <span className="text-[12.5px] text-dim flex-1">{conn.text}</span>
-          {conn.paired && conn.account && <span className="font-mono text-[11px] text-faint truncate max-w-[180px]">{conn.account}</span>}
         </div>
-        {/* 配对区 */}
-        <div className="px-4 py-4">
-          {p.phase === 'waiting' ? (
-            <div className="flex flex-col items-center gap-3 py-2">
-              <div className="text-[11.5px] text-dim">在手机 App「设备」页输入此配对码(10 分钟内有效)</div>
-              <div className="font-mono text-[34px] font-semibold tracking-[0.25em] text-ink" style={{ paddingLeft: '0.25em' }}>{p.code}</div>
-              <button onClick={() => cmd.pairCancel()} className="text-[12.5px] text-dim px-3 py-1.5 rounded-lg border border-strong hover:bg-sunken">取消</button>
-            </div>
-          ) : p.phase === 'fetching' ? (
-            <div className="text-[12.5px] text-dim py-1">正在获取配对码…</div>
-          ) : (
-            <div className="flex items-center gap-2.5">
-              <div className="flex-1 min-w-0">
-                {conn.paired
-                  ? <><div className="text-[13px] font-medium text-ink">已配对</div><div className="text-[11.5px] text-dim mt-0.5">手机已绑定到 {conn.account}</div></>
-                  : <><div className="text-[13px] font-medium text-ink">未配对</div><div className="text-[11.5px] text-dim mt-0.5">点「配对手机」生成配对码,在手机上输入完成绑定</div></>}
-                {p.phase === 'failed' && p.error && <div className="text-[11.5px] mt-1" style={{ color: 'var(--red)' }}>{p.error}</div>}
-              </div>
-              {conn.paired && <button onClick={() => cmd.unpair()} className="text-[12.5px] px-3 py-1.5 rounded-lg hover:bg-sunken" style={{ color: 'var(--red)' }}>退出登录</button>}
-              <button onClick={() => cmd.pairStart()} disabled={pairing}
-                className="text-[12.5px] px-3.5 py-1.5 rounded-lg text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}>
-                {conn.paired ? '重新配对' : '配对手机'}
-              </button>
-            </div>
-          )}
+        {/* 已登录账号 + 退出 */}
+        <div className="flex items-center gap-2.5 px-4 py-4">
+          <div className="flex-1 min-w-0">
+            <div className="text-[13px] font-medium text-ink">已登录</div>
+            <div className="text-[11.5px] text-dim mt-0.5 font-mono truncate">{conn.account || '—'}</div>
+          </div>
+          <button onClick={() => cmd.logout()} className="text-[12.5px] px-3 py-1.5 rounded-lg hover:bg-sunken" style={{ color: 'var(--red)' }}>退出登录</button>
         </div>
       </div>
     </>
@@ -1535,8 +1917,12 @@ function ConnSection() {
 
 function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light' | 'dark') => void }) {
   const state = useAgent()
+  const prefs = usePrefs()
   const [autosave, setAutosave] = useState(() => localStorage.getItem('console.autosave') !== '0')
   useEffect(() => { localStorage.setItem('console.autosave', autosave ? '1' : '0') }, [autosave])
+  const [hostInput, setHostInput] = useState('')
+  const [hostSaved, setHostSaved] = useState(false)
+  useEffect(() => { if (prefs?.host != null) setHostInput(prefs.host) }, [prefs?.host])
   return (
     <div className="flex-1 overflow-y-auto bg-bg">
       <div className="max-w-[640px] mx-auto px-8 pt-8 pb-12">
@@ -1557,6 +1943,35 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
           </div>
         </div>
 
+        <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">系统</div>
+        <div className="border border-line rounded-[13px] bg-elev divide-y divide-line">
+          <div className="px-4 py-4">
+            <div className="text-[13px] font-medium text-ink mb-1.5">中转服务器</div>
+            <div className="flex items-center gap-2">
+              <input value={hostInput} onChange={(e) => { setHostInput(e.target.value); setHostSaved(false) }}
+                placeholder="服务器 IP / 域名" spellCheck={false}
+                className="flex-1 min-w-0 px-3 py-1.5 rounded-lg bg-sunken border border-line text-[12.5px] font-mono text-ink outline-none focus:border-strong" />
+              <button onClick={() => { cmd.setHost(hostInput.trim()); setHostSaved(true) }} disabled={!hostInput.trim()}
+                className="shrink-0 text-[12.5px] px-3 py-1.5 rounded-lg text-accentfg disabled:opacity-50" style={{ background: 'var(--accent)' }}>
+                {hostSaved ? '✓ 已保存' : '保存并重连'}
+              </button>
+            </div>
+            <div className="text-[11px] text-faint mt-1.5">端口固定(WS 8090 / HTTP 8080),只填地址。改后手机端按新地址重连。</div>
+          </div>
+          <div className="flex items-center px-4 py-4">
+            <div className="flex-1"><div className="text-[13px] font-medium text-ink">开机自动启动</div><div className="text-[11.5px] text-dim mt-0.5">登录系统时自动运行 VibeNotch</div></div>
+            <button onClick={() => cmd.setLaunchAtLogin(!prefs?.launchAtLogin)} className="w-[42px] h-[24px] rounded-full p-[3px] transition-colors" style={{ background: prefs?.launchAtLogin ? 'var(--accent)' : 'var(--bg-sunken)' }}>
+              <span className="block w-[18px] h-[18px] rounded-full bg-white transition-transform" style={{ transform: prefs?.launchAtLogin ? 'translateX(18px)' : 'none', boxShadow: '0 1px 2px rgba(0,0,0,.2)' }} />
+            </button>
+          </div>
+          <div className="flex items-center px-4 py-4">
+            <div className="flex-1"><div className="text-[13px] font-medium text-ink">静音提示音</div><div className="text-[11.5px] text-dim mt-0.5">关闭权限请求 / 完成等提示音</div></div>
+            <button onClick={() => cmd.setMute(!prefs?.muted)} className="w-[42px] h-[24px] rounded-full p-[3px] transition-colors" style={{ background: prefs?.muted ? 'var(--accent)' : 'var(--bg-sunken)' }}>
+              <span className="block w-[18px] h-[18px] rounded-full bg-white transition-transform" style={{ transform: prefs?.muted ? 'translateX(18px)' : 'none', boxShadow: '0 1px 2px rgba(0,0,0,.2)' }} />
+            </button>
+          </div>
+        </div>
+
         <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">会话</div>
         <div className="border border-line rounded-[13px] bg-elev">
           <div className="flex items-center px-4 py-4 border-b border-line">
@@ -1572,10 +1987,33 @@ function SettingsPage({ theme, setTheme }: { theme: string; setTheme: (t: 'light
         </div>
 
         <div className="text-[11px] font-semibold tracking-[0.05em] uppercase text-faint mt-7 mb-2.5">工作目录</div>
-        <div className="border border-line rounded-[13px] bg-elev">
+        <div className="border border-line rounded-[13px] bg-elev divide-y divide-line">
           <div className="flex items-center px-4 py-4">
-            <div className="flex-1 min-w-0"><div className="text-[13px] font-medium text-ink">根目录</div><div className="font-mono text-[11.5px] text-dim mt-0.5 truncate">新建项目默认从这里挑选</div></div>
-            <button onClick={() => cmd.openProject()} className="text-[12.5px] px-3 py-1.5 rounded-lg border border-strong text-dim hover:bg-sunken transition-colors shrink-0">添加项目</button>
+            <div className="flex-1 min-w-0">
+              <div className="text-[13px] font-medium text-ink">默认工作目录</div>
+              <div className="font-mono text-[11.5px] text-dim mt-0.5 truncate" title={state.defaultWorkdir}>{state.defaultWorkdir || '未设置 · 回退到 ~/.vibenotch/workplace'}</div>
+              <div className="text-[11px] text-faint mt-1">没导入成项目的会话都归到这个目录下显示;顶层「新建会话」也建在这</div>
+            </div>
+            <button onClick={() => cmd.pickDefaultWorkdir()} className="text-[12.5px] px-3 py-1.5 rounded-lg border border-strong text-dim hover:bg-sunken transition-colors shrink-0">更改</button>
+          </div>
+          <div className="px-4 py-4">
+            <div className="flex items-center">
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-medium text-ink">会话归属目录</div>
+                <div className="text-[11.5px] text-dim mt-0.5">这些目录下手动建的会话,会读进默认文件夹显示(不会在项目栏单独成文件夹)</div>
+              </div>
+              <button onClick={() => cmd.addDefaultSessionDir()} className="text-[12.5px] px-3 py-1.5 rounded-lg border border-strong text-dim hover:bg-sunken transition-colors shrink-0">添加目录</button>
+            </div>
+            {(state.defaultSessionDirs?.length ?? 0) > 0
+              ? <div className="mt-2.5 space-y-1">
+                  {state.defaultSessionDirs!.map((d) => (
+                    <div key={d} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-sunken">
+                      <span className="font-mono text-[11.5px] text-dim flex-1 min-w-0 truncate" title={d}>{d}</span>
+                      <button onClick={() => cmd.removeDefaultSessionDir(d)} title="移除" className="shrink-0 text-faint hover:text-[var(--red)] p-0.5 rounded"><X size={13} /></button>
+                    </div>
+                  ))}
+                </div>
+              : <div className="mt-2.5 text-[11.5px] text-faint">还没登记。点「添加目录」选一个你常手动建会话、但不想导入成项目的目录。</div>}
           </div>
         </div>
 
@@ -1644,6 +2082,146 @@ function TitleBar({ theme, toggleTheme }: { theme: string; toggleTheme: () => vo
   )
 }
 
+// —— 登录页 —— 打开控制台先判断是否登录;未登录走这里,登录成功(conn.loggedIn=true)自动进控制台。
+// 流程与手机端一致:邮箱 → 分流(密码登录 / 验证码登录 / 注册)+ 忘记密码。调用走桥接(auth.*)。
+function LoginPage() {
+  type Step = 'email' | 'password' | 'code' | 'setpw'
+  type Flow = 'login' | 'register' | 'reset'
+  const [step, setStep] = useState<Step>('email')
+  const [flow, setFlow] = useState<Flow>('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [code, setCode] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const [info, setInfo] = useState('')
+
+  const acc = email.trim().toLowerCase()
+  const emailOk = /\S+@\S+\.\S+/.test(acc)
+  const errMsg = (e: any) => (e && e.message) || '出错了'
+  const clear = () => { setErr(''); setInfo('') }
+
+  function backToEmail() { clear(); setStep('email'); setFlow('login'); setPassword(''); setCode('') }
+
+  async function run(fn: () => Promise<any>, after?: () => void) {
+    if (busy) return
+    setBusy(true); clear()
+    try { await fn(); after?.() } catch (e) { setErr(errMsg(e)) } finally { setBusy(false) }
+  }
+
+  const proceedEmail = () => run(
+    async () => {
+      const r = await auth.check(acc)
+      if (!r.exists) { setFlow('register'); setStep('setpw') }
+      else if (r.hasPassword) { setStep('password') }
+      else { await auth.sendCode(acc); setFlow('login'); setStep('code'); setInfo('验证码已发送到邮箱') }
+    })
+
+  const doPasswordLogin = () => run(() => auth.login(acc, password))
+  const switchToCode = () => run(async () => { await auth.sendCode(acc) }, () => { setFlow('login'); setStep('code'); setCode(''); setInfo('验证码已发送') })
+  const forgot = () => run(async () => { await auth.sendForgotCode(acc) }, () => { setFlow('reset'); setStep('code'); setCode(''); setPassword(''); setInfo('重置验证码已发送') })
+  const proceedRegister = () => run(async () => { await auth.sendRegisterCode(acc) }, () => { setStep('code'); setCode(''); setInfo('注册验证码已发送') })
+  const resend = () => run(
+    () => flow === 'register' ? auth.sendRegisterCode(acc) : flow === 'reset' ? auth.sendForgotCode(acc) : auth.sendCode(acc),
+    () => setInfo('验证码已重新发送'))
+  const submitCode = () => {
+    if (flow === 'login') run(() => auth.loginWithCode(acc, code))
+    else if (flow === 'register') run(() => auth.register(acc, code, password))
+    else run(async () => { await auth.resetPassword(acc, code, password) }, () => { setStep('password'); setFlow('login'); setCode(''); setInfo('密码已重置,请用新密码登录') })
+  }
+
+  const onEnter = (fn: () => void) => (e: React.KeyboardEvent) => { if (e.key === 'Enter') fn() }
+  const inputCls = 'w-full px-3 py-2.5 rounded-[10px] bg-sunken border border-line text-[13px] text-text outline-none focus:border-accent transition-colors placeholder:text-faint'
+  const btnCls = 'w-full px-3 py-2.5 rounded-[10px] bg-accent text-accent-fg text-[13px] font-medium transition-opacity hover:opacity-90 disabled:opacity-40'
+  const linkCls = 'text-[12px] text-faint hover:text-dim transition-colors'
+
+  const codeTitle = flow === 'register' ? '创建账号' : flow === 'reset' ? '重置密码' : '验证码登录'
+  const codeBtn = flow === 'register' ? '注册并登录' : flow === 'reset' ? '重置密码' : '登录'
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <TitleBar theme={(localStorage.getItem('theme') as any) || 'light'} toggleTheme={() => {}} />
+      <div className="flex-1 min-h-0 flex items-center justify-center bg-bg px-6">
+        <div className="w-full max-w-[340px] flex flex-col gap-5">
+          {/* logo + 标题 */}
+          <div className="flex flex-col items-center gap-3 mb-1">
+            <div className="w-12 h-12 rounded-[14px] bg-accent flex items-center justify-center shadow-pop">
+              <span className="text-accent-fg text-[22px] font-semibold leading-none">›_</span>
+            </div>
+            <div className="text-center">
+              <div className="text-[17px] font-semibold text-text">AI Coding Remote</div>
+              <div className="text-[12px] text-faint mt-0.5">
+                {step === 'email' ? '登录后用手机遥控你的电脑' :
+                 flow === 'register' ? '设置密码,创建新账号' :
+                 flow === 'reset' ? '通过邮箱验证码重置密码' :
+                 acc}
+              </div>
+            </div>
+          </div>
+
+          {/* 表单 */}
+          <div className="flex flex-col gap-2.5">
+            {step === 'email' && (
+              <>
+                <input className={inputCls} type="email" placeholder="邮箱" autoFocus value={email}
+                  onChange={e => setEmail(e.target.value)} onKeyDown={onEnter(proceedEmail)} />
+                <button className={btnCls} disabled={busy || !emailOk} onClick={proceedEmail}>{busy ? '请稍候…' : '继续'}</button>
+              </>
+            )}
+
+            {step === 'password' && (
+              <>
+                <input className={inputCls} type="password" placeholder="密码" autoFocus value={password}
+                  onChange={e => setPassword(e.target.value)} onKeyDown={onEnter(doPasswordLogin)} />
+                <button className={btnCls} disabled={busy || !password} onClick={doPasswordLogin}>{busy ? '登录中…' : '登录'}</button>
+                <div className="flex items-center justify-between pt-1">
+                  <button className={linkCls} onClick={switchToCode} disabled={busy}>用验证码登录</button>
+                  <button className={linkCls} onClick={forgot} disabled={busy}>忘记密码?</button>
+                </div>
+              </>
+            )}
+
+            {step === 'setpw' && (
+              <>
+                <input className={inputCls} type="password" placeholder="设置密码(至少 4 位)" autoFocus value={password}
+                  onChange={e => setPassword(e.target.value)} onKeyDown={onEnter(proceedRegister)} />
+                <button className={btnCls} disabled={busy || password.length < 4} onClick={proceedRegister}>{busy ? '请稍候…' : '继续'}</button>
+                <div className="text-[11px] text-faint pt-0.5">该邮箱未注册,设置密码后用验证码完成注册。</div>
+              </>
+            )}
+
+            {step === 'code' && (
+              <>
+                <div className="text-[12px] text-dim -mb-0.5">{codeTitle} · {acc}</div>
+                <input className={`${inputCls} font-mono tracking-widest`} inputMode="numeric" placeholder="6 位验证码" autoFocus value={code}
+                  onChange={e => setCode(e.target.value)} onKeyDown={onEnter(submitCode)} />
+                {flow === 'reset' && (
+                  <input className={inputCls} type="password" placeholder="新密码(至少 4 位)" value={password}
+                    onChange={e => setPassword(e.target.value)} onKeyDown={onEnter(submitCode)} />
+                )}
+                <button className={btnCls}
+                  disabled={busy || code.trim().length < 4 || (flow === 'reset' && password.length < 4)}
+                  onClick={submitCode}>{busy ? '请稍候…' : codeBtn}</button>
+                <div className="flex items-center justify-between pt-1">
+                  <button className={linkCls} onClick={resend} disabled={busy}>重新发送验证码</button>
+                </div>
+              </>
+            )}
+
+            {/* 提示 */}
+            {info && <div className="text-[12px] text-green">{info}</div>}
+            {err && <div className="text-[12px] text-red">{err}</div>}
+
+            {step !== 'email' && (
+              <button className={`${linkCls} self-start pt-1`} onClick={backToEmail} disabled={busy}>← 换个邮箱</button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [page, setPage] = useState('console')
   const [theme, setThemeState] = useState<'light' | 'dark'>(() => (localStorage.getItem('theme') as 'light' | 'dark') || 'light')
@@ -1654,6 +2232,12 @@ export default function App() {
   }, [theme])
   const setTheme = (t: 'light' | 'dark') => setThemeState(t)
   const toggleTheme = () => setThemeState((t) => (t === 'dark' ? 'light' : 'dark'))
+
+  // 门禁:首个 conn 推送前留白等待;未登录 → 登录页;登录成功后 conn.loggedIn 翻 true 自动进控制台。
+  const conn = useConn()
+  if (!conn) return <div className="h-full bg-bg" />
+  if (!conn.loggedIn) return <LoginPage />
+
   return (
     <div className="flex flex-col h-full min-h-0">
       <TitleBar theme={theme} toggleTheme={toggleTheme} />

@@ -69,7 +69,7 @@ public class RegistrationController {
         return switch (codes.check(account, req.code())) {
             case OK -> {
                 store.createWithPassword(account, password, null);
-                String token = store.issueToken(account);
+                String token = store.issueClientToken(account);
                 log.info("register: 新账号已创建 {}", account);
                 yield ResponseEntity.ok(Map.of("account", account, "token", token));
             }

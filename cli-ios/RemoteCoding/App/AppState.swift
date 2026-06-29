@@ -5,6 +5,8 @@ import SwiftUI
 final class AppState: ObservableObject {
     @Published var isLoggedIn: Bool
     @Published var userEmail: String?
+    /// 被服务器判为「登录已过期」(账号在别的手机登录,单活动踢下线)→ 回登录页时提示一次。
+    @Published var sessionExpiredNotice = false
 
     static let tokenKey = "auth_token"
     private let accountKey = "relay_account"
@@ -26,6 +28,7 @@ final class AppState: ObservableObject {
         userEmail = account
         UserDefaults.standard.set(account, forKey: accountKey)
         KeychainStore.save(token, for: Self.tokenKey)
+        sessionExpiredNotice = false
         isLoggedIn = true
     }
 
@@ -35,13 +38,28 @@ final class AppState: ObservableObject {
         userEmail = nil
         isLoggedIn = false
     }
+
+    /// 服务器判定登录已过期(账号在其它手机登录)→ 清登录态并标记提示。
+    func sessionExpired() {
+        guard isLoggedIn else { return }
+        logout()
+        sessionExpiredNotice = true
+    }
 }
 
 /// 一个在线的电脑代理(会话入口)。PROTOCOL §8.1 auth_ok.agents。
 struct AgentInfo: Identifiable, Hashable {
     let id: String
     let name: String
+    let online: Bool             // WS 是否连着中转(电脑是否开机联网)
+    var suspended: Bool = false  // 被手机端「暂停」(软暂停):电脑保持连接,点「恢复」即继续
+}
+
+/// 一台登录此账号的设备(电脑或手机;来自服务器全量登录记录)。
+struct DeviceRec: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let role: String             // "AGENT"=电脑 / "CLIENT"=手机
     let online: Bool
-    var suspended: Bool = false   // 被手机端「断开」挂起,可点重连恢复
-    var resuming: Bool = false    // 已点「重连」,等待电脑回连(≤10s 探测周期)
+    var isComputer: Bool { role == "AGENT" }
 }

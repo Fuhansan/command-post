@@ -1,6 +1,21 @@
 export type MsgKind = 'text' | 'tool' | 'file' | 'permission'
 
 export interface MsgImage { id: string; ext?: string }   // 通道只带 id;web 按 app://__img/<id> 取字节
+
+export type OpKind = 'read' | 'edit' | 'write' | 'bash' | 'other'
+export interface DiffLine { k: string; t: string }        // k: add | del | ctx
+export interface ToolOp {                                 // 结构化动作(时间线一行)
+  kind: OpKind
+  file: string
+  dir: string
+  add?: number
+  del?: number
+  sameFile?: boolean
+  command?: string
+  diff?: DiffLine[]
+  output?: string[]
+  label?: string                                          // other 类工具的中文动作名
+}
 export interface Msg {
   id: string
   role: string          // user | assistant | system
@@ -10,6 +25,9 @@ export interface Msg {
   images?: MsgImage[]
   permState?: string | null   // null=待处理 allow/deny=已处理
   permReqId?: string | null
+  op?: ToolOp                  // kind==='tool' 时携带
+  model?: string              // 产生该回合的模型(完整 id)
+  ts?: number                 // 消息时间(epoch ms)
 }
 
 export interface PendingOption { id: string; label: string }
@@ -47,8 +65,9 @@ export interface Manual {
   lastActivityAt: number
 }
 
-export interface PairState { phase: 'idle' | 'fetching' | 'waiting' | 'done' | 'failed'; code?: string; account?: string; error?: string }
-export interface Conn { host: string; paired: boolean; account: string; state: string; text: string; pair: PairState }
+export interface Conn { host: string; paired: boolean; account: string; loggedIn: boolean; state: string; text: string }
+// 偏好设置(原菜单栏「设置」搬到控制台设置页):中转地址 + 开机启动 + 静音
+export interface Prefs { host: string; launchAtLogin: boolean; muted: boolean }
 
 export interface HiddenEntry { key: string; title: string }
 export interface AppState {
@@ -56,6 +75,9 @@ export interface AppState {
   sessions: Session[]
   manual: Manual[]
   hidden: HiddenEntry[]
+  defaultWorkdir?: string       // 默认工作目录:新建会话建在这,其会话归默认文件夹
+  defaultRoots?: string[]       // 默认目录 + 归属目录:这些根下的会话(非导入项目)归默认文件夹
+  defaultSessionDirs?: string[] // 「会话归属目录」用户登记列表(设置页展示,不在项目栏成文件夹)
 }
 
 export interface UsageTotals {

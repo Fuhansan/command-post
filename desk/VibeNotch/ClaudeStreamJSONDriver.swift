@@ -24,6 +24,17 @@ final class ClaudeStreamJSONDriver: AgentDriver {
 
     /// 权限审批回写器:reqId → 调用即写回 allow/deny 解除 PreToolUse hook 阻塞。
     private var permDeciders: [String: (PermissionDecision) -> Void] = [:]
+    /// AskUserQuestion 待答:tool_use id → 问题文本。回 tool_result 必须按 Claude Code 原生模板
+    /// `Your questions have been answered: "Q"="A". ...` 拼——裸 label 会被当成空消息(实测根因)。
+    private var pendingQuestions: [String: String] = [:]
+    /// ExitPlanMode 待确认的 tool_use id 集合。回 tool_result 用 approved/rejected 原生模板。
+    private var pendingPlans = Set<String>()
+    /// 当前工作目录(算动作行的相对目录用)。
+    private var workdir = ""
+    /// bash 工具的 tool_use id 集合:只有它们的 tool_result 输出值得回填(read 输出可能巨大,不回填)。
+    private var bashToolIds = Set<String>()
+    /// 上一条动作涉及的文件(连续操作同文件时展示「同一文件」)。
+    private var lastOpFile: String?
 
     private var proc: Process?
     private var stdinHandle: FileHandle?
@@ -55,6 +66,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     // MARK: - 生命周期
 
     func start(workdir: String, resume: String?, continueLast: Bool, model: String?) async throws {
+        self.workdir = workdir
         guard let bin = Self.claudeBinary() else {
             emit.yield(.error("找不到 claude 可执行文件"))
             throw DriverError.binaryNotFound
@@ -163,15 +175,25 @@ final class ClaudeStreamJSONDriver: AgentDriver {
     func respond(to requestId: String, choose optionIds: [String]) {
         // ① 权限审批:写回 hook 解除阻塞,不走 stdin。
         if let decide = permDeciders.removeValue(forKey: requestId) {
+            vlog("[respond] permission id=\(requestId) choose=\(optionIds) → \(optionIds.contains("allow") ? "allow" : "deny")")
             decide(optionIds.contains("allow") ? .allow : .deny)
             emit.yield(.pendingResolved(id: requestId))
             return
         }
-        // ② 选项卡(AskUserQuestion/ExitPlanMode):回 tool_result,tool_use_id = requestId。
-        let answer = optionIds.joined(separator: ", ")
-        writeJSON(["type": "user", "message": ["role": "user", "content": [
-            ["type": "tool_result", "tool_use_id": requestId, "content": answer]
-        ]]])
+        // ②③ AskUserQuestion / ExitPlanMode:headless 的 stream-json 下,claude 一调用这类交互工具
+        //    就「立刻自动错误结束」(transcript 实测:tool_result="Answer questions?" toolUseResult=Error),
+        //    根本不等我们的 tool_result——我们再写 tool_result 就成了重复/迟到的孤儿,模型当成空选择并重新提问。
+        //    所以改为发一条**普通 user 文本消息**把答案给模型,它把这当用户回答继续(实测可行)。
+        let isPlan = pendingPlans.remove(requestId) != nil
+        pendingQuestions.removeValue(forKey: requestId)
+        let text: String
+        if isPlan {
+            text = optionIds.contains("approve") ? "同意这个计划,按它开始执行吧。" : "先别按这个计划做,我们再讨论一下。"
+        } else {
+            text = "我选择:\(optionIds.joined(separator: "、"))"
+        }
+        vlog("[respond] choice/plan → user message: \(text) (reqId=\(requestId))")
+        writeJSON(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
         emit.yield(.pendingResolved(id: requestId))
     }
 
@@ -202,8 +224,8 @@ final class ClaudeStreamJSONDriver: AgentDriver {
             emit.yield(.status(.working))
             handleAssistant(o)
         case "user":
-            // tool_result 回流(含权限拒绝信息);此处暂只用于状态,渲染细节后续补。
-            break
+            // tool_result 回流:只回填 bash 工具的输出(按 tool_use_id 配对);read 等输出可能巨大,不回填。
+            handleToolResults(o)
         case "result":
             let r = o["result"] as? String
             emit.yield(.turnComplete(result: r))
@@ -211,6 +233,25 @@ final class ClaudeStreamJSONDriver: AgentDriver {
             streamMsgId = nil; streamedTextIds.removeAll()
         default:
             break
+        }
+    }
+
+    /// 解析 user 消息里的 tool_result,把 bash 工具的输出按 tool_use_id 回填(截断防爆)。
+    private func handleToolResults(_ o: [String: Any]) {
+        guard let msg = o["message"] as? [String: Any],
+              let blocks = msg["content"] as? [[String: Any]] else { return }
+        for b in blocks where (b["type"] as? String) == "tool_result" {
+            guard let tid = b["tool_use_id"] as? String, bashToolIds.contains(tid) else { continue }
+            bashToolIds.remove(tid)
+            let text: String
+            if let s = b["content"] as? String { text = s }
+            else if let arr = b["content"] as? [[String: Any]] {
+                text = arr.compactMap { $0["text"] as? String }.joined(separator: "\n")
+            } else { text = "" }
+            var lines = text.components(separatedBy: "\n")
+            if lines.count > 40 { lines = Array(lines.prefix(40)) + ["… (\(text.components(separatedBy: "\n").count - 40) 行已省略)"] }
+            lines = lines.map { $0.count > 400 ? String($0.prefix(400)) + "…" : $0 }
+            emit.yield(.toolOutput(id: tid, lines: lines))
         }
     }
 
@@ -265,25 +306,29 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         let input = b["input"] as? [String: Any] ?? [:]
         switch name {
         case "AskUserQuestion":
-            if let req = Self.choiceRequest(id: id, input: input) { emit.yield(.pendingRequest(req)) }
+            if let req = Self.choiceRequest(id: id, input: input) {
+                // 存问题文本,respond 时按原生模板拼 tool_result(取第一题,与 UI 展示一致)。
+                pendingQuestions[id] = (input["questions"] as? [[String: Any]])?.first?["question"] as? String ?? (req.detail ?? "")
+                vlog("[choice] AskUserQuestion tool_use id=\(id) optionIds=\(req.options.map(\.id))")
+                emit.yield(.pendingRequest(req))
+            }
         case "ExitPlanMode":
+            pendingPlans.insert(id)
             let plan = input["plan"] as? String
             emit.yield(.pendingRequest(PendingRequest(
                 id: id, kind: .planConfirm, title: "计划待确认", detail: plan,
                 options: [.init(id: "approve", label: "同意", detail: nil),
                           .init(id: "keep", label: "继续讨论", detail: nil)],
                 multiSelect: false)))
-        case "Edit", "Write", "MultiEdit":
-            if let path = input["file_path"] as? String {
-                emit.yield(.fileEdit(FileEditInfo(path: path, additions: 0)))
-            }
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: name, summary: (input["file_path"] as? String) ?? "")))
-        case "Bash":
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: "Bash", summary: (input["command"] as? String) ?? "")))
         default:
-            let summary = (input["file_path"] ?? input["path"] ?? input["command"]
-                           ?? input["pattern"] ?? input["url"] ?? input["prompt"]) as? String ?? ""
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: name, summary: summary)))
+            // 读取/编辑/新建/命令/其它:统一用共享构造器(与转录解析一致)。
+            guard var op = claudeToolOp(name: name, input: input, workdir: workdir) else { return }
+            let path = (input["file_path"] ?? input["notebook_path"]) as? String ?? ""
+            // 不再单发 .fileEdit:.tool 的 op 已带 file/dir/diff,单发会和它重复(web 两行、iOS 两卡)。
+            if op.kind == .bash { bashToolIds.insert(id) }
+            if !path.isEmpty { op.sameFile = (path == lastOpFile); lastOpFile = path }
+            let summary = path.isEmpty ? (op.command ?? op.file) : path
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: name, summary: summary, op: op)))
         }
     }
 

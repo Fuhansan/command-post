@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 /// 一个会话(任务)= 一个 claude 终端会话,按协议 `sid` 区分。
 struct RelaySession: Identifiable {
@@ -28,16 +29,24 @@ struct RelaySession: Identifiable {
 final class RelayClient: ObservableObject {
     @Published private(set) var connection: ConnectionState = .disconnected
     @Published private(set) var agents: [AgentInfo] = []
+    /// 全量登录设备(同账户的电脑+手机,含离线;来自 auth_ok)。「设置」页登录设备列表用。
+    @Published private(set) var devices: [DeviceRec] = []
     @Published private(set) var sessions: [RelaySession] = []
     /// 电脑端打开的项目列表(结构化,来自 `console:projects` 通道)。首页「项目区」用。
     @Published private(set) var projects: [ProjectInfo] = []
+    /// 默认根 + 归属目录:这些根下、不属于任何导入项目的会话 → 归默认文件夹。
+    @Published private(set) var defaultRoots: [String] = []
+
+    /// 服务器判定「登录已过期」(账号在别的手机登录)时回调 → 由 RootView 接到 AppState.sessionExpired()。
+    var onSessionExpired: (() -> Void)?
 
     /// 中转地址。iOS 模拟器可直连宿主机 127.0.0.1;真机改成电脑的局域网 IP。
     // MARK: - 服务器地址(设置页只填 IP + 端口,其余固定拼接)
 
     static let hostKey = "relay.serverHost"
     static let portKey = "relay.serverPort"
-    static let defaultHost = "127.0.0.1"
+    // 固定连公网中转服务器(VPS);登录不再让用户填 IP / 测连接。
+    static let defaultHost = "8.159.151.118"
     static let defaultPort = 8090
 
     static var savedHost: String {
@@ -154,6 +163,21 @@ final class RelayClient: ObservableObject {
     /// 跨会话待办数(通知 Tab 角标)。
     var pendingCount: Int { sessions.filter { !$0.pendingKind.isEmpty }.count }
 
+    /// 本机稳定唯一设备 id(每个 App 安装一个;别再写死 ios_device,否则多台手机/模拟器在服务器
+    /// 记录里会互相覆盖、无法区分)。
+    static var deviceId: String {
+        let key = "relay.deviceId"
+        if let v = UserDefaults.standard.string(forKey: key), !v.isEmpty { return v }
+        let v = "ios_" + UUID().uuidString.prefix(8).lowercased()
+        UserDefaults.standard.set(v, forKey: key)
+        return v
+    }
+    /// 设备展示名(尽量可区分:iOS 16+ UIDevice.name 多为机型名,模拟器为机型名)。
+    static var deviceName: String {
+        let n = UIDevice.current.name.trimmingCharacters(in: .whitespaces)
+        return n.isEmpty ? "iPhone" : n
+    }
+
     private func sendAuth() {
         guard let account else { return }
         let body = JSONValue.object([
@@ -161,9 +185,9 @@ final class RelayClient: ObservableObject {
             "token": .string(AppState.sessionToken ?? "ios"),
             "account": .string(account),
             "device": .object([
-                "id": .string("ios_device"),
+                "id": .string(Self.deviceId),
                 "platform": .string("ios"),
-                "name": .string("我的 iPhone")
+                "name": .string(Self.deviceName)
             ]),
             "caps": .object(["protocol": .number(1)])
         ])
@@ -176,18 +200,35 @@ final class RelayClient: ObservableObject {
         switch frame.t {
         case .authOk:
             agents = Self.parseAgents(frame.body)
+            devices = Self.parseDevices(frame.body)
             flushPending()   // 重连成功 → 补发断线期间未确认的上行
         case .presence:  applyPresence(frame.body)
         case .ui:        applyUI(frame)
         case .patch:     applyPatch(frame)
         case .ack:       applyAck(frame)
         case .error:
-            // 致命错误(如令牌失效被服务器拒绝)→ 停止自动重连,避免风暴;
-            // 用户重新登录后会以新令牌重连。
-            if frame.body?["fatal"]?.boolValue == true {
+            let code = frame.body?["code"]?.stringValue
+            if code == "session_expired" {
+                // 单活动:账号已在其它手机登录,本机令牌作废 → 清登录态、回登录页、停连。
+                ws.disconnect()
+                onSessionExpired?()
+            } else if frame.body?["fatal"]?.boolValue == true {
+                // 其它致命错误(如令牌失效被服务器拒绝)→ 停止自动重连,避免风暴;
+                // 用户重新登录后会以新令牌重连。
                 ws.disconnect()
             }
         default:         break
+        }
+    }
+
+    /// auth_ok 里的全量登录设备(电脑+手机,含离线)。
+    private static func parseDevices(_ body: JSONValue?) -> [DeviceRec] {
+        var seen = Set<String>()
+        return (body?["devices"]?.arrayValue ?? []).compactMap { d in
+            let id = d.string("id")
+            guard !id.isEmpty, seen.insert(id).inserted else { return nil }
+            return DeviceRec(id: id, name: d.string("name", default: id),
+                             role: d.string("role"), online: d["online"]?.boolValue ?? false)
         }
     }
 
@@ -204,56 +245,50 @@ final class RelayClient: ObservableObject {
         return out
     }
 
-    /// 断开某台电脑(服务器挂起它并踢下线;它的会话随 reset/离线清除)。
+    /// 暂停某台电脑(软暂停):服务器置暂停标志并通知电脑停止推送/忽略输入,但**保持连接**,
+    /// 随时可一键恢复 —— 不再「踢下线」,杜绝旧版重连死锁。
     func suspendAgent(_ agent: AgentInfo) {
         sendFrame(t: "ctl", id: "ctl_\(UUID().uuidString)", sid: nil,
                   body: .object(["op": .string("agent_suspend"),
                                  "agent": .string(agent.id),
                                  "name": .string(agent.name)]))
         if let i = agents.firstIndex(where: { $0.id == agent.id }) {
-            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: false, suspended: true)
+            // 乐观更新:仍在线,只是被暂停。服务器随后回 presence(paused) 确认。
+            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: agent.online, suspended: true)
         }
     }
 
-    /// 恢复某台电脑:解除挂起 → 显示「重连中」,电脑下一次探测(≤10s)上线;
-    /// 30s 仍未回来则落回离线(电脑可能根本没开机)。
+    /// 恢复某台电脑:解除暂停 → 电脑立即继续推送(连接一直都在,无需等重连)。
     func resumeAgent(_ agent: AgentInfo) {
         sendFrame(t: "ctl", id: "ctl_\(UUID().uuidString)", sid: nil,
                   body: .object(["op": .string("agent_resume"),
-                                 "agent": .string(agent.id)]))
+                                 "agent": .string(agent.id),
+                                 "name": .string(agent.name)]))
         if let i = agents.firstIndex(where: { $0.id == agent.id }) {
-            agents[i] = AgentInfo(id: agent.id, name: agent.name,
-                                  online: false, suspended: false, resuming: true)
-        }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            guard let self,
-                  let i = self.agents.firstIndex(where: { $0.id == agent.id }),
-                  self.agents[i].resuming, !self.agents[i].online else { return }
-            self.agents[i].resuming = false   // 超时:显示离线
+            agents[i] = AgentInfo(id: agent.id, name: agent.name, online: agent.online, suspended: false)
         }
     }
 
     private func applyPresence(_ body: JSONValue?) {
         guard let body, let id = body["agent_id"]?.stringValue else { return }
         let online = body["online"]?.boolValue ?? false
+        // paused 字段权威反映暂停态(软暂停下电脑可 online=true 且 paused=true);缺省时沿用旧值。
+        let pausedField = body["paused"]?.boolValue
         let name = body["name"]?.stringValue
         if let idx = agents.firstIndex(where: { $0.id == id }) {
-            // 离线且非挂起/非重连中 → 该电脑已下线,直接移除(不在列表里残留僵尸)
-            if !online && !agents[idx].suspended && !agents[idx].resuming {
+            let paused = pausedField ?? agents[idx].suspended
+            // 离线且未暂停 → 电脑真的关机了,移除(不残留僵尸);暂停态即便离线也保留,显示「已暂停·离线」。
+            if !online && !paused {
                 agents.remove(at: idx)
             } else {
-                let susp = online ? false : agents[idx].suspended
-                let resuming = online ? false : agents[idx].resuming
                 agents[idx] = AgentInfo(id: id, name: name ?? agents[idx].name,
-                                        online: online, suspended: susp, resuming: resuming)
+                                        online: online, suspended: paused)
             }
-        } else if online {
-            agents.append(AgentInfo(id: id, name: name ?? id, online: true))
+        } else if online || (pausedField ?? false) {
+            agents.append(AgentInfo(id: id, name: name ?? id, online: online, suspended: pausedField ?? false))
         }
-        // 客户端隔离(双保险):电脑离线 → 它的会话立即移除,不再展示旧数据。
-        // 服务端同时会代发该设备的 reset 并清快照;电脑重连后会全量重推。
-        if !online {
+        // 客户端隔离:电脑「真离线」(非暂停)→ 它的会话立即移除。暂停态保留画面(用户暂停时的快照)。
+        if !online && !(pausedField ?? false) {
             sessions.removeAll { $0.agentId == id }
         }
     }
@@ -301,13 +336,15 @@ final class RelayClient: ObservableObject {
     /// 解析 `console:projects` 通道的结构化项目列表 → 驱动首页「项目区」。
     private func applyProjects(_ body: JSONValue?) {
         let arr = body?["projects"]?.arrayValue ?? []
+        defaultRoots = (body?["defaultRoots"]?.arrayValue ?? []).compactMap { $0.stringValue }
         projects = arr.compactMap { p in
             let wd = p.string("workdir")
             guard !wd.isEmpty else { return nil }
             let hist = (p["history"]?.arrayValue ?? []).map {
                 ProjectHistory(id: $0.string("id"), label: $0.string("label"))
             }
-            return ProjectInfo(workdir: wd, name: p.string("name"), history: hist)
+            return ProjectInfo(workdir: wd, name: p.string("name"), history: hist,
+                               isDefault: p["isDefault"]?.boolValue ?? false)
         }
     }
 
@@ -421,11 +458,19 @@ final class RelayClient: ObservableObject {
                      body: .object(["action_id": .string(actionId), "value": .string(value)]))
     }
 
-    /// 某 cwd 属于哪个项目(最长前缀匹配)——把项目子目录里的手动会话也折叠进该项目。
+    /// 某 cwd 归到哪个文件夹(与桌面一致):① 导入项目(排除默认文件夹)最长前缀 → 该项目;
+    /// ② 否则在任一 defaultRoot/归属目录下 → 默认文件夹;③ 都不是 → nil(散在外面,首页平铺)。
     func project(forCwd cwd: String) -> ProjectInfo? {
-        projects
-            .filter { cwd == $0.workdir || cwd.hasPrefix($0.workdir + "/") }
-            .max(by: { $0.workdir.count < $1.workdir.count })
+        let imported = projects.filter { !$0.isDefault }
+        if let p = imported
+            .filter({ cwd == $0.workdir || cwd.hasPrefix($0.workdir + "/") })
+            .max(by: { $0.workdir.count < $1.workdir.count }) {
+            return p
+        }
+        if defaultRoots.contains(where: { cwd == $0 || cwd.hasPrefix($0 + "/") }) {
+            return projects.first { $0.isDefault }
+        }
+        return nil
     }
 
     /// 结束任务:请求电脑端关闭该 claude 会话(终止进程),随后会话经正常移除链路从手机消失。

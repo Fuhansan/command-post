@@ -27,10 +27,6 @@ struct MainTabView: View {
                 .badge(relay.pendingCount)
                 .tag(1)
 
-            DevicesView()
-                .tabItem { Label("设备", systemImage: "desktopcomputer") }
-                .tag(2)
-
             SettingsView()
                 .tabItem { Label("设置", systemImage: "gearshape") }
                 .tag(3)

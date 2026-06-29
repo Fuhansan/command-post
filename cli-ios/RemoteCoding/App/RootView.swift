@@ -22,7 +22,12 @@ struct RootView: View {
             }
         }
         .task { await updater.check() }   // 启动静默检查版本/公告
-        .onAppear { if appState.isLoggedIn { relay.connect(account: appState.account) } }
+        .onAppear {
+            // 单活动:服务器判定登录已过期 → 清登录态回登录页(并提示)。
+            let state = appState
+            relay.onSessionExpired = { state.sessionExpired() }
+            if appState.isLoggedIn { relay.connect(account: appState.account) }
+        }
         .onChange(of: appState.isLoggedIn) { _, loggedIn in
             if loggedIn { relay.connect(account: appState.account) }
             else { relay.disconnect() }

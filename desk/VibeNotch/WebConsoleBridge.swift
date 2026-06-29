@@ -17,7 +17,6 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private weak var manager: AgentSessionManager?
     private weak var store: SessionStore?
     private weak var relayAgent: RelayAgent?
-    private let pairing = PairingController()
     private var cancellables = Set<AnyCancellable>()
     private var ready = false
     // 增量推送状态:记录每个会话上次推送的 JSON 指纹,只推变化的那个(流式时关键)。
@@ -26,7 +25,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private var lastProjectsSig: String?
     private var sessionsScheduled = false
     private var manualScheduled = false
+    private var manualContentScheduled = false
+    private var lastManualContentSig: [String: String] = [:]
+    private var manualTxStat: [String: (size: UInt64, mtime: TimeInterval)] = [:]
     private var projectsScheduled = false
+    private var pollTimer: Timer?
 
     init(manager: AgentSessionManager, store: SessionStore, relayAgent: RelayAgent?) {
         self.manager = manager
@@ -49,9 +52,14 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         manager.$sessions.sink { [weak self] _ in self?.scheduleSessions() }.store(in: &cancellables)
         manager.$projects.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
         manager.$historyByProject.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
-        store.$sessions.sink { [weak self] _ in self?.scheduleManual() }.store(in: &cancellables)
+        // 默认工作目录 / 归属目录 一变,立刻重推项目(否则改了设置 web 不刷新,散会话归不进 workplace)。
+        AppSettings.shared.$defaultWorkdir.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
+        AppSettings.shared.$defaultSessionDirs.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
+        store.$sessions.sink { [weak self] _ in self?.scheduleManual(); self?.scheduleManualContent() }.store(in: &cancellables)
+        // 定时轮询活跃会话转录:入队/内容增长不触发 hook 事件,光等 store 变化会延迟几秒。
+        // 0.3s 看一眼(size+mtime 缓存,没长大就跳过),让「排队中」几乎即时显示。
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.scheduleManualContent() }
         relayAgent?.$connState.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
-        pairing.$state.sink { [weak self] _ in self?.pushConn() }.store(in: &cancellables)
     }
 
     private func loadFrontend() {
@@ -86,17 +94,41 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
               let action = obj["action"] as? String else { return }
         switch action {
         case "ready":
-            ready = true; pushState(); pushConn()
+            ready = true; pushState(); pushConn(); pushPrefs()
         case "setHost":
-            if let host = obj["host"] as? String { AgentServer.host = host; pushConn() }
-        case "pairStart":
-            pairing.start()
-        case "pairCancel":
-            pairing.cancel(); pushConn()
-        case "unpair":
-            AgentCredentials.clear()
-            NotificationCenter.default.post(name: .relayCredentialsChanged, object: nil)
-            pushConn()
+            if let host = obj["host"] as? String { AgentServer.host = host; pushConn(); pushPrefs() }
+        case "setLaunchAtLogin":
+            if let v = obj["value"] as? Bool { AppSettings.shared.launchAtLogin = v; pushPrefs() }
+        case "setMute":
+            if let v = obj["value"] as? Bool { AppSettings.shared.muted = v; pushPrefs() }
+        case "removeProject":
+            if let wd = obj["workdir"] as? String { manager?.removeProject(wd) }
+        case "pickDefaultWorkdir":
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.prompt = "设为默认工作目录"
+            if panel.runModal() == .OK, let url = panel.url {
+                AppSettings.shared.defaultWorkdir = url.path   // 观察者自动重推;散会话据此归入 workplace
+                scheduleProjects()
+            }
+        case "addDefaultSessionDir":
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.prompt = "归属到默认文件夹"
+            if panel.runModal() == .OK, let url = panel.url {
+                var dirs = AppSettings.shared.defaultSessionDirs
+                if !dirs.contains(url.path) { dirs.append(url.path); AppSettings.shared.defaultSessionDirs = dirs }
+                scheduleProjects()
+            }
+        case "removeDefaultSessionDir":
+            if let dir = obj["dir"] as? String {
+                AppSettings.shared.defaultSessionDirs.removeAll { $0 == dir }
+                scheduleProjects()
+            }
         case "openProject":
             let panel = NSOpenPanel()
             panel.canChooseDirectories = true
@@ -178,17 +210,67 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             }
             let before = (obj["beforeByte"] as? NSNumber)?.uint64Value
             loadTranscript(id: id, path: path, beforeByte: before)
+
+        // ── 账号登录:登录页 UI 在 React;调用走桥接(和会话/项目同一套),原生帮忙发请求 ──
+        // 每个请求带 reqId,结果经 "authResult" push 回带同一 reqId,前端 await 对应 promise。
+        case "checkAccount":
+            let r = reqId(obj); let acc = account(obj)
+            runAuth(r) { let c = try await DeviceLogin.check(account: acc); return ["exists": c.exists, "hasPassword": c.hasPassword] }
+        case "login":
+            let r = reqId(obj); let acc = account(obj); let pw = obj["password"] as? String ?? ""
+            runAuth(r) { ["account": try await DeviceLogin.login(account: acc, password: pw)] }
+        case "sendCode":
+            let r = reqId(obj); let acc = account(obj)
+            runAuth(r) { try await DeviceLogin.sendCode(account: acc); return [:] }
+        case "loginWithCode":
+            let r = reqId(obj); let acc = account(obj); let code = obj["code"] as? String ?? ""
+            runAuth(r) { ["account": try await DeviceLogin.loginWithCode(account: acc, code: code)] }
+        case "sendRegisterCode":
+            let r = reqId(obj); let acc = account(obj)
+            runAuth(r) { try await DeviceLogin.sendRegisterCode(account: acc); return [:] }
+        case "register":
+            let r = reqId(obj); let acc = account(obj); let code = obj["code"] as? String ?? ""; let pw = obj["password"] as? String ?? ""
+            runAuth(r) { ["account": try await DeviceLogin.register(account: acc, code: code, password: pw)] }
+        case "sendForgotCode":
+            let r = reqId(obj); let acc = account(obj)
+            runAuth(r) { try await DeviceLogin.sendForgotCode(account: acc); return [:] }
+        case "resetPassword":
+            let r = reqId(obj); let acc = account(obj); let code = obj["code"] as? String ?? ""; let pw = obj["password"] as? String ?? ""
+            runAuth(r) { try await DeviceLogin.resetPassword(account: acc, code: code, password: pw); return [:] }
+        case "logout":
+            AgentCredentials.clear()
+            NotificationCenter.default.post(name: .relayCredentialsChanged, object: nil)
+            pushConn()
+
         default:
             break
+        }
+    }
+
+    private func reqId(_ obj: [String: Any]) -> String { obj["reqId"] as? String ?? "" }
+    private func account(_ obj: [String: Any]) -> String {
+        (obj["account"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// 跑一个登录类异步请求,结果(成功 payload + ok / 失败 error)经 authResult push 回带 reqId。
+    private func runAuth(_ reqId: String, _ work: @escaping () async throws -> [String: Any]) {
+        Task { [weak self] in
+            var payload: [String: Any]
+            do { payload = try await work(); payload["ok"] = true }
+            catch { payload = ["ok": false, "error": (error as NSError).localizedDescription] }
+            payload["reqId"] = reqId
+            await MainActor.run { self?.pushJSON(type: "authResult", payload: payload); self?.pushConn() }
         }
     }
 
     private func raiseWindow(manualId: String) {
         guard let e = store?.sessions.first(where: { $0.id == manualId }),
               let start = e.ownerPID ?? e.terminalPID, start > 1,
-              let appPid = ProcessUtils.findTerminal(startPid: start).pid,
-              let app = NSRunningApplication(processIdentifier: appPid) else { return }
-        app.activate(options: [.activateIgnoringOtherApps])
+              let appPid = ProcessUtils.findTerminal(startPid: start).pid else { return }
+        // 控制台跑在后台:.activateIgnoringOtherApps 在 macOS 14+ 已失效(no-op)。
+        // 用 AX kAXFrontmost(jumpToTerminal 同款,已验证可从后台把 JetBrains/终端带到前台)。
+        if let app = NSRunningApplication(processIdentifier: appPid), app.isHidden { app.unhide() }
+        WindowActivator.bringAppFrontmost(pid: appPid)
     }
 
     private func loadFile(path: String) {
@@ -206,22 +288,69 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         }
     }
 
+    /// 把转录窗口解析成前端 transcript msg 数组(loadTranscript 与「活跃会话实时推」共用)。
+    /// nonisolated:可在后台线程解析,算完再回主线程推。
+    nonisolated private static func buildTranscriptMsgs(path: String, endByte: UInt64?)
+        -> (msgs: [[String: Any]], queued: [String], earliest: Int, hasEarlier: Bool) {
+        let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: endByte)
+        let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: endByte)
+        let msgs = win.messages.map { m -> [String: Any] in
+            var d: [String: Any] = ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
+            if let imgs = imgMap[m.ord] { d["images"] = imgs }   // 历史图片(thumb/url 都是 data URL)
+            if let op = m.op { d["op"] = toolOpJSON(op) }         // 结构化动作(diff/目录)
+            if let mo = m.model, !mo.isEmpty { d["model"] = mo }
+            if let ts = m.ts { d["ts"] = ts }
+            return d
+        }
+        return (msgs, win.queued, win.earliest, win.hasEarlier)
+    }
+
     private func loadTranscript(id: String, path: String?, beforeByte: UInt64?) {
         guard let path else { return }
         Task.detached(priority: .userInitiated) { [weak self] in
-            let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: beforeByte)
-            let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: beforeByte)
-            let msgs = win.messages.map { m -> [String: Any] in
-                var d: [String: Any] = ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
-                if let imgs = imgMap[m.ord] { d["images"] = imgs }   // 历史图片(thumb/url 都是 data URL)
-                return d
-            }
+            let r = Self.buildTranscriptMsgs(path: path, endByte: beforeByte)
             await MainActor.run {
                 self?.pushJSON(type: "transcript", payload: [
-                    "id": id, "messages": msgs, "earliest": win.earliest, "hasEarlier": win.hasEarlier,
+                    "id": id, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
                 ])
             }
         }
+    }
+
+    /// 活跃 hook 会话(working/waiting)的正文:随 store 变化重新解析转录尾窗 → 推 `transcript`
+    /// (前端按 id 替换合并 → 实时更新)。修复「前台终端会话正文冻结」:与 iOS 同样跟随活动。
+    /// 指纹去重避免没变化时空推;只对活跃会话做,idle/done 用户打开时 loadTranscript 一次即可。
+    private func pushManualContent() {
+        guard ready else { return }
+        for e in store?.sessions ?? [] {
+            guard let tp = e.transcriptPath else { continue }
+            // 转录没增长就跳过:避免长会话每次 store 变化(reply-poll 每 400ms)都重解析 256KB,
+            // 否则重复解析堆积 → web 比手机慢很多。stat 很廉价,只在文件真长大时才解析。
+            let attrs = try? FileManager.default.attributesOfItem(atPath: tp)
+            let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+            let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            if let s = manualTxStat[e.id], s.size == size, s.mtime == mtime { continue }
+            manualTxStat[e.id] = (size, mtime)
+            // 不限 working/waiting:hook 会话的最终回复在 Stop(state=done)才落盘转录,限了会漏最后一推。
+            let sid = e.id
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let r = Self.buildTranscriptMsgs(path: tp, endByte: nil)
+                await MainActor.run {
+                    guard let self, self.ready else { return }
+                    guard let sig = self.jsonSig(["m": r.msgs, "q": r.queued]) else { return }   // 排队变化也要推
+                    guard self.lastManualContentSig[sid] != sig else { return }
+                    self.lastManualContentSig[sid] = sig
+                    self.pushJSON(type: "transcript", payload: [
+                        "id": sid, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
+                    ])
+                }
+            }
+        }
+    }
+    private func scheduleManualContent() {
+        guard ready, !manualContentScheduled else { return }
+        manualContentScheduled = true
+        Task { @MainActor in self.manualContentScheduled = false; self.pushManualContent() }
     }
 
     // MARK: - Swift → JS
@@ -289,9 +418,35 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         pushJSON(type: "projects", payload: payload)
     }
 
+    private static var ensuredDefaultRoot: String?
+    /// 默认工作目录:桌面设置里设了就用它;没设则回退 ~/.vibenotch/workplace(并建好目录)。
+    /// 新建会话建在这;它 + 用户登记的「会话归属目录」共同决定哪些会话归到默认文件夹。
+    private func normPath(_ s: String) -> String {
+        var p = (s.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
+    }
+    private func resolvedDefaultWorkdir() -> String {
+        let set = AppSettings.shared.defaultWorkdir.trimmingCharacters(in: .whitespaces)
+        if !set.isEmpty { return normPath(set) }
+        if let c = Self.ensuredDefaultRoot { return c }
+        let p = NSString(string: "~/.vibenotch/workplace").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: p, withIntermediateDirectories: true)
+        Self.ensuredDefaultRoot = p
+        return p
+    }
+
     private func projectsPayload(_ manager: AgentSessionManager) -> [String: Any] {
         let meta = SessionMetaStore.shared
-        let projects = manager.projects.map { proj -> [String: Any] in
+        // 默认工作目录始终在列表里(供散会话归类 + 新建会话,且不可移除)。
+        let def = resolvedDefaultWorkdir()
+        // 「会话归属目录」:用户登记的、希望其会话归到默认文件夹的目录(不想导入成独立项目)。
+        let funnelDirs = AppSettings.shared.defaultSessionDirs.map { normPath($0) }
+        let roots = ([def] + funnelDirs).reduce(into: [String]()) { acc, p in if !acc.contains(p) { acc.append(p) } }
+        var wds = manager.projects
+        // 默认根 + 归属目录都进列表(为了把它们各自的历史也加载、带给前端);前端按 defaultRoots 决定「不渲染成文件夹、历史并进默认组」。
+        for r in roots where !wds.contains(r) { wds.insert(r, at: 0) }
+        let projects = wds.map { proj -> [String: Any] in
             manager.loadHistoryList(for: proj)   // 懒加载历史(已缓存则跳过)
             let hist = (manager.historyByProject[proj] ?? []).compactMap { h -> [String: Any]? in
                 if meta.isHidden(h.id) { return nil }
@@ -301,7 +456,9 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             return ["workdir": proj, "name": (proj as NSString).lastPathComponent, "history": hist]
         }
         let hidden = meta.hiddenEntries().map { ["key": $0.key, "title": $0.title] }
-        return ["projects": projects, "hidden": hidden]
+        // defaultRoots = 默认目录 + 归属目录:前端据此「不把它们渲染成文件夹、把它们的历史并进默认组」。
+        return ["projects": projects, "hidden": hidden, "defaultWorkdir": def,
+                "defaultRoots": roots, "defaultSessionDirs": funnelDirs]
     }
 
     /// 初次/重连:推一次全量 state,并把各会话指纹种好,后续走增量。
@@ -319,6 +476,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         pushJSON(type: "state", payload: [
             "projects": proj["projects"] ?? [], "sessions": sessions,
             "manual": manual, "hidden": proj["hidden"] ?? [],
+            "defaultWorkdir": proj["defaultWorkdir"] ?? "",
+            "defaultRoots": proj["defaultRoots"] ?? [], "defaultSessionDirs": proj["defaultSessionDirs"] ?? [],
         ])
     }
 
@@ -336,15 +495,26 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             "host": AgentServer.host,
             "paired": RelayAgent.isPaired,
             "account": AgentCredentials.account ?? "",
+            "loggedIn": !(AgentCredentials.account ?? "").isEmpty,
             "state": connKey(st),
             "text": connText(st),
-            "pair": pairDTO(pairing.state),
         ])
     }
+    /// 偏好设置(原菜单栏「设置」搬到 web 控制台设置页):中转地址 + 开机启动 + 静音。
+    private func pushPrefs() {
+        guard ready else { return }
+        pushJSON(type: "prefs", payload: [
+            "host": AgentServer.host,
+            "launchAtLogin": AppSettings.shared.launchAtLogin,
+            "muted": AppSettings.shared.muted,
+        ])
+    }
+
     private func connKey(_ s: RelayAgent.ConnState) -> String {
         switch s {
         case .unpaired: return "unpaired"; case .connecting: return "connecting"
-        case .online: return "online"; case .suspendedByPhone: return "suspended"
+        case .online: return "online"; case .pausedByPhone: return "paused"
+        case .suspendedByPhone: return "suspended"
         case .rejected: return "rejected"; case .offline: return "offline"
         }
     }
@@ -352,22 +522,13 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         switch s {
         case .online:           return "已连接中转服务器"
         case .connecting:       return "连接中…"
-        case .suspendedByPhone: return "已被手机端断开 —— 在手机「设备」页点「重连」恢复"
+        case .pausedByPhone:    return "已被手机端暂停 —— 在手机「设备」页点「恢复」即可继续(连接保持)"
+        case .suspendedByPhone: return "已被手机端挂起 —— 10s 后自动重试"
         case .rejected(let c):  return "被服务器拒绝(\(c)),请重新配对"
         case .unpaired:         return "未配对,离线"
         case .offline:          return "离线,自动重连中…"
         }
     }
-    private func pairDTO(_ s: PairingController.State) -> [String: Any] {
-        switch s {
-        case .idle:               return ["phase": "idle"]
-        case .fetching:           return ["phase": "fetching"]
-        case .waiting(let code):  return ["phase": "waiting", "code": code]
-        case .done(let account):  return ["phase": "done", "account": account]
-        case .failed(let msg):    return ["phase": "failed", "error": msg]
-        }
-    }
-
     /// 会话的稳定 key:优先 claude session_id(跨重启/与历史统一),没有则用内部 id。
     private func sessionKey(_ s: AgentSession) -> String {
         if let a = s.agentSessionId, !a.isEmpty { return a }
@@ -376,7 +537,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     private func manualDTO(_ e: SessionEntry) -> [String: Any]? {
         let meta = SessionMetaStore.shared
-        if meta.isHidden(e.id) { return nil }
+        if meta.isHidden(e.id) {
+            // 隐藏=归档。但若这个终端会话又活跃了(在 JetBrains/终端里 resume/继续干活),
+            // 说明用户重新需要它 → 取消归档并照常显示(否则它一直隐身,前台终端唤不起来)。
+            let live = manualState(e.state) == "working" || manualState(e.state) == "waiting"
+            if live { meta.unhide(e.id) } else { return nil }
+        }
         let agent = e.transcriptPath.flatMap { CodingAgents.forTranscript($0)?.id } ?? "claude"
         let base = e.promptSummary.map { String($0.prefix(40)) }
             ?? e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }.map { String($0.prefix(40)) }
@@ -422,6 +588,9 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         }
         if let ps = m.permState { d["permState"] = ps }
         if let pr = m.permReqId { d["permReqId"] = pr }
+        if let op = m.op { d["op"] = toolOpJSON(op) }
+        if let mo = m.model, !mo.isEmpty { d["model"] = mo }
+        if let ts = m.ts { d["ts"] = ts }
         return d
     }
 
@@ -479,6 +648,19 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
               let json = String(data: data, encoding: .utf8) else { return }
         webView.evaluateJavaScript("window.__agent && window.__agent.push(\(json))", completionHandler: nil)
     }
+}
+
+/// 结构化动作 → JSON(msgDTO 与转录加载共用;放文件作用域,供 off-main 转录解析直接调)。
+func toolOpJSON(_ op: ToolOp) -> [String: Any] {
+    var d: [String: Any] = ["kind": op.kind.rawValue, "file": op.file, "dir": op.dir]
+    if let a = op.add { d["add"] = a }
+    if let de = op.del { d["del"] = de }
+    if op.sameFile { d["sameFile"] = true }
+    if let c = op.command { d["command"] = c }
+    if !op.diff.isEmpty { d["diff"] = op.diff.map { ["k": $0.kind, "t": $0.text] } }
+    if !op.output.isEmpty { d["output"] = op.output }
+    if let l = op.label { d["label"] = l }
+    return d
 }
 
 /// 把打包进 app 的 dist/ 文件用 app:// scheme 喂给 WKWebView。

@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastHoverState: Bool = false
     private static let hoverCollapseGrace: TimeInterval = 0.20
     let store = SessionStore()
+    /// 消息枢纽:terminal/console 会话规范化的单一来源(见 docs/message-hub.md)。出口订阅它取数据。
+    lazy var conversationHub = ConversationHub(store: store)
     /// stream-json 新架构的多会话宿主(与旧 hook 路径并存,经 Agent 控制台使用)。
     let agentManager = AgentSessionManager()
     let pendingStore = PendingDecisionStore()
@@ -150,7 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 接入 AI Coding Remote 中转：把会话推给手机,并把手机的 Allow/Deny 接到 decide()。
     private func setupRelayAgent() {
-        let agent = RelayAgent(store: store, pending: pendingStore)
+        let agent = RelayAgent(store: store, pending: pendingStore, hub: conversationHub)
         agent.onRemoteDecision = { [weak self] sid, decision in
             guard let self else { return }
             // 仅当该会话确实在等待决定时才处理(防止手机误点已过期的卡)。
@@ -206,8 +208,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                self?.focusEditableInputIfNeeded(sessionId: sid)
-                TerminalTyper.type(message)
+                guard let self else { return }
+                // 唤起窗口后,先把焦点落到终端(IDE 内置终端常常焦点在编辑器上),再打字。
+                let focused = self.focusEditableInputIfNeeded(sessionId: sid)
+                DispatchQueue.main.asyncAfter(deadline: .now() + (focused ? 0.2 : 0.0)) {
+                    TerminalTyper.type(message)
+                }
             }
             vlog("relay input via GUI 回退 sid=\(sid.prefix(8)) len=\(message.count)")
         }
@@ -268,7 +274,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agent.agentManager = agentManager   // 控制台(stream-json)会话也桥接到手机(start 内订阅)
         agent.start()
         relayAgent = agent
-        SettingsWindowController.shared.relayAgent = agent
 
         // 手机配对成功 / 退出登录 → 以新账号身份重连中转
         NotificationCenter.default.addObserver(forName: .relayCredentialsChanged,
@@ -370,6 +375,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         store.apply(event)
 
+        // 终端用 `--continue`/`--resume` 抢占了控制台会话(同 session_id,但 ppid 不是本管理器进程
+        // —— 上面的 isConsoleSession 早退已排除自家进程,到这里必是 foreign)。先 store.apply 让终端
+        // 会话落地,再杀掉控制台那个 claude(只保活一个进程)、移除控制台条目 → 前端按 session_id 原地
+        // 翻牌成「终端会话」。未命中廉价返回(每事件一次)。
+        if let sid = event.sessionId, agentManager.handoffToTerminal(agentSessionId: sid) {
+            vlog("terminal preempt session=\(sid.prefix(8)) → 控制台让位翻牌")
+        }
+
         // 每个工具/停止事件来时立即读一次转录,不等下一次 800ms 轮询 → 执行完一步即时显示
         // (刘海 + 手机两端都受益,因为 RelayAgent 订阅 store 变化即时推送)。
         if let sid = event.sessionId, let path = event.transcriptPath {
@@ -387,6 +400,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if event.hookEventName == "UserPromptSubmit",
            let sid = event.sessionId,
            let path = event.transcriptPath {
+            // 在前台终端里又发了新 prompt = 用户重新启用这个会话 →
+            // 取消归档(隐藏),让它作为「活的终端会话」在控制台/手机重新出现(带唤起)。
+            // 这里已过了 isConsoleSession 早退,必是 hook(终端)会话。
+            SessionMetaStore.shared.unhide(sid)
             scheduleReplyRefresh(sessionId: sid, transcriptPath: path)
         }
         // Also start a poll on Stop in case the App was launched mid-turn and
@@ -505,21 +522,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return false
         }
 
+        // 关键:App 被 Cmd+H 隐藏后,窗口既枚举不到也 raise 不了 —— 先取消隐藏再说。
+        // (手机遥控时电脑那头大概率没把 IDE 摆在前台,这一步保证「唤起」真的发生。)
+        if app.isHidden {
+            app.unhide()
+            vlog("jump: app 处于隐藏态,先 unhide pid=\(pid)")
+        }
+
         if Self.ideTerminalKinds.contains(kind) {
             if !WindowActivator.isAccessibilityTrusted {
                 WindowActivator.requestAccessibilityIfNeeded()
                 vlog("jump: AX not trusted — prompting; falling back to whole-app activate")
-            } else if WindowActivator.activateWindow(pid: pid, cwd: entry.cwd) {
-                vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) AX-window-match cwd=\(entry.cwd)")
-                return true
             } else {
-                vlog("jump: sid=\(sessionId.prefix(8)) AX no window match for cwd=\(entry.cwd) — falling back")
+                let matched = WindowActivator.activateWindow(pid: pid, cwd: entry.cwd)
+                vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) (\(app.localizedName ?? "?")) window=\(matched ? "raised" : "none") cwd=\(entry.cwd)")
             }
+            // IDE 在跑就算唤起成功。关键:手机触发时 VibeNotch 在后台,普通 activate 抢不到前台
+            // (现代 macOS 禁止后台抢焦点),改走 AX 强制置前(bringAppFrontmost,后台也生效)。
+            WindowActivator.bringAppFrontmost(pid: pid)
+            return true
         }
 
-        let ok = app.activate(options: [.activateAllWindows])
-        vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) kind=\(kind.displayName) (\(app.localizedName ?? "?")) ok=\(ok)")
-        return ok
+        // 非 IDE 独立终端:窗口即焦点,AX 强制置前即可。
+        WindowActivator.bringAppFrontmost(pid: pid)
+        vlog("jump: sid=\(sessionId.prefix(8)) → pid=\(pid) kind=\(kind.displayName) (\(app.localizedName ?? "?")) 置前")
+        return true
     }
 
     private func hostForSession(_ entry: SessionEntry) -> (TerminalKind, pid_t?) {
@@ -528,12 +555,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (.unknown, nil)
     }
 
-    private func focusEditableInputIfNeeded(sessionId: String) {
-        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return }
+    /// 注入前先把焦点落到目标会话的输入处,避免「窗口唤起了但焦点在编辑器」导致打字打飞。
+    /// - Codex(Electron):聚焦聊天 composer(第一个可编辑框)。
+    /// - IDE 内置终端(JetBrains/VS Code/Cursor/…):专门挑「终端」那个可编辑框聚焦。
+    /// 返回是否真的聚焦了(调用方据此决定多等一会儿再打字)。
+    @discardableResult
+    private func focusEditableInputIfNeeded(sessionId: String) -> Bool {
+        guard let entry = store.sessions.first(where: { $0.id == sessionId }) else { return false }
         let host = hostForSession(entry)
-        guard host.0 == .codex, let pid = host.1 else { return }
+        guard let pid = host.1 else { return false }
+        // 只有 Codex(Electron 聊天框)需要主动把焦点落到 composer。其余终端(IntelliJ/Terminal/
+        // iTerm/…)一律**不抢焦点**,直接往当前焦点打字 —— 通用、不针对某个终端搞特例。
+        // (曾尝试给 IntelliJ 用 AX 找终端聚焦,但 IntelliJ 终端不暴露给辅助功能,反而误聚焦到
+        //  代码编辑器,把消息打进了源码文件 —— 已撤销。)
+        guard host.0 == .codex else { return false }
         let ok = WindowActivator.focusEditableText(pid: pid)
         vlog("relay input focus Codex sid=\(sessionId.prefix(8)) pid=\(pid) ok=\(ok)")
+        return ok
     }
 
     /// 45-second watchdog tripped without an Allow/Deny click. Connection is
@@ -580,7 +618,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sink { [weak self] _ in
                 Task { @MainActor in
                     self?.rebuildStatusMenu()
-                    SettingsWindowController.shared.refreshTitle()
                 }
             }
     }
@@ -592,17 +629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let locale = L10n.resolved(from: AppSettings.shared.language)
         menu.removeAllItems()
 
-        menu.addItem({
-            let mi = NSMenuItem(
-                title: L10n.t(.menuSettings, locale: locale),
-                action: #selector(openSettings),
-                keyEquivalent: ","
-            )
-            mi.keyEquivalentModifierMask = [.command]
-            return mi
-        }())
-
-        // Web 控制台(WKWebView + React)
+        // Web 控制台(WKWebView + React)—— 设置已并入控制台「设置」页,菜单栏不再单列
         menu.addItem({
             let mi = NSMenuItem(title: "Agent 控制台",
                                 action: #selector(openWebConsole), keyEquivalent: "")
@@ -675,9 +702,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         WebConsoleWindowController.shared.show()
     }
 
-    @objc private func openSettings() {
-        SettingsWindowController.shared.show()
-    }
 
     @objc private func quit() {
         NSApp.terminate(nil)

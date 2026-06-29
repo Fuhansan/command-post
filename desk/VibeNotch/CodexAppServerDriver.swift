@@ -371,7 +371,15 @@ final class CodexAppServerDriver: AgentDriver {
         case "commandExecution":
             let cmd = item["command"] as? String ?? ""
             guard !cmd.isEmpty else { return }
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: "Shell", summary: cmd)))
+            var op = ToolOp(kind: .bash); op.command = cmd
+            op.file = cmd.split(separator: " ").first.map(String.init) ?? "bash"
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: "Shell", summary: cmd, op: op)))
+            // 完成时回填输出(codex 各版本字段名不一,挨个兜底)。
+            if completed, let out = (item["aggregatedOutput"] ?? item["output"] ?? item["stdout"]) as? String, !out.isEmpty {
+                var lines = out.components(separatedBy: "\n")
+                if lines.count > 40 { lines = Array(lines.prefix(40)) + ["… 已省略"] }
+                emit.yield(.toolOutput(id: id, lines: lines))
+            }
         case "fileChange":
             for path in fileChangePaths(item) {
                 emit.yield(.fileEdit(FileEditInfo(path: path, additions: 0)))
@@ -379,12 +387,16 @@ final class CodexAppServerDriver: AgentDriver {
         case "mcpToolCall":
             let server = item["server"] as? String ?? "mcp"
             let tool = item["tool"] as? String ?? "tool"
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: server, summary: tool)))
+            var op = ToolOp(kind: .other); op.label = server; op.file = tool
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: server, summary: tool, op: op)))
         case "dynamicToolCall":
             let tool = item["tool"] as? String ?? "tool"
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: tool, summary: compactJSON(item["arguments"]) ?? "")))
+            var op = ToolOp(kind: .other); op.label = "工具"; op.file = tool
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: tool, summary: compactJSON(item["arguments"]) ?? "", op: op)))
         case "webSearch":
-            emit.yield(.toolCall(ToolCallInfo(id: id, name: "WebSearch", summary: item["query"] as? String ?? "")))
+            let q = item["query"] as? String ?? ""
+            var op = ToolOp(kind: .other); op.label = "联网"; op.file = q
+            emit.yield(.toolCall(ToolCallInfo(id: id, name: "WebSearch", summary: q, op: op)))
         default:
             break
         }

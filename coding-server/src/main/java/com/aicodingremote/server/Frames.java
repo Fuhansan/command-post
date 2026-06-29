@@ -16,22 +16,38 @@ final class Frames {
 
     private Frames() {}
 
-    /** PROTOCOL §8.1 —— 握手成功，回带账号下在线 Agent + 被挂起的 Agent 列表。 */
+    /** PROTOCOL §8.1 —— 握手成功，回带账号下在线 Agent + 被挂起的 Agent 列表 + 全量登录设备列表。 */
     static String authOk(String account, Collection<Connection> agents,
-                         java.util.Map<String, String> suspendedAgents) {
+                         java.util.Map<String, String> suspendedAgents,
+                         java.util.List<java.util.Map<String, Object>> devices) {
         ObjectNode f = M.createObjectNode();
         f.put("v", 1).put("t", "auth_ok").put("from", "server");
         ObjectNode body = f.putObject("body");
         body.put("user_id", account);
         body.put("last_seq", 0);
+        // 全量登录设备(client + agent,含离线),供「登录设备列表」展示、区分是哪台。
+        ArrayNode darr = body.putArray("devices");
+        for (var d : devices) {
+            ObjectNode o = darr.addObject();
+            o.put("id", String.valueOf(d.get("id")));
+            o.put("name", String.valueOf(d.get("name")));
+            o.put("role", String.valueOf(d.get("role")));
+            o.put("online", Boolean.TRUE.equals(d.get("online")));
+        }
         ArrayNode arr = body.putArray("agents");
+        // 软暂停:被暂停的电脑通常仍在线(保持连接)。在线列表里直接标 suspended,
+        // 避免与下面的「离线暂停」列表重复(否则同一台电脑出现两条)。
+        java.util.Set<String> onlineIds = new java.util.HashSet<>();
         for (Connection a : agents) {
+            onlineIds.add(a.deviceId);
             ObjectNode o = arr.addObject();
             o.put("id", a.deviceId);
             o.put("name", a.deviceName);
             o.put("online", true);
+            o.put("suspended", suspendedAgents.containsKey(a.deviceId));
         }
         suspendedAgents.forEach((id, name) -> {
+            if (onlineIds.contains(id)) return;   // 已在在线列表里标过暂停
             ObjectNode o = arr.addObject();
             o.put("id", id);
             o.put("name", name);
@@ -43,12 +59,26 @@ final class Frames {
 
     /** PROTOCOL §8.2 —— Agent 上线 / 下线广播给 Client（附带展示名,只增字段）。 */
     static String presence(String agentId, String name, boolean online) {
+        return presence(agentId, name, online, false);
+    }
+
+    /** 同上,附带「是否被手机暂停」。软暂停下电脑可 online=true 且 paused=true。 */
+    static String presence(String agentId, String name, boolean online, boolean paused) {
         ObjectNode f = M.createObjectNode();
         f.put("v", 1).put("t", "presence").put("from", "server");
         ObjectNode body = f.putObject("body");
         body.put("agent_id", agentId);
         body.put("name", name);
         body.put("online", online);
+        body.put("paused", paused);
+        return f.toString();
+    }
+
+    /** 服务器 → Agent 的软暂停控制:op=pause 暂停推送/忽略输入(不断开),op=resume 恢复。 */
+    static String agentCtl(String op) {
+        ObjectNode f = M.createObjectNode();
+        f.put("v", 1).put("t", "ctl").put("from", "server");
+        f.putObject("body").put("op", op);
         return f.toString();
     }
 

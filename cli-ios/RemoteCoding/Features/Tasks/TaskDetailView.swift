@@ -132,8 +132,8 @@ struct TaskDetailView: View {
                     statusLabel(msg)
                 }
             }
-        } else if msg.root.type == "toolchip" {
-            content.padding(.leading, 44)   // 缩进对齐头像后的内容
+        } else if msg.root.type == "toolchip" || msg.root.type == "toolop" {
+            content.padding(.leading, 44)   // 工具动作行:缩进对齐头像后的内容,紧凑无头像
         } else {
             HStack(alignment: .top, spacing: 10) {
                 let style = messageAvatarStyle(for: msg.root)

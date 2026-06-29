@@ -21,9 +21,18 @@ struct ProjectRow: View {
                 RoundedRectangle(cornerRadius: 12)
                     .fill(Theme.blueBtn.gradient)
                     .frame(width: 44, height: 44)
-                    .overlay(Image(systemName: "folder.fill").font(.system(size: 18)).foregroundStyle(.white))
+                    .overlay(Image(systemName: project.isDefault ? "square.stack.3d.up.fill" : "folder.fill")
+                        .font(.system(size: 18)).foregroundStyle(.white))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(project.name).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                    HStack(spacing: 6) {
+                        Text(project.isDefault ? "默认工作目录" : project.name)
+                            .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                        if project.isDefault {
+                            Text("默认").font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.blue)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(Theme.blue.opacity(0.16)).clipShape(Capsule())
+                        }
+                    }
                     Text(shortMacPath(project.workdir))
                         .font(.system(size: 12, design: .monospaced)).foregroundStyle(Theme.textSec)
                         .lineLimit(1).truncationMode(.head)

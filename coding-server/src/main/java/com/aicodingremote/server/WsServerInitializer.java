@@ -19,11 +19,13 @@ final class WsServerInitializer extends ChannelInitializer<SocketChannel> {
     private final Hub hub;
     private final String path;
     private final UserStore users;
+    private final MQRelay mqRelay;
 
-    WsServerInitializer(Hub hub, String path, UserStore users) {
+    WsServerInitializer(Hub hub, String path, UserStore users, MQRelay mqRelay) {
         this.hub = hub;
         this.path = path;
         this.users = users;
+        this.mqRelay = mqRelay;
     }
 
     @Override
@@ -37,6 +39,6 @@ final class WsServerInitializer extends ChannelInitializer<SocketChannel> {
         // 第三参 true = 处理关闭帧；WS 协议层 ping/pong 由它处理,应用层 ping/pong 走 JSON 文本帧。
         // 第四参:WS 单帧上限(默认 64KB,不够装图片)。
         p.addLast(new WebSocketServerProtocolHandler(path, null, true, MAX_FRAME));
-        p.addLast(new FrameHandler(hub, users));
+        p.addLast(new FrameHandler(hub, users, mqRelay));
     }
 }

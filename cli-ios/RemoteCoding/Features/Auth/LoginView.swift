@@ -6,14 +6,6 @@ import GoogleSignIn
 ///   日常 = 邮箱 + 密码(只连自己的服务器,国内单 Tailscale 即可,不再碰 Google)。
 struct LoginView: View {
     @EnvironmentObject private var appState: AppState
-    @AppStorage(RelayClient.hostKey) private var serverHost: String = RelayClient.defaultHost
-    @AppStorage(RelayClient.portKey) private var serverPort: Int = RelayClient.defaultPort
-
-    @State private var host = ""
-    @State private var portText = ""
-    @State private var reachable = false
-    @State private var testing = false
-    @State private var serverMsg: String?
 
     @State private var account = ""
     @State private var password = ""
@@ -49,14 +41,12 @@ struct LoginView: View {
     @State private var loginStep: Step = .email
     @State private var resetStep: Step = .email
 
-    private var port: Int { Int(portText) ?? 0 }
-    private var serverValid: Bool { !RelayClient.sanitizeHost(host).isEmpty && (1...65535).contains(port) }
     private func isEmail(_ s: String) -> Bool { s.trimmingCharacters(in: .whitespaces).contains("@") }
     private var canLogin: Bool {
-        reachable && !account.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 4
+        !account.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 4
     }
     private var canSendReset: Bool {
-        reachable && resetAccount.trimmingCharacters(in: .whitespaces).contains("@")
+        resetAccount.trimmingCharacters(in: .whitespaces).contains("@")
     }
 
     var body: some View {
@@ -72,7 +62,19 @@ struct LoginView: View {
                     Text("AI Coding Remote")
                         .font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.text)
 
-                    serverCard
+                    if appState.sessionExpiredNotice {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 13))
+                            Text("登录已过期 —— 你的账号已在其它手机登录,请重新登录")
+                                .font(.system(size: 13, weight: .medium))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .foregroundStyle(Theme.gold)
+                        .padding(.horizontal, 12).padding(.vertical, 10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.gold.opacity(0.15)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+
                     loginCard
 
                     if let errorMessage {
@@ -86,38 +88,7 @@ struct LoginView: View {
             .scrollDismissesKeyboard(.interactively)
             .dismissKeyboardOnTap()
         }
-        .onAppear { host = serverHost; portText = String(serverPort) }
         .sheet(isPresented: $showReset) { resetSheet }
-    }
-
-    private var serverCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("中转服务器(电脑的局域网 / Tailscale IP)")
-                .font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.textSec)
-            HStack(spacing: 10) {
-                field($host, prompt: "IP,如 100.84.170.113", keyboard: .URL, width: nil, secure: false)
-                    .onChange(of: host) { _, _ in reachable = false; serverMsg = nil }
-                field($portText, prompt: "端口", keyboard: .numberPad, width: 78, secure: false)
-                    .onChange(of: portText) { _, _ in reachable = false; serverMsg = nil }
-            }
-            Button(action: testConnection) {
-                HStack(spacing: 6) {
-                    if testing { ProgressView().controlSize(.mini) }
-                    else { Image(systemName: reachable ? "checkmark.circle.fill" : "wifi") }
-                    Text(testing ? "测试中…" : (reachable ? "连接正常" : "测试连接"))
-                        .font(.system(size: 14, weight: .semibold))
-                }
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity).padding(.vertical, 11)
-                .background(reachable ? Theme.green : Theme.blueBtn)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-            .buttonStyle(.plain).disabled(testing || !serverValid)
-            if let m = serverMsg {
-                Text(m).font(.system(size: 12)).foregroundStyle(reachable ? Theme.green : Theme.coral)
-            }
-        }
-        .padding(16).frame(maxWidth: .infinity, alignment: .leading).cardStyle()
     }
 
     private var loginCard: some View {
@@ -131,11 +102,7 @@ struct LoginView: View {
                 field($account, prompt: "邮箱", keyboard: .emailAddress, width: nil, secure: false)
                     .textContentType(.username)
                 Button(action: proceedEmail) { primaryLabel(checking ? "请稍候…" : "下一步", loading: checking) }
-                    .buttonStyle(.plain).disabled(!reachable || !isEmail(account) || checking)
-                if !reachable {
-                    Text("请先在上方测试连接到服务器")
-                        .font(.system(size: 12)).foregroundStyle(Theme.textTer)
-                }
+                    .buttonStyle(.plain).disabled(!isEmail(account) || checking)
 
             case .password:
                 accountHeader(account) { backToEmail() }
@@ -312,16 +279,11 @@ struct LoginView: View {
 
     // MARK: - 动作
 
-    private func testConnection() {
-        testing = true; serverMsg = nil; reachable = false
-        let h = RelayClient.sanitizeHost(host), p = port
-        Task {
-            let r = await RelayClient.testServer(host: h, port: p)
-            if r.ok { serverHost = h; serverPort = p; reachable = true }
-            serverMsg = r.ok ? r.message
-                : "✗ \(r.message) —— 检查 IP/端口、电脑服务器是否运行、手机 Tailscale 是否连接"
-            testing = false
-        }
+    /// 错误文案:网络类(连不到服务器)统一提示「网络异常」;服务器返回的业务错误(密码错/验证码错)原样显示。
+    private func friendly(_ error: Error) -> String {
+        if error is URLError { return "网络异常,请检查网络后重试" }
+        let m = friendly(error)
+        return m.isEmpty ? "网络异常,请检查网络后重试" : m
     }
 
     private func doLogin() {
@@ -331,13 +293,12 @@ struct LoginView: View {
             do {
                 let r = try await AuthAPI.login(account: acc, password: pwd)
                 appState.login(account: r.account, token: r.token)
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             loading = false
         }
     }
 
     private func signInGoogle() {
-        guard reachable else { return }
         guard let rootVC = UIApplication.shared.connectedScenes
             .compactMap({ ($0 as? UIWindowScene)?.keyWindow })
             .first?.rootViewController else { return }
@@ -365,7 +326,7 @@ struct LoginView: View {
                         newPassword = ""; setPwError = nil
                         showSetPassword = true
                     }
-                } catch { errorMessage = error.localizedDescription }
+                } catch { errorMessage = friendly(error) }
                 loading = false
             }
         }
@@ -388,7 +349,7 @@ struct LoginView: View {
                     try await AuthAPI.loginCode(account: acc)
                     code = ""; withAnimation { loginStep = .code }
                 }
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             checking = false
         }
     }
@@ -407,7 +368,7 @@ struct LoginView: View {
                 try await AuthAPI.loginCode(account: acc)
                 codeFor = .login; code = ""
                 withAnimation { loginStep = .code }
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             codeSending = false
         }
     }
@@ -421,7 +382,7 @@ struct LoginView: View {
                 try await AuthAPI.registerCode(account: acc)
                 codeFor = .register; code = ""
                 withAnimation { loginStep = .code }
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             codeSending = false
         }
     }
@@ -441,7 +402,7 @@ struct LoginView: View {
                     r = try await AuthAPI.loginVerify(account: acc, code: c)
                 }
                 appState.login(account: r.account, token: r.token)
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             loading = false
         }
     }
@@ -454,7 +415,7 @@ struct LoginView: View {
             do {
                 if codeFor == .register { try await AuthAPI.registerCode(account: acc) }
                 else { try await AuthAPI.loginCode(account: acc) }
-            } catch { errorMessage = error.localizedDescription }
+            } catch { errorMessage = friendly(error) }
             codeSending = false
         }
     }
@@ -475,7 +436,7 @@ struct LoginView: View {
                 try await AuthAPI.forgotPassword(account: acc)
                 resetInfo = nil
                 withAnimation { if resetStep == .email { resetStep = .code } }
-            } catch { resetError = error.localizedDescription }
+            } catch { resetError = friendly(error) }
             resetSending = false
         }
     }
@@ -491,7 +452,7 @@ struct LoginView: View {
                 showReset = false
                 account = acc; password = ""; loginStep = .password   // 回登录页密码步,预填邮箱
                 errorMessage = "密码已重置,请用新密码登录"
-            } catch { resetError = error.localizedDescription }
+            } catch { resetError = friendly(error) }
             loading = false
         }
     }
@@ -505,7 +466,7 @@ struct LoginView: View {
                 try await AuthAPI.setPassword(token: token, password: pwd)
                 showSetPassword = false
                 appState.login(account: setPwAccount, token: token)   // 设好即登录
-            } catch { setPwError = error.localizedDescription }
+            } catch { setPwError = friendly(error) }
             loading = false
         }
     }

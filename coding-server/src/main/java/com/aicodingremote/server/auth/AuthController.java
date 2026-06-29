@@ -70,7 +70,7 @@ public class AuthController {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "该邮箱未注册"));
         }
         return switch (codes.check(account, req.code())) {
-            case OK -> ResponseEntity.ok(Map.of("account", account, "token", store.issueToken(account)));
+            case OK -> ResponseEntity.ok(Map.of("account", account, "token", store.issueClientToken(account)));
             case WRONG    -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "验证码错误"));
             case TOO_MANY -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "尝试次数过多,请重新获取验证码"));
             default       -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "验证码已过期,请重新获取"));
@@ -88,7 +88,37 @@ public class AuthController {
             }
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "账号或密码错误"));
         }
+        return ResponseEntity.ok(Map.of("account", account, "token", store.issueClientToken(account)));
+    }
+
+    /** 电脑端登录:邮箱+密码,签发普通令牌(不进单活动 —— 电脑随时可连,且不踢手机)。
+     *  取代旧的「配对码」流程。 */
+    @PostMapping("/device-login")
+    public ResponseEntity<Map<String, String>> deviceLogin(@RequestBody Credentials c) {
+        String account = norm(c.account());
+        if (!store.verify(account, c.password() == null ? "" : c.password())) {
+            if (store.exists(account) && !store.hasPassword(account)) {
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("error", "该账号尚未设置密码,请先用 Google 登录并设置密码"));
+            }
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "账号或密码错误"));
+        }
         return ResponseEntity.ok(Map.of("account", account, "token", store.issueToken(account)));
+    }
+
+    /** 电脑端验证码登录 - 验码并签发普通令牌(不进单活动)。发码复用 /login/code。 */
+    @PostMapping("/device-login/verify")
+    public ResponseEntity<Map<String, String>> deviceLoginVerify(@RequestBody CodeLoginReq req) {
+        String account = norm(req.account());
+        if (!store.exists(account)) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "该邮箱未注册"));
+        }
+        return switch (codes.check(account, req.code())) {
+            case OK -> ResponseEntity.ok(Map.of("account", account, "token", store.issueToken(account)));
+            case WRONG    -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "验证码错误"));
+            case TOO_MANY -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(Map.of("error", "尝试次数过多,请重新获取验证码"));
+            default       -> ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "验证码已过期,请重新获取"));
+        };
     }
 
     /** 设置密码:用 Google 登录拿到的 token 鉴权,给当前账号设密码。 */

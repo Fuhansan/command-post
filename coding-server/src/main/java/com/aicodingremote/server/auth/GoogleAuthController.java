@@ -74,7 +74,7 @@ public class GoogleAuthController {
                 return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Google 账号缺少已验证邮箱"));
             }
             store.ensureExternal(email, "google");
-            String token = store.issueToken(email);
+            String token = store.issueClientToken(email);
             boolean hasPassword = store.hasPassword(email);
             log.info("google login ok: {} (hasPassword={})", email, hasPassword);
             // hasPassword=false → 客户端引导设置密码(之后可邮箱密码登录,不再需要 Google)

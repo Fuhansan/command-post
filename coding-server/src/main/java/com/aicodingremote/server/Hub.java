@@ -41,6 +41,15 @@ public class Hub {
         return accounts.computeIfAbsent(account, k -> new Account());
     }
 
+    /** 该账号当前**在线**的所有设备(client + agent)。「登录设备列表」只展示在线的,离线不留。 */
+    public java.util.List<Connection> onlineDevices(String account) {
+        Account a = accounts.get(account);
+        if (a == null) return java.util.List.of();
+        java.util.List<Connection> out = new java.util.ArrayList<>(a.clients.values());
+        out.addAll(a.agents.values());
+        return out;
+    }
+
     private Map<String, Snap> snaps(String account) {
         return snapshots.computeIfAbsent(account, k -> Collections.synchronizedMap(new LinkedHashMap<>()));
     }

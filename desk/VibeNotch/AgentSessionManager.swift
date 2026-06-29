@@ -22,6 +22,9 @@ struct AgentMessage: Identifiable, Equatable {
     /// permission 卡的处理结果:nil=待处理(显示允许/拒绝按钮);"allow"/"deny"=已处理(显示徽标)。
     var permState: String? = nil
     var permReqId: String? = nil   // 关联 driver 的权限请求 id,回写时用
+    var op: ToolOp? = nil          // 结构化动作(kind=.tool 时;供 web 时间线渲染)
+    var model: String? = nil       // 产生该回合的模型(完整 id,头部展示用)
+    var ts: Double? = nil          // 该消息时间(epoch ms,头部展示相对时间)
 }
 
 /// 一个会话(统一模型)。SessionManager 维护,上层(桌面 UI / RelayAgent / 手机)消费。
@@ -105,6 +108,11 @@ final class AgentSessionManager: ObservableObject {
         projects.removeAll { $0 == workdir }
         persistProjects()
     }
+    /// 移除项目:仅从项目栏移出(不结束会话,非破坏式);活跃会话仍在后台跑。
+    func removeProject(_ workdir: String) {
+        projects.removeAll { $0 == workdir }
+        persistProjects()
+    }
     /// 某项目当前的活跃会话(若有)。
     func activeSession(for workdir: String) -> AgentSession? {
         sessions.first { $0.workdir == workdir }
@@ -137,7 +145,14 @@ final class AgentSessionManager: ObservableObject {
                     continueLast: Bool = false, restoreId: String? = nil) -> String {
         let sid = restoreId ?? "s_\(Int(Date().timeIntervalSince1970 * 1000))_\(sessions.count)"
         vlog("console new: workdir=\((workdir as NSString).lastPathComponent) resume=\(resume ?? "-") cont=\(continueLast) sid=\(sid)")
-        if !projects.contains(workdir) { projects.append(workdir); persistProjects() }
+        // 自动加项目:只在「孤儿」工作目录时才加——既不在已有项目下,也不在归属目录/默认根下。
+        // 否则会被对应项目文件夹 / 默认文件夹收纳,不该污染项目列表(以前无脑加导致什么都变成项目)。
+        let inProj: (String) -> Bool = { root in workdir == root || workdir.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
+        let underExisting = projects.contains(where: inProj)
+        let funnelRoots = AppSettings.shared.defaultSessionDirs.map { ($0 as NSString).expandingTildeInPath }
+            + [AppSettings.shared.defaultWorkdir.isEmpty ? NSString(string: "~/.vibenotch/workplace").expandingTildeInPath : (AppSettings.shared.defaultWorkdir as NSString).expandingTildeInPath]
+        let underFunnel = funnelRoots.contains(where: inProj)
+        if !underExisting && !underFunnel { projects.append(workdir); persistProjects() }
         let driver = makeDriver(agent)
         let title = (workdir as NSString).lastPathComponent
         sessions.append(AgentSession(id: sid, agent: agent, workdir: workdir, title: title,
@@ -220,42 +235,52 @@ final class AgentSessionManager: ObservableObject {
         if path.contains("/.codex/") { return CodexTranscriptReader.parseTranscriptFile(path: path) }
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
         var out: [(String, AgentMessage.Kind, String)] = []
-        for line in content.split(separator: "\n") { out.append(contentsOf: parseTranscriptLine(String(line))) }
+        for line in content.split(separator: "\n") {
+            out.append(contentsOf: parseTranscriptLine(String(line)).map { (role: $0.role, kind: $0.kind, text: $0.text) })
+        }
         return out
     }
 
     /// 解析转录中的一行(jsonl),抽出可显示的消息;一行的多个 block 可产生多条。
     nonisolated static func parseTranscriptLine(_ line: String)
-        -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        -> [(role: String, kind: AgentMessage.Kind, text: String, op: ToolOp?, model: String?, ts: Double?)] {
         guard let d = line.data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               let type = o["type"] as? String,
               let msg = o["message"] as? [String: Any] else { return [] }
-        var out: [(String, AgentMessage.Kind, String)] = []
+        let cwd = o["cwd"] as? String ?? ""
+        let ts = parseISOms(o["timestamp"])
+        let model = msg["model"] as? String
+        var out: [(String, AgentMessage.Kind, String, ToolOp?, String?, Double?)] = []
         if type == "user" {
-            if let s = msg["content"] as? String, !s.trimmingCharacters(in: .whitespaces).isEmpty {
-                out.append(("user", .text, s))
+            if (o["isMeta"] as? Bool) == true { return [] }   // 元数据条目(非真实对话)整条跳过
+            if let s = msg["content"] as? String {
+                let t = s.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty, !isSystemInjected(t) { out.append(("user", .text, s, nil, nil, ts)) }
             } else if let blocks = msg["content"] as? [[String: Any]] {
                 var added = false
                 for b in blocks where (b["type"] as? String) == "text" {
-                    if let t = b["text"] as? String, !t.isEmpty { out.append(("user", .text, t)); added = true }
+                    // 按 block 过滤:丢掉系统/harness 注入块(任务通知/系统提醒/本地命令回显…),保留同条里你真正的文本
+                    if let t = b["text"] as? String, !t.isEmpty, !isSystemInjected(t) { out.append(("user", .text, t, nil, nil, ts)); added = true }
                 }
                 // 纯图片消息:占位一条空文本(图片由 transcriptImages 按 ord 补上),否则历史里整条消失
                 if !added, blocks.contains(where: { ($0["type"] as? String) == "image" }) {
-                    out.append(("user", .text, ""))
+                    out.append(("user", .text, "", nil, nil, ts))
                 }
             }
         } else if type == "assistant", let blocks = msg["content"] as? [[String: Any]] {
             for b in blocks {
                 switch b["type"] as? String {
                 case "text":
-                    if let t = b["text"] as? String, !t.isEmpty { out.append(("assistant", .text, t)) }
+                    if let t = b["text"] as? String, !t.isEmpty { out.append(("assistant", .text, t, nil, model, ts)) }
                 case "tool_use":
                     let name = b["name"] as? String ?? "?"
+                    if Self.isNoisyTool(name) { break }   // 任务/待办类:转录回填也跳过(与实时链路一致)
                     let input = b["input"] as? [String: Any] ?? [:]
+                    let op = claudeToolOp(name: name, input: input, workdir: cwd)   // 与实时链路同一构造器 → diff/目录一致
                     let sm = (input["command"] ?? input["file_path"] ?? input["path"]
                               ?? input["pattern"] ?? input["url"]) as? String ?? ""
-                    out.append(("assistant", .tool, "\(name): \(sm)"))
+                    out.append(("assistant", .tool, "\(name): \(sm)", op, model, ts))
                 default: break
                 }
             }
@@ -263,15 +288,47 @@ final class AgentSessionManager: ObservableObject {
         return out
     }
 
+    /// 系统/harness 注入到 user 轮的非真实输入(任务通知、系统提醒、本地命令回显、诊断等)。
+    /// 转录里这些虽然 type=user,但不是用户真正的话,要过滤掉,避免聊天里冒出多余气泡。
+    /// 任务/待办类工具 = 纯流程噪音(TodoWrite / Task*),不进会话模型。
+    /// 这样手机协议、桌面 web 控制台、转录回填三条链路统一不展示,保证「桌面转录 = 手机协议」。
+    nonisolated static func isNoisyTool(_ name: String) -> Bool {
+        switch name {
+        case "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop":
+            return true
+        default:
+            return false
+        }
+    }
+
+    nonisolated static func isSystemInjected(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tags = ["<task-notification", "<system-reminder", "<local-command-stdout", "<local-command-caveat",
+                    "<command-name", "<command-message", "<command-args", "<command-contents",
+                    "<bash-input", "<bash-stdout", "<bash-stderr", "<user-prompt-submit-hook",
+                    "<new-diagnostics", "<persisted-output"]
+        return tags.contains { t.hasPrefix($0) }
+    }
+
+    /// ISO8601 时间串 → epoch 毫秒(转录里每行带 timestamp,如 2026-06-24T19:02:16.123Z)。
+    nonisolated static func parseISOms(_ v: Any?) -> Double? {
+        guard let s = v as? String, !s.isEmpty else { return nil }
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d.timeIntervalSince1970 * 1000 }
+        let f2 = ISO8601DateFormatter()
+        return f2.date(from: s).map { $0.timeIntervalSince1970 * 1000 }
+    }
+
     /// 只解析文件「尾部一窗」(默认末尾 256KB),供历史/手动会话懒加载,避免读+推+渲染整份大转录。
     /// endByte 省略 = 到文件末尾;传值 = 解析该字节偏移之前的一窗(「加载更早」)。
     /// ord = 该消息所在行的起始字节偏移(全局单调,跨窗稳定排序/去重);earliest = 本窗最早一条消息所在行的偏移。
-    nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024)
-        -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int)], earliest: Int, hasEarlier: Bool) {
+    nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024)
+        -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int, op: ToolOp?, model: String?, ts: Double?)], queued: [String], earliest: Int, hasEarlier: Bool) {
         if path.contains("/.codex/") {
-            return CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
+            let r = CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
+            return (r.messages.map { ($0.role, $0.kind, $0.text, $0.ord, nil as ToolOp?, nil as String?, nil as Double?) }, [], r.earliest, r.hasEarlier)
         }
-        guard let fh = FileHandle(forReadingAtPath: path) else { return ([], 0, false) }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return ([], [], 0, false) }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
         let end = min(endByte ?? fileSize, fileSize)
@@ -281,30 +338,46 @@ final class AgentSessionManager: ObservableObject {
         // start>0:丢弃可能被切断的首行残片(从第一个换行后开始)。
         var i = 0
         if start > 0 { i = (bytes.firstIndex(of: 0x0A)).map { $0 + 1 } ?? bytes.count }
-        var out: [(String, AgentMessage.Kind, String, Int)] = []
+        var out: [(String, AgentMessage.Kind, String, Int, ToolOp?, String?, Double?)] = []
         var firstKept: Int? = nil
+        // 「工作中发的消息」被 Claude Code 记成 queue-operation(enqueue/dequeue/remove),不是 type:user。
+        // FIFO 跟踪:enqueue 入队、dequeue(已处理→会另有 type:user)/remove(撤销)出队。末尾剩下的=当前仍在排队。
+        var pendingQueue: [String] = []
         while i < bytes.count {
             var j = i
             while j < bytes.count && bytes[j] != 0x0A { j += 1 }
             if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8) {
                 let lineByteStart = Int(start) + i
-                let msgs = parseTranscriptLine(lineStr)
-                if !msgs.isEmpty {
-                    if firstKept == nil { firstKept = lineByteStart }
-                    for (k, m) in msgs.enumerated() {
-                        out.append((m.role, m.kind, m.text, lineByteStart * 16 + min(k, 15)))
+                if lineStr.contains("\"type\":\"queue-operation\"") {
+                    if let d = lineStr.data(using: .utf8), let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                        let op = o["operation"] as? String
+                        if op == "enqueue", let c = (o["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !c.isEmpty, !isSystemInjected(c) {
+                            pendingQueue.append(c)
+                        } else if op == "dequeue" || op == "remove" {
+                            if !pendingQueue.isEmpty { pendingQueue.removeFirst() }
+                        }
+                    }
+                } else {
+                    let msgs = parseTranscriptLine(lineStr)
+                    if !msgs.isEmpty {
+                        if firstKept == nil { firstKept = lineByteStart }
+                        for (k, m) in msgs.enumerated() {
+                            out.append((m.role, m.kind, m.text, lineByteStart * 16 + min(k, 15), m.op, m.model, m.ts))
+                        }
                     }
                 }
             }
             i = j + 1
         }
+        // pendingQueue = 当前仍在排队的消息(工作中发的、还没被处理)→ 单独返回,前端在「排队中」区显示。
         let earliest = firstKept ?? Int(start)
-        return (out, earliest, earliest > 0)
+        return (out, pendingQueue, earliest, earliest > 0)
     }
 
     /// 历史图片:扫与 parseTranscriptWindow 同一窗,返回 ord → 图片([{thumb,url}],都是 data URL)。
     /// 不动主解析链(Codex/手机端不受影响),桥按 ord 合并进历史消息 DTO。Codex 图片是 localImage 路径,暂不处理。
-    nonisolated static func transcriptImages(path: String, endByte: UInt64?, windowBytes: Int = 256 * 1024) -> [Int: [[String: String]]] {
+    nonisolated static func transcriptImages(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024) -> [Int: [[String: String]]] {
         guard !path.contains("/.codex/"), let fh = FileHandle(forReadingAtPath: path) else { return [:] }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
@@ -500,6 +573,23 @@ final class AgentSessionManager: ObservableObject {
         if let wd { loadHistoryList(for: wd, force: true) }
     }
 
+    /// 终端用 `--continue`/`--resume` 抢占了某个控制台会话(同 session_id,但 hook 事件来自终端、
+    /// 不是本管理器 spawn 的进程)。「只保活一个进程」:杀掉控制台那个 claude(进程 A)、移除控制台
+    /// 会话条目 → 前端按 session_id 去重(App.tsx consoleSids)会让同 id 的终端会话**原地接上**:
+    /// 卡片从「控制台」翻牌成「终端」,不消失、不重复。调用方在 `store.apply(event)` 之后调它,
+    /// 终端会话此时已落地 → 翻牌零空窗。每个 hook 事件都会调一次,未命中廉价返回 false。
+    @discardableResult
+    func handoffToTerminal(agentSessionId aid: String) -> Bool {
+        guard let s = sessions.first(where: { $0.agentSessionId == aid }) else { return false }
+        let sid = s.id
+        vlog("console handoff→terminal: sid=\(sid) aid=\(aid.prefix(8)) 杀进程A,让位给终端")
+        managed[sid]?.consumeTask?.cancel()
+        managed[sid]?.driver.stop()
+        managed[sid] = nil
+        sessions.removeAll { $0.id == sid }
+        return true
+    }
+
     /// 会话中途切模型:停掉当前 driver,用新模型 `--resume` 当前会话重起(上下文保留,短暂重连)。
     /// 没有 agentSessionId(还没开聊)时则直接以新模型重起,消息此时为空,无损。
     func switchModel(_ sid: String, to model: String) {
@@ -543,15 +633,22 @@ final class AgentSessionManager: ObservableObject {
                     s.messages[i].text += text
                 } else {
                     s.messages.append(AgentMessage(id: msgId, role: role, kind: .text,
-                                                   text: text, ord: self.nextOrd()))
+                                                   text: text, ord: self.nextOrd(),
+                                                   model: s.model, ts: Date().timeIntervalSince1970 * 1000))
                 }
             }
         case .messageComplete:
             break
         case .toolCall(let t):
+            if Self.isNoisyTool(t.name) { break }   // 任务/待办类:不入会话(噪音)
             mutate(sid) { s in
                 s.messages.append(AgentMessage(id: t.id, role: "assistant", kind: .tool,
-                                               text: "\(t.name): \(t.summary)", ord: self.nextOrd()))
+                                               text: "\(t.name): \(t.summary)", ord: self.nextOrd(), op: t.op,
+                                               model: s.model, ts: Date().timeIntervalSince1970 * 1000))
+            }
+        case .toolOutput(let id, let lines):
+            mutate(sid) { s in
+                if let i = s.messages.firstIndex(where: { $0.id == id }) { s.messages[i].op?.output = lines }
             }
         case .fileEdit(let f):
             mutate(sid) { s in

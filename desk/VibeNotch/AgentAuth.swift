@@ -77,80 +77,82 @@ extension URLSession {
     }()
 }
 
-/// 配对流程(设置窗口里使用):取码 → 展示 → 轮询 → 拿到 Agent token。
-@MainActor
-final class PairingController: ObservableObject {
-    enum State: Equatable {
-        case idle
-        case fetching
-        case waiting(code: String)
-        case done(account: String)
-        case failed(String)
-    }
-    @Published var state: State = .idle
+/// 电脑端账号登录(取代配对码):邮箱 + 密码或验证码 → token,存进 AgentCredentials。
+/// 与手机同账号才能互发消息。电脑端签发的是普通令牌(不进单活动,不踢手机)。
+/// 走 URLSession.direct,HTTP 直连绕开系统代理。
+enum DeviceLogin {
 
-    private static var api: String { "\(AgentServer.httpBase)/api/pair" }
-    private var pollTask: Task<Void, Never>?
-
-    func start() {
-        pollTask?.cancel()
-        state = .fetching
-        pollTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let code = try await Self.fetchCode()
-                self.state = .waiting(code: code)
-                // 轮询认领结果(2s 间隔,10 分钟由服务端过期)。
-                // 瞬时网络错误(切节点/抖动)不放弃,只有「码过期」才停 —— 否则一抖动就废了整次配对。
-                while !Task.isCancelled {
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
-                    do {
-                        if let result = try await Self.poll(code: code) {
-                            AgentCredentials.save(account: result.account, token: result.token)
-                            self.state = .done(account: result.account)
-                            return
-                        }
-                    } catch let e as NSError where e.domain == "pair.expired" {
-                        self.state = .failed("配对码已过期,请重新配对")
-                        return
-                    } catch {
-                        continue   // 网络瞬断:继续等下一次轮询
-                    }
-                }
-            } catch {
-                vlog("pair 取码失败: \(error)  (api=\(Self.api))")
-                self.state = .failed("取码失败(连不到服务器): \(error.localizedDescription)")
-            }
-        }
+    /// 查邮箱是否注册/有密码 —— 登录入口据此分流(密码登录 / 验证码登录 / 注册)。
+    static func check(account: String) async throws -> (exists: Bool, hasPassword: Bool) {
+        let obj = try await post(path: "/api/auth/check", body: ["account": account])
+        return (obj["exists"] as? Bool ?? false, obj["hasPassword"] as? Bool ?? false)
     }
 
-    func cancel() {
-        pollTask?.cancel()
-        pollTask = nil
-        if case .waiting = state { state = .idle }
+    /// 邮箱+密码登录。
+    @discardableResult
+    static func login(account: String, password: String) async throws -> String {
+        try await auth(path: "/api/auth/device-login", body: ["account": account, "password": password])
     }
 
-    private static func fetchCode() async throws -> String {
-        var req = URLRequest(url: URL(string: "\(api)/start")!, timeoutInterval: 8)
+    /// 发送登录验证码(账号须已注册)。
+    static func sendCode(account: String) async throws {
+        _ = try await post(path: "/api/auth/login/code", body: ["account": account])
+    }
+
+    /// 邮箱+验证码登录。
+    @discardableResult
+    static func loginWithCode(account: String, code: String) async throws -> String {
+        try await auth(path: "/api/auth/device-login/verify", body: ["account": account, "code": code])
+    }
+
+    /// 注册:发送验证码 → 提交(邮箱+码+密码)。注册成功直接得到 token 并登录。
+    static func sendRegisterCode(account: String) async throws {
+        _ = try await post(path: "/api/auth/register/code", body: ["account": account])
+    }
+    @discardableResult
+    static func register(account: String, code: String, password: String) async throws -> String {
+        try await auth(path: "/api/auth/register",
+                       body: ["account": account, "code": code, "password": password])
+    }
+
+    /// 忘记密码:发码 → 重置(邮箱+码+新密码)。重置后用新密码登录。
+    static func sendForgotCode(account: String) async throws {
+        _ = try await post(path: "/api/auth/forgot", body: ["account": account])
+    }
+    static func resetPassword(account: String, code: String, password: String) async throws {
+        _ = try await post(path: "/api/auth/reset",
+                           body: ["account": account, "code": code, "password": password])
+    }
+
+    // ── 底层 ──────────────────────────────────────────────
+
+    /// POST JSON,200 返回解析后的字典,非 200 抛带 server `error` 文案的错误。
+    @discardableResult
+    private static func post(path: String, body: [String: String]) async throws -> [String: Any] {
+        var req = URLRequest(url: URL(string: "\(AgentServer.httpBase)\(path)")!, timeoutInterval: 12)
         req.httpMethod = "POST"
-        let (data, _) = try await URLSession.direct.data(for: req)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: String],
-              let code = obj["code"] else { throw URLError(.badServerResponse) }
-        return code
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.direct.data(for: req)
+        let obj = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw NSError(domain: "device.login", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: (obj["error"] as? String) ?? "请求失败(连不到服务器?)"])
+        }
+        return obj
     }
 
-    /// 认领完成返回凭据;仍在等待返回 nil;过期抛错。
-    private static func poll(code: String) async throws -> (account: String, token: String)? {
-        let (data, resp) = try await URLSession.direct.data(
-            from: URL(string: "\(api)/poll?code=\(code)")!)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-            throw NSError(domain: "pair.expired", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "配对码已过期,请重新开始"])
+    /// 登录类:POST 后取 {account, token} 存盘并以新身份重连。
+    @discardableResult
+    private static func auth(path: String, body: [String: String]) async throws -> String {
+        let obj = try await post(path: path, body: body)
+        guard let acc = obj["account"] as? String, let tok = obj["token"] as? String else {
+            throw NSError(domain: "device.login", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "登录返回缺少凭据"])
         }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            throw URLError(.badServerResponse)
-        }
-        if obj["status"] == "ok", let a = obj["account"], let t = obj["token"] { return (a, t) }
-        return nil
+        await MainActor.run { AgentCredentials.save(account: acc, token: tok) }
+        return acc
     }
 }
+
+// 配对(PairingController)已移除:改为账号登录(见 DeviceLogin),不再用配对码。

@@ -24,10 +24,12 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
 
     private final Hub hub;
     private final UserStore users;
+    private final MQRelay mqRelay;
 
-    FrameHandler(Hub hub, UserStore users) {
+    FrameHandler(Hub hub, UserStore users, MQRelay mqRelay) {
         this.hub = hub;
         this.users = users;
+        this.mqRelay = mqRelay;
     }
 
     @Override
@@ -51,7 +53,9 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
             case "patch"  -> handlePatch(ctx, root, text);
             // 上行指令:先回 server 级 ack(已到服务器),再转发给 Agent;
             // Agent 处理后回 delivered 级 ack,经下面的 "ack" 分支透传回 Client。
-            case "action", "input" -> { ackToSender(ctx, root); forward(ctx, text, /*fromAgent=*/false); }
+            // 手机指令:回 server 级 ack(已到服务器),然后**入 MQ 队列**而非实时直推 ——
+            // 电脑在线立即消费投递,离线则留队列、重连补齐(不丢)。
+            case "action", "input" -> { ackToSender(ctx, root); routeClientToAgent(ctx, text); }
             case "ack"    -> {
                 Connection c = ctx.channel().attr(CONN).get();
                 forward(ctx, text, /*fromAgent=*/c != null && c.isAgent());
@@ -89,26 +93,31 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         String deviceName = device.path("name").asText(role == Connection.Role.AGENT ? "Agent" : "Device");
         String deviceId = device.hasNonNull("id") ? device.path("id").asText() : deviceName;
 
-        // 被手机挂起的电脑:拒绝接入,直到手机点「重连」解除
-        if (role == Connection.Role.AGENT && hub.isSuspended(account, deviceId)) {
-            log.info("auth 拒绝: 设备已被手机挂起 {}@{}", deviceId, account);
-            send(ctx.channel(), Frames.error("suspended", "该电脑已被手机端断开,在手机「设备」页点重连恢复", true));
-            ctx.close();
-            return;
-        }
-
+        // 不再单活动「踢人」:同账户多设备可同时在线、互不挤掉,按账户经 MQ 互发消息。
         Connection conn = new Connection(ctx.channel(), account, role, deviceId, deviceName);
         ctx.channel().attr(CONN).set(conn);
         hub.register(conn);
         log.info("auth: {} 上线 (account={})", conn, account);
 
-        // 回 auth_ok:带上该账号当前在线的 Agent 列表
-        send(ctx.channel(), Frames.authOk(account, hub.agentsOf(account), hub.suspendedOf(account)));
+        // 回 auth_ok:带上该账号当前在线的 Agent 列表 + 当前**在线**设备列表(电脑+手机;离线不展示、不保留)。
+        java.util.Map<String, java.util.Map<String, Object>> devMap = new java.util.LinkedHashMap<>();
+        for (Connection c : hub.onlineDevices(account)) {
+            if (c.deviceId == null || c.deviceId.isEmpty()) continue;
+            devMap.putIfAbsent(c.deviceId, java.util.Map.of(
+                    "id", c.deviceId, "name", c.deviceName, "role", c.role.name(), "online", true));
+        }
+        java.util.List<java.util.Map<String, Object>> devs = new java.util.ArrayList<>(devMap.values());
+        send(ctx.channel(), Frames.authOk(account, hub.agentsOf(account), hub.suspendedOf(account), devs));
 
         if (role == Connection.Role.AGENT) {
-            // Agent 上线 → 通知同账号的 Client
-            String presence = Frames.presence(deviceId, deviceName, true);
+            // Agent 上线 → 通知同账号的 Client(附带是否被暂停)
+            boolean paused = hub.isSuspended(account, deviceId);
+            String presence = Frames.presence(deviceId, deviceName, true, paused);
             for (Connection c : hub.clientsOf(account)) send(c.channel, presence);
+            // 软暂停:断网重连回来的电脑若仍被手机暂停,补发一条 pause 让它重新进入暂停态。
+            if (paused) send(ctx.channel(), Frames.agentCtl("pause"));
+            // 电脑上线 → 把它离线期间积压在 MQ 里的手机指令补齐投递。
+            mqRelay.onAgentOnline(account);
         } else {
             // Client 上线 → 补发该账号现有所有会话的最后一帧,使其立刻看到全部任务
             for (String snap : hub.snapshotsOf(account)) send(ctx.channel(), snap);
@@ -165,17 +174,37 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
         if (agentId.isEmpty()) return;
         switch (op) {
             case "agent_suspend" -> {
+                // 软暂停:不断开电脑,只置暂停标志 + 通知电脑暂停(停止推送/忽略输入),
+                // 电脑保持连接,手机随时一键恢复 —— 杜绝旧版「踢下线→重连被拒」的死锁。
                 String name = body.path("name").asText(agentId);
                 hub.suspendAgent(conn.account, agentId, name);
-                // 踢掉该设备当前的连接(channelInactive 会清快照 + 广播 reset/离线)
+                boolean online = false;
                 for (Connection a : hub.agentsOf(conn.account)) {
-                    if (agentId.equals(a.deviceId)) a.channel.close();
+                    if (agentId.equals(a.deviceId)) {
+                        send(a.channel, Frames.agentCtl("pause"));
+                        online = true;
+                        name = a.deviceName;
+                    }
                 }
-                log.info("ctl: 挂起设备 {}@{}", agentId, conn.account);
+                // 通知所有手机:该电脑已暂停(仍可能在线)
+                String presence = Frames.presence(agentId, name, online, true);
+                for (Connection c : hub.clientsOf(conn.account)) send(c.channel, presence);
+                log.info("ctl: 暂停设备 {}@{} (online={})", agentId, conn.account, online);
             }
             case "agent_resume" -> {
                 hub.resumeAgent(conn.account, agentId);
-                log.info("ctl: 恢复设备 {}@{} (等待其重连)", agentId, conn.account);
+                String name = body.path("name").asText(agentId);
+                boolean online = false;
+                for (Connection a : hub.agentsOf(conn.account)) {
+                    if (agentId.equals(a.deviceId)) {
+                        send(a.channel, Frames.agentCtl("resume"));
+                        online = true;
+                        name = a.deviceName;
+                    }
+                }
+                String presence = Frames.presence(agentId, name, online, false);
+                for (Connection c : hub.clientsOf(conn.account)) send(c.channel, presence);
+                log.info("ctl: 恢复设备 {}@{} (online={})", agentId, conn.account, online);
             }
             default -> { }
         }
@@ -186,6 +215,16 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
     private void ackToSender(ChannelHandlerContext ctx, JsonNode root) {
         String id = root.path("id").asText("");
         if (!id.isEmpty()) send(ctx.channel(), Frames.ack(id, "server"));
+    }
+
+    /** 手机指令 → 入 MQ(to_agent)+ 触发投递给在线电脑。取代旧的实时直推,离线不丢。 */
+    private void routeClientToAgent(ChannelHandlerContext ctx, String text) {
+        Connection conn = ctx.channel().attr(CONN).get();
+        if (conn == null) {
+            send(ctx.channel(), Frames.error("not_authed", "请先 auth", false));
+            return;
+        }
+        mqRelay.clientToAgent(conn.account, text);
     }
 
     /** 透传内容类 frame:Agent→所有 Client,或 Client→所有 Agent。原文不改。 */
@@ -211,7 +250,9 @@ final class FrameHandler extends SimpleChannelInboundHandler<TextWebSocketFrame>
                 // Agent 重连后会全量重推,数据不会丢。
                 hub.clearSnapshots(conn.account, conn.deviceId);
                 String reset = Frames.agentReset(conn.deviceId);
-                String presence = Frames.presence(conn.deviceId, conn.deviceName, false);
+                // 仍被暂停的电脑掉线 → 手机显示「已暂停·离线」,不当成普通离线移除。
+                boolean paused = hub.isSuspended(conn.account, conn.deviceId);
+                String presence = Frames.presence(conn.deviceId, conn.deviceName, false, paused);
                 for (Connection c : hub.clientsOf(conn.account)) {
                     send(c.channel, reset);
                     send(c.channel, presence);

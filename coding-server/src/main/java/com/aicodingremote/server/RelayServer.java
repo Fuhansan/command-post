@@ -24,16 +24,18 @@ public class RelayServer implements SmartLifecycle {
     private final Hub hub;
     private final RelayProperties props;
     private final UserStore users;
+    private final MQRelay mqRelay;
 
     private EventLoopGroup boss;
     private EventLoopGroup worker;
     private Channel serverChannel;
     private volatile boolean running;
 
-    public RelayServer(Hub hub, RelayProperties props, UserStore users) {
+    public RelayServer(Hub hub, RelayProperties props, UserStore users, MQRelay mqRelay) {
         this.hub = hub;
         this.props = props;
         this.users = users;
+        this.mqRelay = mqRelay;
     }
 
     @Override
@@ -44,7 +46,7 @@ public class RelayServer implements SmartLifecycle {
             ServerBootstrap b = new ServerBootstrap();
             b.group(boss, worker)
                     .channel(NioServerSocketChannel.class)
-                    .childHandler(new WsServerInitializer(hub, props.getPath(), users));
+                    .childHandler(new WsServerInitializer(hub, props.getPath(), users, mqRelay));
             serverChannel = b.bind(props.getPort()).syncUninterruptibly().channel();
             running = true;
             log.info("中转 WS 已启动: ws://0.0.0.0:{}{}", props.getPort(), props.getPath());

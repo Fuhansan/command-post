@@ -18,11 +18,16 @@ final class RelayAgent: NSObject, ObservableObject {
         case unpaired            // 未配对,不连接
         case connecting          // 连接/鉴权中
         case online              // 已上线
-        case suspendedByPhone    // 被手机「断开」挂起,等待手机点重连
+        case pausedByPhone       // 被手机「暂停」:保持连接,停止推送/忽略输入,等手机一键恢复
+        case suspendedByPhone    // 被手机「挂起」(服务器拒绝 code=suspended):不计失败,10s 后继续探测
         case rejected(String)    // 被服务器拒绝(令牌失效等)
         case offline             // 断线,自动重连中
     }
     @Published private(set) var connState: ConnState = .offline
+
+    /// 软暂停标志:被手机暂停期间为 true。保持 WS + 心跳在线,但不推送、不执行远程输入。
+    /// 手机点「恢复」→ 服务器下发 ctl resume → 清标志并全量重推。杜绝旧版「踢下线→重连被拒」死锁。
+    private var pausedByPhone = false
 
     /// 中转地址改由 AgentServer 提供(可在设置里填 VPS 公网 IP),不再写死本机。
     static var relayURL: URL { AgentServer.wsURL }
@@ -74,7 +79,6 @@ final class RelayAgent: NSObject, ObservableObject {
     private static let consoleWindowStep = 25
     // hook 会话历史回填(转录里、当前轮之前的旧消息):缓存解析结果 + 窗口大小,翻页扩大窗口。
     private var hookWindow: [String: Int] = [:]
-    private var hookHistoryCache: [String: [(role: String, kind: AgentMessage.Kind, text: String)]] = [:]
 
     // 稳定顺序:每条消息按「首次出现」分配单调递增 ord 并固定 —— 审批卡停在它出现的位置,
     // 不会因为之后到达的文本而被挤到末尾(修审批后顺序错乱)。
@@ -85,17 +89,6 @@ final class RelayAgent: NSObject, ObservableObject {
         let o = liveOrdCounter; liveOrdCounter += 1; liveOrdMap[id] = o; return o
     }
 
-    /// 取某 hook 会话「当前轮之前」的历史消息(转录里),一次解析后缓存复用。
-    private func hookHistory(for e: SessionEntry) -> [(role: String, kind: AgentMessage.Kind, text: String)] {
-        if let cached = hookHistoryCache[e.id] { return cached }
-        guard let path = e.transcriptPath else { return [] }
-        let all = AgentSessionManager.parseTranscriptFile(path: path)
-        // 边界 = 最后一条用户消息(当前轮起点);它之后由实时管线渲染,历史只取之前的,避免重复。
-        let boundary = all.lastIndex { $0.role == "user" } ?? all.count
-        let hist = Array(all.prefix(boundary))
-        hookHistoryCache[e.id] = hist
-        return hist
-    }
     private var seq = 0
     private var lastSent: [String: String] = [:]   // 消息 id → 内容签名,去重
     private var knownSids: Set<String> = []         // 已推送过的会话,用于检测会话整体消失
@@ -144,9 +137,11 @@ final class RelayAgent: NSObject, ObservableObject {
     private var firstConnect = true   // 进程内首次连接(区分进程重启 vs 网络重连)
     private var lastClientResyncAt = Date.distantPast   // 手机上线触发全量重推的防抖
 
-    init(store: SessionStore, pending: PendingDecisionStore) {
+    private let hub: ConversationHub
+    init(store: SessionStore, pending: PendingDecisionStore, hub: ConversationHub) {
         self.store = store
         self.pending = pending
+        self.hub = hub
         super.init()
     }
 
@@ -232,7 +227,6 @@ final class RelayAgent: NSObject, ObservableObject {
         lastSentConsole.removeAll()   // 否则新连/重连的手机拿不到 console 会话与项目(被去重缓存挡住)
         consoleWindow.removeAll()
         hookWindow.removeAll()
-        hookHistoryCache.removeAll()  // 重连重算历史边界(当前轮可能已变)
         syncToServer()
         syncConsole()
         syncProjects()
@@ -291,6 +285,7 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 每个会话 → **多条独立消息**(prompt / 每句 AI 文本 / 每个文件 / 每条命令 / 待批准),
     /// 各自一条 `ui` 帧。手机端据此渲染成真正的对话:每条消息独立一行、各带头像。
     private func syncToServer() {
+        if pausedByPhone { return }   // 软暂停:停止推送
         // 先消费新的审批决定事件:把结果写进对应记录(该会话最早一条未决定的)。
         for ev in pending.decisionEvents where ev.seq > appliedDecisionSeq {
             if var recs = permRecords[ev.sid],
@@ -308,7 +303,7 @@ final class RelayAgent: NSObject, ObservableObject {
             for k in Array(lastSent.keys) where k.hasPrefix("m:\(sid):") { lastSent[k] = nil }
             for k in Array(msgTime.keys) where k.hasPrefix("m:\(sid):") { msgTime[k] = nil }
             permRecords[sid] = nil
-            hookWindow[sid] = nil; hookHistoryCache[sid] = nil
+            hookWindow[sid] = nil
             for k in Array(liveOrdMap.keys) where k.hasPrefix("m:\(sid):") { liveOrdMap[k] = nil }
         }
         knownSids = activeSids
@@ -323,7 +318,8 @@ final class RelayAgent: NSObject, ObservableObject {
             let turn = max(turnCount[e.id] ?? 0, 1)
 
             // hook 历史回填:窗口默认最后 N 条(当前轮之前);hasMore 让手机显示「加载更早」。
-            let hist = hookHistory(for: e)
+            // 来源 = 枢纽(单一来源);窗口/过滤/渲染仍在出口(per-client)。
+            let hist = hub.terminalHistory(sessionId: e.id)
             let hwin = hookWindow[e.id] ?? Self.defaultConsoleWindow
             var meta = sessionMeta(e)
             meta["hasMore"] = hist.count > hwin
@@ -335,11 +331,13 @@ final class RelayAgent: NSObject, ObservableObject {
                 sendMessageRemove(sid: e.id, msgId: k)
                 lastSent[k] = nil
             }
-            // 变化的消息才推。ord = 逻辑顺序号(轮次×1000+轮内位置),手机据此排序渲染,
-            // 不受推送到达时序影响 —— 修复审批卡比它前面的文本先到达而排到文本上面的问题。
-            for m in msgs {
+            // 变化的消息才推。ord = 逻辑顺序号 = 轮次×1000 + 轮内位置(buildMessages 输出里的下标),
+            // 手机据此排序渲染,**不受推送到达时序影响**。用「位置」而非「首次出现序」:用户 prompt 在
+            // buildMessages 里恒为第 0 条 → ord 恒最小 → 永远排在该轮 AI 回复之前。
+            // (旧版用 liveOrd 首次出现序:AI 流式回复常比 prompt 先登记,导致用户消息被排到回复下面。)
+            for (i, m) in msgs.enumerated() {
                 let body: [String: Any] = ["role": m.role, "session": meta, "root": m.root,
-                                           "time": stamp(for: m.id), "ord": liveOrd(for: m.id)]
+                                           "time": stamp(for: m.id), "ord": turn * 1000 + i]
                 let sig = jsonString(body)
                 guard lastSent[m.id] != sig else { continue }
                 lastSent[m.id] = sig
@@ -355,12 +353,21 @@ final class RelayAgent: NSObject, ObservableObject {
             let startIdx = hist.count - shown.count
             for (k, hm) in shown.enumerated() {
                 let idx = startIdx + k
+                // 过滤系统/harness 注入(task-notification / system-reminder / 本地命令回显…),不是用户真说的话
+                if hm.role == "user", AgentSessionManager.isSystemInjected(hm.text) { continue }
                 let mid = "m:\(e.id):h\(idx)"
                 let root: [String: Any]
                 switch hm.kind {
                 case .text where hm.role == "user": root = bubble(role: "user", hm.text)
-                case .tool:                          root = commandComp(hm.text)
-                case .file:                          root = fileComp(path: hm.text, hunks: [])
+                case .text:                          root = text(hm.text, markdown: true)   // agent 历史文本也走 markdown(否则裸 ** / 反引号)
+                case .tool:
+                    // 历史工具消息 "Name: arg" → 简版 toolop(无 diff),与桌面/实时统一
+                    let ci = hm.text.firstIndex(of: ":")
+                    let nm = ci.map { String(hm.text[..<$0]) } ?? hm.text
+                    if AgentSessionManager.isNoisyTool(nm) { continue }   // 任务/待办类:不展示(噪音)
+                    let arg = ci.map { hm.text[hm.text.index(after: $0)...].trimmingCharacters(in: .whitespaces) } ?? ""
+                    root = toolOpComp(textToolOp(name: nm, arg: arg, cwd: e.cwd))
+                case .file:                          root = toolOpComp(textToolOp(name: "Edit", arg: hm.text, cwd: e.cwd))
                 default:                             root = bubble(role: "agent", hm.text)
                 }
                 let body: [String: Any] = ["role": hm.role == "user" ? "user" : "agent",
@@ -403,6 +410,7 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 把 AgentSessionManager 的会话翻成手机协议帧。手机 sid 加 "c:" 前缀避免与旧会话冲突;
     /// 用独立的 lastSentConsole 去重,不与旧 hook 路径互相干扰。
     private func syncConsole() {
+        if pausedByPhone { return }   // 软暂停:停止推送
         guard let mgr = agentManager else { return }
         let active = Set(mgr.sessions.map { "c:\($0.id)" })
         for csid in knownConsoleSids where !active.contains(csid) {
@@ -440,12 +448,24 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 把电脑已打开的项目列表翻成一个「打开项目」ui 消息推手机:每项目一张卡(继续最近/全新/
     /// 历史恢复按钮)。手机点按钮 → console_* action 回电脑开会话。手机端不用改,复用现有协议。
     private func syncProjects() {
+        if pausedByPhone { return }   // 软暂停:停止推送
         guard let mgr = agentManager else { return }
         let sid = "console:projects"
         let mid = "m:\(sid):list"
+        // 默认工作目录 + 归属目录(与桌面 web 一致):散会话归默认文件夹。
+        let def: String = {
+            let s = AppSettings.shared.defaultWorkdir.trimmingCharacters(in: .whitespaces)
+            if !s.isEmpty { var p = (s as NSString).expandingTildeInPath; while p.count > 1 && p.hasSuffix("/") { p.removeLast() }; return p }
+            let p = NSString(string: "~/.vibenotch/workplace").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: p, withIntermediateDirectories: true); return p
+        }()
+        let funnel = AppSettings.shared.defaultSessionDirs.map { ($0 as NSString).expandingTildeInPath }
+        let roots = ([def] + funnel).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+
         var cards: [[String: Any]] = []
         var projList: [[String: Any]] = []     // 结构化项目数据(手机端建项目模型用)
-        for proj in mgr.projects {
+        // 默认根/归属目录不当普通项目渲染(它们就是默认文件夹本身),否则会和下面 prepend 的默认文件夹撞 workdir。
+        for proj in mgr.projects where !roots.contains(proj) {
             let name = (proj as NSString).lastPathComponent
             var kids: [[String: Any]] = [text(proj, color: "secondary", style: "caption")]
             kids.append(["type": "button_group", "props": ["buttons": [
@@ -468,6 +488,18 @@ final class RelayAgent: NSObject, ObservableObject {
                 "history": hist.map { ["id": $0.id, "label": $0.label] }
             ])
         }
+        // 默认文件夹置顶,聚合所有 root 的历史。
+        var defHist: [(id: String, label: String)] = []
+        var seenHist = Set<String>()
+        for r in roots {
+            for h in AgentSessionManager.listHistory(workdir: r, limit: 30) where !seenHist.contains(h.id) {
+                seenHist.insert(h.id); defHist.append((h.id, h.label))
+            }
+        }
+        projList.insert([
+            "workdir": def, "name": (def as NSString).lastPathComponent, "isDefault": true,
+            "history": defHist.prefix(40).map { ["id": $0.id, "label": $0.label] }
+        ], at: 0)
         let root: [String: Any] = cards.isEmpty
             ? bubble(role: "agent", "电脑端还没打开项目。在电脑 VibeNotch「打开项目」后,这里就能选项目开会话。")
             : ["type": "stack", "props": ["spacing": 10], "children": cards]
@@ -478,7 +510,7 @@ final class RelayAgent: NSObject, ObservableObject {
         ]
         // body.projects:结构化项目列表 —— 手机端据此渲染原生「项目」页(不再解析聊天卡片)。
         let body: [String: Any] = ["role": "agent", "session": meta, "root": root,
-                                   "projects": projList, "time": stamp(for: mid), "ord": 0]
+                                   "projects": projList, "defaultRoots": roots, "time": stamp(for: mid), "ord": 0]
         let sig = jsonString(body)
         guard lastSentConsole[mid] != sig else { return }
         lastSentConsole[mid] = sig
@@ -507,7 +539,8 @@ final class RelayAgent: NSObject, ObservableObject {
                 // agent 文本走 markdown 渲染(MarkdownText),否则手机端会显示裸 ## / ** / -
                 out.append(("msg:\(m.id)", "agent", text(m.text, markdown: true), m.text, m.ord))
             case .tool:
-                out.append(("msg:\(m.id)", "agent", commandComp(m.text), m.text, m.ord))
+                let root = m.op.map { toolOpComp($0) } ?? commandComp(m.text)
+                out.append(("msg:\(m.id)", "agent", root, m.text, m.ord))
             case .file:
                 out.append(("msg:\(m.id)", "agent", fileComp(path: m.text, hunks: []), m.text, m.ord))
             case .permission:
@@ -656,13 +689,14 @@ final class RelayAgent: NSObject, ObservableObject {
             return []
         }
         let pfx = "m:\(sid):t\(turn):"
-        let diffs = e.transcriptPath.map { TranscriptReader.fileEditDiffs(transcriptPath: $0) } ?? [:]
         var out: [Msg] = []
 
         // 用户 prompt:图片 + 文字 → 一个 `photomsg` 统一气泡(文件信息栏 + 图 + 说明,同一张卡片)。
-        if let p = e.promptSummary, !p.isEmpty {
+        // 原料(是否展示 / 原文 / 图片路径)来自枢纽;文本清洗 + 图片解码 + 渲染仍在这里(iOS 专属)。
+        if let pm = hub.terminalPrompt(sessionId: sid) {
+            let p = pm.text
             var imageItems: [[String: Any]] = []
-            let imgPaths = extractImagePaths(p, sessionId: sid)
+            let imgPaths = (pm.images ?? []).map { $0.id }
             for path in imgPaths {
                 guard let data = thumbnailBase64(path: path) else { continue }
                 var item: [String: Any] = ["data": data]
@@ -702,41 +736,32 @@ final class RelayAgent: NSObject, ObservableObject {
         // 这样「AI 分析完才开始写代码/跑命令」呈现为一个整体,而不是拆成一堆碎气泡。
         var groups: [(fallback: String, blocks: [[String: Any]])] = []
         var current: (fallback: String, blocks: [[String: Any]])? = nil
-        var seenFiles = Set<String>()
         func flush() { if let c = current { groups.append(c) }; current = nil }
 
-        for step in e.turnSteps {
-            switch step {
-            case .text(let s):
-                let t = cap(s, 1500)
+        // 步骤来源 = 枢纽(ConversationHub):turnSteps→工具 op 推导、噪音过滤、读/编辑去重、diff 计算
+        // 都已搬进枢纽(单一来源)。这里只保留 iOS 的「一段文字 + 其后工具 → 一个头像组」分组与渲染。
+        for m in hub.terminalSteps(sessionId: sid) {
+            switch m.kind {
+            case .text:
+                let t = cap(m.text, 1500)
                 guard !t.isEmpty else { break }
                 flush()   // 新的分析段 → 开新组
                 current = (cap(t, 120), [text(t, markdown: true, style: "body")])   // markdown 文本(无气泡框)
-            case .tool(let name, let input):
-                var block: [String: Any]? = nil
-                switch name {
-                case "Edit", "Write", "MultiEdit":
-                    if let path = input, !seenFiles.contains(path) {
-                        seenFiles.insert(path)
-                        block = fileComp(path: path, hunks: diffs[path] ?? [])
-                    }
-                case "Bash":
-                    block = commandComp(input ?? "")
-                default:
-                    block = toolChipComp(name: name, input: input)
-                }
-                if let block {
-                    if current == nil { current = ("AI 操作", []) }
-                    current?.blocks.append(block)
-                }
+            case .tool:
+                guard let op = m.op else { break }
+                if current == nil { current = ("AI 操作", []) }
+                current?.blocks.append(toolOpComp(op))
+            default:
+                break
             }
         }
         flush()
 
         for (gi, g) in groups.enumerated() {
-            let root: [String: Any] = g.blocks.count == 1
-                ? g.blocks[0]
-                : ["type": "stack", "props": ["spacing": 10], "children": g.blocks]
+            let blocks = mergeToolOps(g.blocks)   // 连续工具操作 → 带竖轨的 tooltimeline,对齐桌面
+            let root: [String: Any] = blocks.count == 1
+                ? blocks[0]
+                : ["type": "stack", "props": ["spacing": 10], "children": blocks]
             out.append(Msg(id: "\(pfx)g\(gi)", role: "agent", root: root, fallback: g.fallback))
         }
 
@@ -894,42 +919,6 @@ final class RelayAgent: NSObject, ObservableObject {
         p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "", options: .regularExpression)
     }
 
-    /// 从 prompt 抽出粘贴图片的本地路径。Claude Code 真实格式是 `[Image #N]`(只有编号),
-    /// 图片实际在 `~/.claude/image-cache/<sessionId>/<N>.<ext>`,据此构造路径。
-    /// 兼容带显式路径的 `[Image: source: /path]` 与裸路径。
-    private func extractImagePaths(_ p: String, sessionId: String) -> [String] {
-        var paths: [String] = []
-        let fm = FileManager.default
-        let cacheDir = NSString(string: "~/.claude/image-cache").expandingTildeInPath + "/" + sessionId
-
-        // 1) [Image #N] → image-cache/<sid>/N.<ext>
-        if let re = try? NSRegularExpression(pattern: #"\[Image\s*#(\d+)\]"#) {
-            let ns = p as NSString
-            for m in re.matches(in: p, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
-                let n = ns.substring(with: m.range(at: 1))
-                for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
-                    let path = "\(cacheDir)/\(n).\(ext)"
-                    if fm.fileExists(atPath: path) { if !paths.contains(path) { paths.append(path) }; break }
-                }
-            }
-        }
-        if !paths.isEmpty { return paths }
-
-        // 2) 兜底:显式路径
-        let patterns = [#"\[Image:[^\]]*?source:\s*([^\]\s]+)\]"#,
-                        #"(/[^\s\]]+?\.(?:png|jpe?g|gif|webp|heic))"#]
-        for pat in patterns {
-            guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive]) else { continue }
-            let ns = p as NSString
-            for m in re.matches(in: p, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
-                let path = ns.substring(with: m.range(at: 1))
-                if !paths.contains(path) { paths.append(path) }
-            }
-            if !paths.isEmpty { break }
-        }
-        return paths
-    }
-
     private func imageComp(data: String, source: String) -> [String: Any] {
         ["type": "image", "props": [
             "data": data, "mime": "image/jpeg",
@@ -982,10 +971,27 @@ final class RelayAgent: NSObject, ObservableObject {
         let t = obj["t"] as? String
         if t == "pong" { lastPongAt = Date(); return }
         if t == "auth_ok" {
-            connState = .online
+            // 重连回来若仍处于暂停态(服务器会随后补发 ctl pause),先不抢标志;否则正常上线。
+            connState = pausedByPhone ? .pausedByPhone : .online
             // 确认成功上线 → 本次首连的 reset 已送达,以后网络重连不再 reset(保留历史)。
             firstConnect = false
             rejectStreak = 0   // 成功上线即重置被拒计数,允许后续再次进入重试节奏
+            return
+        }
+        // 软暂停:服务器下发的 ctl 控制(pause/resume)。暂停=保持连接但停推送/忽略输入。
+        if t == "ctl", let body = obj["body"] as? [String: Any] {
+            switch body["op"] as? String {
+            case "pause":
+                pausedByPhone = true
+                connState = .pausedByPhone
+                vlog("relay: 已被手机暂停(保持连接,停止推送/忽略输入)")
+            case "resume":
+                pausedByPhone = false
+                connState = .online
+                vlog("relay: 已被手机恢复,全量重推")
+                forceResyncForClient()
+            default: break
+            }
             return
         }
         // 手机上线 → 服务端会向本机转发一条 client presence。电脑主动把当前所有任务
@@ -1018,6 +1024,9 @@ final class RelayAgent: NSObject, ObservableObject {
             return
         }
         guard t == "input" || t == "action" else { return }
+        // 软暂停期间忽略一切远程输入/动作(电脑已被手机暂停)。手机端此时也被禁止操作,
+        // 这里是双保险:即便有迟到/重发的帧也不执行。
+        if pausedByPhone { return }
 
         // 可靠投递:回 delivered 级 ack;按帧 id 去重(重发的帧只 ack 不重复执行,
         // 杜绝重复注入终端/重复审批)。
@@ -1203,7 +1212,7 @@ final class RelayAgent: NSObject, ObservableObject {
     private func scheduleReconnect() {
         heartbeatTimer?.invalidate(); heartbeatTimer = nil
         switch connState {
-        case .suspendedByPhone, .rejected, .unpaired: break   // 保留具体原因
+        case .pausedByPhone, .suspendedByPhone, .rejected, .unpaired: break   // 保留具体原因
         default: connState = .offline
         }
         // 连续被拒达阈值:停摆,等用户在设置里手动操作(coolDownUntil = .distantFuture)
@@ -1248,6 +1257,7 @@ final class RelayAgent: NSObject, ObservableObject {
 
     private func send(_ json: String) {
         guard !json.isEmpty else { return }
+        GoldenTap.record(json)   // P1 验证夹具:开启时落盘 ui/patch 帧(见 GoldenTap)
         task?.send(.string(json)) { err in
             if let err { vlog("relay send error: \(err)") }
         }
@@ -1298,6 +1308,58 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 运行命令 → `command` 语义组件。
     private func commandComp(_ cmd: String) -> [String: Any] {
         ["type": "command", "props": ["command": cap(cmd, 400)]]
+    }
+
+    /// 结构化动作 → `toolop` 组件(对齐桌面:verb/file/dir/+−/command/output/diff)。
+    /// 手机端按动作行紧凑渲染,点开看 diff / 终端输出。无 schema → 老版本 app 安全降级。
+    private func toolOpComp(_ op: ToolOp) -> [String: Any] {
+        var props: [String: Any] = [
+            "kind": op.kind.rawValue, "file": op.file, "dir": op.dir, "sameFile": op.sameFile,
+        ]
+        if let l = op.label { props["label"] = l }
+        if let a = op.add { props["add"] = a }
+        if let d = op.del { props["del"] = d }
+        if let c = op.command { props["command"] = cap(c, 600) }
+        if !op.output.isEmpty { props["output"] = Array(op.output.prefix(40)) }
+        if !op.diff.isEmpty { props["diff"] = op.diff.prefix(80).map { ["k": $0.kind, "t": $0.text] } }
+        return ["type": "toolop", "props": props]
+    }
+
+    /// 把一组 block 里「连续的 toolop」合成一个 `tooltimeline`(带竖轨的时间线,对齐桌面);
+    /// 单个 toolop 保持原样,非工具块(文本等)原样保留。
+    private func mergeToolOps(_ blocks: [[String: Any]]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        var ops: [[String: Any]] = []
+        func flush() {
+            guard !ops.isEmpty else { return }
+            if ops.count == 1 { out.append(["type": "toolop", "props": ops[0]]) }
+            else { out.append(["type": "tooltimeline", "props": ["ops": ops]]) }
+            ops = []
+        }
+        for b in blocks {
+            if (b["type"] as? String) == "toolop", let p = b["props"] as? [String: Any] { ops.append(p) }
+            else { flush(); out.append(b) }
+        }
+        flush()
+        return out
+    }
+
+    /// 从 "工具名 + 参数串" 拼简版 toolop(历史回填用,无 diff)。
+    private func textToolOp(name: String, arg: String, cwd: String) -> ToolOp {
+        switch name {
+        case "Read", "NotebookRead":
+            var op = ToolOp(kind: .read); op.file = (arg as NSString).lastPathComponent; op.dir = relDir(arg, workdir: cwd); return op
+        case "Edit", "MultiEdit", "NotebookEdit":
+            var op = ToolOp(kind: .edit); op.file = (arg as NSString).lastPathComponent; op.dir = relDir(arg, workdir: cwd); return op
+        case "Write", "Create":
+            var op = ToolOp(kind: .write); op.file = (arg as NSString).lastPathComponent; op.dir = relDir(arg, workdir: cwd); return op
+        case "Bash":
+            var op = ToolOp(kind: .bash); op.command = arg
+            op.file = arg.split(separator: " ").first.map(String.init) ?? "bash"
+            op.dir = (cwd as NSString).lastPathComponent; return op
+        default:
+            var op = ToolOp(kind: .other); op.label = otherToolLabel(name); op.file = arg; return op
+        }
     }
 
     private func cap(_ s: String, _ n: Int) -> String {
