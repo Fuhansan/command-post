@@ -93,6 +93,19 @@ enum ImageRelay {
     private static var b64Loc: [String: (path: String, lineStart: UInt64, imgIdx: Int, ext: String)] = [:]
     private static let b64Lock = NSLock()
 
+    // 本地文件按 id 取(用于队列消息里的 [Image #NN] → ~/.claude/image-cache/<会话>/NN.* 直接当缩略图)。
+    private static var localFiles: [String: String] = [:]
+    private static let lfLock = NSLock()
+    /// 登记一个本地图片文件,返回可被 app://__img/<id> 取到的 id。
+    static func registerLocalFile(_ path: String) -> String {
+        let id = cheapId(path)
+        lfLock.lock(); localFiles[id] = path; lfLock.unlock()
+        return id
+    }
+    static func localFilePath(id: String) -> String? {
+        lfLock.lock(); defer { lfLock.unlock() }; return localFiles[id]
+    }
+
     /// 解析转录窗口时调用:登记一张图的位置(不解码、不写盘),返回廉价 id。
     static func indexB64(_ b64: String, path: String, lineStart: UInt64, imgIdx: Int, ext: String) -> String {
         let id = cheapId(b64)

@@ -132,6 +132,36 @@ function UserImages({ images }: { images: MsgImage[] }) {
   )
 }
 
+// 排队消息弹幕:一条条暗色行(图标+透明文字、无背景),图片显示小缩略图、可点预览。
+function QueueDanmaku({ items }: { items: { text: string; images?: { id: string; ext: string }[] }[] }) {
+  const [zoom, setZoom] = useState<string | null>(null)
+  const srcOf = (im: { id: string; ext: string }) => `app://local/__img/${im.id}.${im.ext || 'png'}`
+  return (
+    <>
+      {items.slice(-6).map((q, i) => (
+        <div key={i} className="flex items-start gap-2 text-[13px] leading-[1.5] animate-msg" style={{ opacity: 0.55 }}>
+          <User size={13} className="mt-[3px] shrink-0" style={{ color: 'var(--text-faint)' }} />
+          <div className="flex flex-col gap-1 min-w-0 pointer-events-auto">
+            {q.images && q.images.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {q.images.map((im, k) => (
+                  <img key={k} src={srcOf(im)} alt="" onClick={() => setZoom(srcOf(im))}
+                    className="h-[60px] w-auto max-w-[160px] rounded-lg object-cover border border-line cursor-zoom-in" />
+                ))}
+              </div>
+            )}
+            {q.text && <span className="whitespace-nowrap" style={{ color: 'var(--text-dim)', textShadow: '0 1px 4px var(--bg), 0 0 4px var(--bg)' }} title={q.text}>{q.text}</span>}
+          </div>
+        </div>
+      ))}
+      {zoom && createPortal(
+        <div onClick={() => setZoom(null)} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
+          <img src={zoom} alt="" className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
+        </div>, document.body)}
+    </>
+  )
+}
+
 // ===== 消息渲染:助手回合 = 思考文本 + 动作时间线(读取/编辑/新建/命令)=====
 // verb / 配色 / 节点(对齐设计稿 opMeta）
 type OpKindT = 'read' | 'edit' | 'write' | 'bash' | 'other'
@@ -1563,15 +1593,8 @@ function ConsolePage() {
     // 排队消息:独立浮层(不占对话空间、不打乱消息高度),浮在对话底部、输入区之上;干净样式:图标+透明文字、无背景。
     if (viewMode === 'chat' && (mm?.queued?.length ?? 0) > 0) {
       queueOverlay = (
-        <div className="absolute left-0 right-0 bottom-3 z-20 pointer-events-none px-7 flex flex-col justify-end overflow-hidden" style={{ maxHeight: '45%' }}>
-          <div className="max-w-[780px] w-full mx-auto flex flex-col gap-1">
-            {mm!.queued!.slice(-6).map((q, i) => (
-              <div key={i} className="flex items-start gap-2 text-[13px] leading-[1.5] animate-msg" style={{ opacity: 0.5 }}>
-                <User size={13} className="mt-[3px] shrink-0" style={{ color: 'var(--text-faint)' }} />
-                <span className="truncate" style={{ color: 'var(--text-dim)', textShadow: '0 1px 4px var(--bg), 0 0 4px var(--bg)' }} title={q}>{q}</span>
-              </div>
-            ))}
-          </div>
+        <div className="absolute left-5 bottom-4 z-30 pointer-events-none flex flex-col justify-end gap-1" style={{ maxHeight: '55%', maxWidth: 'calc(100% - 40px)' }}>
+          <QueueDanmaku items={mm!.queued!} />
         </div>
       )
     }

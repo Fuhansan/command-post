@@ -299,7 +299,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     /// 把转录窗口解析成前端 transcript msg 数组(loadTranscript 与「活跃会话实时推」共用)。
     /// nonisolated:可在后台线程解析,算完再回主线程推。
     nonisolated private static func buildTranscriptMsgs(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024)
-        -> (msgs: [[String: Any]], queued: [String], earliest: Int, hasEarlier: Bool) {
+        -> (msgs: [[String: Any]], queued: [[String: Any]], earliest: Int, hasEarlier: Bool) {
         // 窗口 1MB:装得下整张图片行(单张内联 base64 可达 ~650KB)以便建索引。文字解析仍快——
         // 图片不再在此解码(只登记位置),真要看时 scheme handler 后台现切现解,所以窗口大也不卡。
         let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: endByte, windowBytes: windowBytes)
@@ -697,7 +697,7 @@ final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
             let id = (name as NSString).deletingPathExtension
             let ext = (name as NSString).pathExtension
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let local = id.isEmpty ? nil : (ImageRelay.ensureFromIndex(id: id, ext: ext) ?? ImageRelay.ensureCached(id: id, ext: ext))
+                let local = id.isEmpty ? nil : (ImageRelay.ensureFromIndex(id: id, ext: ext) ?? ImageRelay.localFilePath(id: id) ?? ImageRelay.ensureCached(id: id, ext: ext))
                 let data = local.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }
                 guard let self, !self.isStopped(task) else { return }
                 if let data {

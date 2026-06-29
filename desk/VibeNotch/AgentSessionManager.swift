@@ -359,7 +359,7 @@ final class AgentSessionManager: ObservableObject {
     /// endByte 省略 = 到文件末尾;传值 = 解析该字节偏移之前的一窗(「加载更早」)。
     /// ord = 该消息所在行的起始字节偏移(全局单调,跨窗稳定排序/去重);earliest = 本窗最早一条消息所在行的偏移。
     nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024)
-        -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int, op: ToolOp?, model: String?, ts: Double?)], queued: [String], earliest: Int, hasEarlier: Bool) {
+        -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int, op: ToolOp?, model: String?, ts: Double?)], queued: [[String: Any]], earliest: Int, hasEarlier: Bool) {
         if path.contains("/.codex/") {
             let r = CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
             return (r.messages.map { ($0.role, $0.kind, $0.text, $0.ord, nil as ToolOp?, nil as String?, nil as Double?) }, [], r.earliest, r.hasEarlier)
@@ -409,13 +409,43 @@ final class AgentSessionManager: ObservableObject {
         // pendingQueue = 当前仍在排队的消息(工作中发的、还没被处理)→ 单独返回,前端在「排队中」区显示。
         // 每页最多 N 条:窗口为索引图片要读 1MB,但一次只把最后 N 条推给前端,避免前端一次渲染上百条卡主线程。
         // earliest 对齐到「首个保留消息」的字节偏移(ord/16),「加载更早」从那继续 → 不留洞。
+        // 排队文字里的 [Image #NN] → 解析成可显示的缩略图(取 ~/.claude/image-cache/<会话>/NN.*)。
+        let queued = pendingQueue.map { Self.queuedItem(text: $0, transcriptPath: path) }
         let pageLimit = 25
         if out.count > pageLimit {
             let kept = Array(out.suffix(pageLimit))
-            return (kept, pendingQueue, kept[0].3 / 16, true)   // ord = 行字节偏移*16+k(k<16)→ /16 即行偏移
+            return (kept, queued, kept[0].3 / 16, true)   // ord = 行字节偏移*16+k(k<16)→ /16 即行偏移
         }
         let earliest = firstKept ?? Int(start)
-        return (out, pendingQueue, earliest, earliest > 0)
+        return (out, queued, earliest, earliest > 0)
+    }
+
+    /// 一条排队消息 → {text, images}:把 [Image #NN] 占位换成 image-cache 里的真实图片(返回 id 供 app://__img 取)。
+    nonisolated private static func queuedItem(text: String, transcriptPath: String) -> [String: Any] {
+        let sid = ((transcriptPath as NSString).lastPathComponent as NSString).deletingPathExtension
+        let cacheDir = NSString(string: "~/.claude/image-cache/\(sid)").expandingTildeInPath
+        var images: [[String: String]] = []
+        let ns = text as NSString
+        let cleanM = NSMutableString(string: text)
+        if let re = try? NSRegularExpression(pattern: "\\[[^\\]]*#(\\d+)\\]") {
+            for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)).reversed() {
+                let nn = ns.substring(with: m.range(at: 1))
+                if let f = imageCacheFile(dir: cacheDir, n: nn) {
+                    images.insert(["id": ImageRelay.registerLocalFile(f.path), "ext": f.ext], at: 0)
+                }
+                cleanM.replaceCharacters(in: m.range, with: "")
+            }
+        }
+        var d: [String: Any] = ["text": (cleanM as String).trimmingCharacters(in: .whitespacesAndNewlines)]
+        if !images.isEmpty { d["images"] = images }
+        return d
+    }
+    nonisolated private static func imageCacheFile(dir: String, n: String) -> (path: String, ext: String)? {
+        let fm = FileManager.default
+        for ext in ["png", "jpg", "jpeg", "webp", "gif"] where fm.fileExists(atPath: "\(dir)/\(n).\(ext)") {
+            return ("\(dir)/\(n).\(ext)", ext == "jpeg" ? "jpg" : ext)
+        }
+        return nil
     }
 
     /// 历史图片:扫与 parseTranscriptWindow 同一窗,返回 ord → 图片([{thumb,url}],都是 data URL)。
