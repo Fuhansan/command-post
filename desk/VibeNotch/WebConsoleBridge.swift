@@ -17,6 +17,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private weak var manager: AgentSessionManager?
     private weak var store: SessionStore?
     private weak var relayAgent: RelayAgent?
+    private weak var pending: PendingDecisionStore?   // 终端会话审批扣留处(权限 allow/deny),供控制台渲染+应答
     private var cancellables = Set<AnyCancellable>()
     private var ready = false
     // 增量推送状态:记录每个会话上次推送的 JSON 指纹,只推变化的那个(流式时关键)。
@@ -33,10 +34,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private var projectsScheduled = false
     private var pollTimer: Timer?
 
-    init(manager: AgentSessionManager, store: SessionStore, relayAgent: RelayAgent?) {
+    init(manager: AgentSessionManager, store: SessionStore, relayAgent: RelayAgent?, pending: PendingDecisionStore? = nil) {
         self.manager = manager
         self.store = store
         self.relayAgent = relayAgent
+        self.pending = pending
         let cfg = WKWebViewConfiguration()
         let ucc = WKUserContentController()
         cfg.userContentController = ucc
@@ -58,6 +60,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         AppSettings.shared.$defaultWorkdir.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
         AppSettings.shared.$defaultSessionDirs.sink { [weak self] _ in self?.scheduleProjects() }.store(in: &cancellables)
         store.$sessions.sink { [weak self] _ in self?.scheduleManual(); self?.scheduleManualContent() }.store(in: &cancellables)
+        // 终端会话审批一来/一走,重推 manual(控制台据此显示/收起审批卡)。
+        pending?.$pendingIDs.sink { [weak self] _ in self?.scheduleManual() }.store(in: &cancellables)
         // 定时轮询活跃会话转录:入队/内容增长不触发 hook 事件,光等 store 变化会延迟几秒。
         // 0.3s 看一眼(size+mtime 缓存,没长大就跳过),让「排队中」几乎即时显示。
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in self?.scheduleManualContent() }
@@ -177,6 +181,9 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         case "respond":
             if let sid = obj["sid"] as? String, let req = obj["reqId"] as? String,
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
+        case "termPermission":
+            // 控制台对终端会话审批的应答 → 回写被 hook 扣住的连接(allow/deny),和手机同一套。
+            if let sid = obj["sid"] as? String { pending?.resolve(sid: sid, decision: (obj["allow"] as? Bool ?? false) ? .allow : .deny) }
         case "theme":
             // 跟随网页主题给原生标题栏条着色,避免深色模式露出白边。
             let dark = obj["dark"] as? Bool ?? false
@@ -561,6 +568,9 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             "agent": agent,
             "state": manualState(e.state),
             "lastActivityAt": e.lastActivityAt.timeIntervalSince1970 * 1000,
+            // 终端会话被 hook 扣住的权限审批(如 git push):控制台据此渲染允许/拒绝卡,点击经 termPermission 回写。
+            "pendingPerm": pending?.pendingIDs.contains(e.id) ?? false,
+            "pendingDetail": e.toolDetail ?? "",
         ]
     }
     private func manualState(_ s: SessionState) -> String {

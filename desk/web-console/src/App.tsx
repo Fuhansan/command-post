@@ -1589,7 +1589,14 @@ function ConsolePage() {
       ? <button onClick={() => cmd.raiseWindow(manualSel.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {manualSel.terminal}</button>
       : null
     chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} working={manualSel.state === 'working'} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
-    footer = viewMode === 'chat' ? <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {manualSel.terminal} 里输入,这里只读。</div> : null
+    footer = manualSel.pendingPerm
+      ? <div className="flex-none px-7 py-3 border-t border-line flex items-center gap-2.5" style={{ background: 'var(--bg-elev)' }}>
+          <span className="text-[10px] font-semibold px-1.5 py-px rounded shrink-0" style={{ color: 'var(--amber)', border: '1px solid var(--amber)' }}>审批</span>
+          <span className="text-[12.5px] text-ink flex-1 min-w-0 truncate font-mono" title={manualSel.pendingDetail}>{manualSel.pendingDetail || '需要确认'}</span>
+          <button onClick={() => cmd.termPermission(manualSel.id, false)} className="shrink-0 px-3 py-1.5 rounded-lg text-[12px] border border-line text-dim hover:bg-sunken transition-colors">拒绝</button>
+          <button onClick={() => cmd.termPermission(manualSel.id, true)} className="shrink-0 px-3 py-1.5 rounded-lg text-[12px] text-accentfg hover:brightness-110 transition" style={{ background: 'var(--accent)' }}>允许</button>
+        </div>
+      : (viewMode === 'chat' ? <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {manualSel.terminal} 里输入,这里只读。</div> : null)
     // 排队消息:独立浮层(不占对话空间、不打乱消息高度),浮在对话底部、输入区之上;干净样式:图标+透明文字、无背景。
     if (viewMode === 'chat' && (mm?.queued?.length ?? 0) > 0) {
       queueOverlay = (

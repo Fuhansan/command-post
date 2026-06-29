@@ -699,6 +699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         WebConsoleWindowController.shared.manager = agentManager
         WebConsoleWindowController.shared.store = store
         WebConsoleWindowController.shared.relayAgent = relayAgent
+        WebConsoleWindowController.shared.pendingStore = pendingStore
         WebConsoleWindowController.shared.show()
     }
 

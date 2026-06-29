@@ -63,6 +63,8 @@ export interface Manual {
   agent: string         // claude | codex
   state: string         // working|waiting|done|idle
   lastActivityAt: number
+  pendingPerm?: boolean  // 终端会话被 hook 扣住的权限审批(如 git push)→ 控制台显示允许/拒绝
+  pendingDetail?: string // 待审批的命令/操作详情
 }
 
 export interface Conn { host: string; paired: boolean; account: string; loggedIn: boolean; state: string; text: string }

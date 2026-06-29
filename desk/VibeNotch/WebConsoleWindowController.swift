@@ -21,6 +21,7 @@ final class WebConsoleWindowController: NSObject, NSWindowDelegate {
     weak var manager: AgentSessionManager?
     weak var store: SessionStore?
     weak var relayAgent: RelayAgent?
+    weak var pendingStore: PendingDecisionStore?
 
     func show() {
         if let w = window {
@@ -29,7 +30,7 @@ final class WebConsoleWindowController: NSObject, NSWindowDelegate {
             return
         }
         guard let manager, let store else { return }
-        let bridge = WebConsoleBridge(manager: manager, store: store, relayAgent: relayAgent)
+        let bridge = WebConsoleBridge(manager: manager, store: store, relayAgent: relayAgent, pending: pendingStore)
         self.bridge = bridge
 
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1120, height: 740),

@@ -109,6 +109,8 @@ export const cmd = {
     send({ action: 'prepareImage', attachId, name, data }),
   // 停止当前回合(Claude 写 {type:interrupt} 控制帧 / Codex turn/interrupt),会话仍在
   interrupt: (sid: string) => send({ action: 'interrupt', sid }),
+  // 终端会话审批应答(允许/拒绝)→ 回写被 hook 扣住的连接(如 git push)
+  termPermission: (sid: string, allow: boolean) => send({ action: 'termPermission', sid, allow }),
   respond: (sid: string, reqId: string, choose: string[]) =>
     send({ action: 'respond', sid, reqId, choose }),
   raiseWindow: (id: string) => send({ action: 'raiseWindow', id }),
