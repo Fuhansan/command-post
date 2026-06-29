@@ -28,6 +28,8 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     private var manualContentScheduled = false
     private var lastManualContentSig: [String: String] = [:]
     private var manualTxStat: [String: (size: UInt64, mtime: TimeInterval)] = [:]
+    private var focusedManualId: String?   // 前端当前打开的(终端/hook)会话;只给它读转录推正文,其余不加载
+    private let pushQueue = DispatchQueue(label: "webconsole.push.serialize")   // 推送序列化放后台,保序
     private var projectsScheduled = false
     private var pollTimer: Timer?
 
@@ -211,6 +213,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             let before = (obj["beforeByte"] as? NSNumber)?.uint64Value
             loadTranscript(id: id, path: path, beforeByte: before)
 
+        case "focusSession":
+            // 前端打开了某(终端/hook)会话 → 只给它读转录、推实时正文;切走 / 打开的是控制台会话
+            // (走进程流,不读转录)则置 nil,其余会话一律不加载正文。
+            focusedManualId = obj["id"] as? String
+            scheduleManualContent()
+
         // ── 账号登录:登录页 UI 在 React;调用走桥接(和会话/项目同一套),原生帮忙发请求 ──
         // 每个请求带 reqId,结果经 "authResult" push 回带同一 reqId,前端 await 对应 promise。
         case "checkAccount":
@@ -290,10 +298,12 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     /// 把转录窗口解析成前端 transcript msg 数组(loadTranscript 与「活跃会话实时推」共用)。
     /// nonisolated:可在后台线程解析,算完再回主线程推。
-    nonisolated private static func buildTranscriptMsgs(path: String, endByte: UInt64?)
+    nonisolated private static func buildTranscriptMsgs(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024)
         -> (msgs: [[String: Any]], queued: [String], earliest: Int, hasEarlier: Bool) {
-        let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: endByte)
-        let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: endByte)
+        // 窗口 1MB:装得下整张图片行(单张内联 base64 可达 ~650KB)以便建索引。文字解析仍快——
+        // 图片不再在此解码(只登记位置),真要看时 scheme handler 后台现切现解,所以窗口大也不卡。
+        let win = AgentSessionManager.parseTranscriptWindow(path: path, endByte: endByte, windowBytes: windowBytes)
+        let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: endByte, windowBytes: windowBytes)
         let msgs = win.messages.map { m -> [String: Any] in
             var d: [String: Any] = ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
             if let imgs = imgMap[m.ord] { d["images"] = imgs }   // 历史图片(thumb/url 都是 data URL)
@@ -321,29 +331,27 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     /// (前端按 id 替换合并 → 实时更新)。修复「前台终端会话正文冻结」:与 iOS 同样跟随活动。
     /// 指纹去重避免没变化时空推;只对活跃会话做,idle/done 用户打开时 loadTranscript 一次即可。
     private func pushManualContent() {
-        guard ready else { return }
-        for e in store?.sessions ?? [] {
-            guard let tp = e.transcriptPath else { continue }
-            // 转录没增长就跳过:避免长会话每次 store 变化(reply-poll 每 400ms)都重解析 256KB,
-            // 否则重复解析堆积 → web 比手机慢很多。stat 很廉价,只在文件真长大时才解析。
-            let attrs = try? FileManager.default.attributesOfItem(atPath: tp)
-            let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
-            let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-            if let s = manualTxStat[e.id], s.size == size, s.mtime == mtime { continue }
-            manualTxStat[e.id] = (size, mtime)
-            // 不限 working/waiting:hook 会话的最终回复在 Stop(state=done)才落盘转录,限了会漏最后一推。
-            let sid = e.id
-            Task.detached(priority: .userInitiated) { [weak self] in
-                let r = Self.buildTranscriptMsgs(path: tp, endByte: nil)
-                await MainActor.run {
-                    guard let self, self.ready else { return }
-                    guard let sig = self.jsonSig(["m": r.msgs, "q": r.queued]) else { return }   // 排队变化也要推
-                    guard self.lastManualContentSig[sid] != sig else { return }
-                    self.lastManualContentSig[sid] = sig
-                    self.pushJSON(type: "transcript", payload: [
-                        "id": sid, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
-                    ])
-                }
+        // 只给「前端当前打开的那个会话」读转录推正文 —— 没打开的会话一律不加载(列表只要标题/元数据)。
+        guard ready, let focus = focusedManualId,
+              let e = store?.sessions.first(where: { $0.id == focus }),
+              let tp = e.transcriptPath else { return }
+        // 转录没增长就跳过:stat 很廉价,只在文件真长大时才解析,避免重复解析堆积。
+        let attrs = try? FileManager.default.attributesOfItem(atPath: tp)
+        let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        if let s = manualTxStat[e.id], s.size == size, s.mtime == mtime { return }
+        manualTxStat[e.id] = (size, mtime)
+        let sid = e.id
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let r = Self.buildTranscriptMsgs(path: tp, endByte: nil)
+            await MainActor.run {
+                guard let self, self.ready else { return }
+                guard let sig = self.jsonSig(["m": r.msgs, "q": r.queued]) else { return }   // 排队变化也要推
+                guard self.lastManualContentSig[sid] != sig else { return }
+                self.lastManualContentSig[sid] = sig
+                self.pushJSON(type: "transcript", payload: [
+                    "id": sid, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
+                ])
             }
         }
     }
@@ -451,7 +459,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             let hist = (manager.historyByProject[proj] ?? []).compactMap { h -> [String: Any]? in
                 if meta.isHidden(h.id) { return nil }
                 return ["id": h.id, "key": h.id, "label": meta.title(for: h.id) ?? h.label,
-                        "mtime": h.mtime.timeIntervalSince1970 * 1000]
+                        "mtime": h.mtime.timeIntervalSince1970 * 1000, "agent": h.agent.rawValue]
             }
             return ["workdir": proj, "name": (proj as NSString).lastPathComponent, "history": hist]
         }
@@ -644,9 +652,16 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
 
     private func pushJSON(type: String, payload: Any) {
-        guard let data = try? JSONSerialization.data(withJSONObject: ["type": type, "payload": payload]),
-              let json = String(data: data, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.__agent && window.__agent.push(\(json))", completionHandler: nil)
+        // payload 是已构建好的值快照(字典/数组/字符串,非可变模型引用)→ 序列化放后台串行队列,
+        // 只把 evaluateJavaScript 留主线程。大 payload 不再卡主线程;串行队列保证推送顺序不乱。
+        let wrapped: [String: Any] = ["type": type, "payload": payload]
+        pushQueue.async { [weak self] in
+            guard let data = try? JSONSerialization.data(withJSONObject: wrapped),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                self?.webView.evaluateJavaScript("window.__agent && window.__agent.push(\(json))", completionHandler: nil)
+            }
+        }
     }
 }
 
@@ -667,25 +682,37 @@ func toolOpJSON(_ op: ToolOp) -> [String: Any] {
 final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
     private let root: URL
     init(root: URL) { self.root = root }
+    // 图片在后台线程取/解时,task 可能已被取消(img 移出 DOM)。记下已 stop 的 task,回调前判一下,避免崩。
+    private let lock = NSLock()
+    private var stopped = Set<ObjectIdentifier>()
+    private func isStopped(_ t: WKURLSchemeTask) -> Bool { lock.lock(); defer { lock.unlock() }; return stopped.contains(ObjectIdentifier(t)) }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url else { task.didFinish(); return }
         var path = url.path
-        let fileURL: URL
         if path.hasPrefix("/__img/") {
-            // 会话图片:按 id 取字节(本地缓存命中或回源下载)。通道里只有这个 id。
+            // 会话图片:按 id 取字节。**放后台线程**现切现解(历史图 base64 很大),不阻塞主线程 →
+            // 文字消息先渲染、图片异步随后出。优先本地转录索引(ensureFromIndex),再回源下载。
             let name = String(path.dropFirst("/__img/".count))   // <id>.<ext>
             let id = (name as NSString).deletingPathExtension
             let ext = (name as NSString).pathExtension
-            guard !id.isEmpty, let local = ImageRelay.ensureCached(id: id, ext: ext) else {
-                let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
-                task.didReceive(resp); task.didFinish(); return
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let local = id.isEmpty ? nil : (ImageRelay.ensureFromIndex(id: id, ext: ext) ?? ImageRelay.ensureCached(id: id, ext: ext))
+                let data = local.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }
+                guard let self, !self.isStopped(task) else { return }
+                if let data {
+                    let resp = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                               headerFields: ["Content-Type": Self.mime(ext), "Access-Control-Allow-Origin": "*"])!
+                    task.didReceive(resp); task.didReceive(data); task.didFinish()
+                } else {
+                    let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
+                    task.didReceive(resp); task.didFinish()
+                }
             }
-            fileURL = URL(fileURLWithPath: local)
-        } else {
-            if path.isEmpty || path == "/" { path = "/index.html" }
-            fileURL = root.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+            return
         }
+        if path.isEmpty || path == "/" { path = "/index.html" }
+        let fileURL = root.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
         guard let data = try? Data(contentsOf: fileURL) else {
             let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!
             task.didReceive(resp); task.didFinish(); return
@@ -695,7 +722,7 @@ final class DistSchemeHandler: NSObject, WKURLSchemeHandler {
                                                   "Access-Control-Allow-Origin": "*"])!
         task.didReceive(resp); task.didReceive(data); task.didFinish()
     }
-    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {}
+    func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) { lock.lock(); stopped.insert(ObjectIdentifier(task)); lock.unlock() }
 
     private static func mime(_ ext: String) -> String {
         switch ext.lowercased() {

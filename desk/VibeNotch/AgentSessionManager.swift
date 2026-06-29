@@ -50,9 +50,10 @@ struct AgentSession: Identifiable, Equatable {
 
 /// 历史会话条目(供「从历史恢复」列表)。
 struct HistoryEntry: Identifiable, Equatable {
-    let id: String       // claude session_id(= 转录文件名)
+    let id: String       // claude=session_id(=转录文件名);codex=rollout 文件名末尾 uuid(=thread/resume 的 threadId)
     let label: String    // 首句,做标签
     var mtime: Date = .distantPast   // 转录最后修改时间(列表展示相对时间)
+    var agent: AgentKind = .claude   // resume 时据此选对 driver(claude / codex)
 }
 
 // MARK: - 会话管理器
@@ -186,7 +187,8 @@ final class AgentSessionManager: ObservableObject {
     private func loadHistory(sessionId: String, into sid: String, attempt: Int = 0) {
         Task.detached(priority: .utility) { [weak self] in
             let found = Self.findTranscript(sessionId: sessionId)
-            let items = Self.parseTranscript(sessionId: sessionId)
+            // 只回填最近 ~15 条(只读文件尾),避免解析整份大转录卡顿。要更早的等懒加载分页。
+            let items = found.map { Self.parseTranscriptTail(path: $0, limit: 15) } ?? []
             let shouldRetry: Bool = await MainActor.run {
                 guard let self else { return false }
                 // 会话已被关 / 已注入过历史 → 停。
@@ -226,7 +228,18 @@ final class AgentSessionManager: ObservableObject {
     /// 某项目下某会话 id 的转录路径(供桌面历史只读浏览)。
     nonisolated static func historyTranscriptPath(workdir: String, id: String) -> String {
         let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        return NSString(string: "~/.claude/projects/\(enc)/\(id).jsonl").expandingTildeInPath
+        let claude = NSString(string: "~/.claude/projects/\(enc)/\(id).jsonl").expandingTildeInPath
+        if FileManager.default.fileExists(atPath: claude) { return claude }
+        return codexPath(forId: id) ?? claude   // Claude 没有 → 按 uuid 在 ~/.codex/sessions 下找 rollout
+    }
+    /// 按会话 uuid 在 ~/.codex/sessions 下定位 rollout 文件(供查看/解析 Codex 历史)。
+    nonisolated private static func codexPath(forId id: String) -> String? {
+        let root = NSString(string: "~/.codex/sessions").expandingTildeInPath
+        guard let en = FileManager.default.enumerator(atPath: root) else { return nil }
+        for case let rel as String in en where rel.contains("rollout-") && rel.hasSuffix("\(id).jsonl") {
+            return "\(root)/\(rel)"
+        }
+        return nil
     }
 
     /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
@@ -239,6 +252,29 @@ final class AgentSessionManager: ObservableObject {
             out.append(contentsOf: parseTranscriptLine(String(line)).map { (role: $0.role, kind: $0.kind, text: $0.text) })
         }
         return out
+    }
+
+    /// 只读转录文件「尾部」(约 tailBytes 字节)解析最近 limit 条消息。用于 resume/打开会话时快速回填:
+    /// 大文件(本会话 41MB→3540 条)整份解析+注入会卡死主线程,这里只碰尾部、只取最后十几条。
+    nonisolated static func parseTranscriptTail(path: String, limit: Int = 15, tailBytes: UInt64 = 256 * 1024)
+        -> [(role: String, kind: AgentMessage.Kind, text: String)] {
+        if path.contains("/.codex/") {
+            return Array(CodexTranscriptReader.parseTranscriptFile(path: path).suffix(limit))
+        }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let start = size > tailBytes ? size - tailBytes : 0
+        try? fh.seek(toOffset: start)
+        let data = (try? fh.readToEnd()) ?? Data()
+        var text = String(decoding: data, as: UTF8.self)
+        // 从中间截断时丢掉第一行残行(从头开始则保留)
+        if start > 0, let nl = text.firstIndex(of: "\n") { text = String(text[text.index(after: nl)...]) }
+        var out: [(String, AgentMessage.Kind, String)] = []
+        for line in text.split(separator: "\n") {
+            out.append(contentsOf: parseTranscriptLine(String(line)).map { (role: $0.role, kind: $0.kind, text: $0.text) })
+        }
+        return Array(out.suffix(limit))
     }
 
     /// 解析转录中的一行(jsonl),抽出可显示的消息;一行的多个 block 可产生多条。
@@ -371,6 +407,13 @@ final class AgentSessionManager: ObservableObject {
             i = j + 1
         }
         // pendingQueue = 当前仍在排队的消息(工作中发的、还没被处理)→ 单独返回,前端在「排队中」区显示。
+        // 每页最多 N 条:窗口为索引图片要读 1MB,但一次只把最后 N 条推给前端,避免前端一次渲染上百条卡主线程。
+        // earliest 对齐到「首个保留消息」的字节偏移(ord/16),「加载更早」从那继续 → 不留洞。
+        let pageLimit = 25
+        if out.count > pageLimit {
+            let kept = Array(out.suffix(pageLimit))
+            return (kept, pendingQueue, kept[0].3 / 16, true)   // ord = 行字节偏移*16+k(k<16)→ /16 即行偏移
+        }
         let earliest = firstKept ?? Int(start)
         return (out, pendingQueue, earliest, earliest > 0)
     }
@@ -392,7 +435,7 @@ final class AgentSessionManager: ObservableObject {
             var j = i
             while j < bytes.count && bytes[j] != 0x0A { j += 1 }
             if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8),
-               let imgs = userImagesInLine(lineStr) {
+               let imgs = userImagesInLine(lineStr, path: path, lineStart: UInt64(Int(start) + i)) {
                 // 与 parseTranscriptWindow 的 ord 对齐:用户图文消息是该行第 0 条
                 result[(Int(start) + i) * 16 + 0] = imgs
             }
@@ -401,42 +444,83 @@ final class AgentSessionManager: ObservableObject {
         return result
     }
 
-    private nonisolated static func userImagesInLine(_ line: String) -> [[String: String]]? {
+    private nonisolated static func userImagesInLine(_ line: String, path: String, lineStart: UInt64) -> [[String: String]]? {
         guard let d = line.data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               (o["type"] as? String) == "user",
               let msg = o["message"] as? [String: Any],
               let blocks = msg["content"] as? [[String: Any]] else { return nil }
         var imgs: [[String: String]] = []
+        var imgIdx = 0
         for b in blocks where (b["type"] as? String) == "image" {
+            defer { imgIdx += 1 }   // 每个 image block 都计数,对齐 ensureFromIndex 的 filter 顺序
             guard let src = b["source"] as? [String: Any], let data = src["data"] as? String, !data.isEmpty else { continue }
             let mt = (src["media_type"] as? String) ?? "image/png"
             let ext = mt.hasSuffix("png") ? "png" : mt.hasSuffix("webp") ? "webp" : mt.hasSuffix("gif") ? "gif" : "jpg"
-            // 历史图落本地缓存、用内容 hash 当本地 id;通道只带这个 id,桌面 web 按 app://__img/<id> 取
-            guard let id = ImageRelay.cacheBase64(data, ext: ext) else { continue }
+            // 不解码:只登记位置(廉价 id),通道仍只带 id;桌面 web 按 app://__img/<id> 取时才现切现解。
+            let id = ImageRelay.indexB64(data, path: path, lineStart: lineStart, imgIdx: imgIdx, ext: ext)
             imgs.append(["id": id, "ext": ext])
         }
         return imgs.isEmpty ? nil : imgs
     }
 
-    /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。
+    /// 列出某工作目录下的历史会话(供「新建时从历史恢复」选择)。新→旧。Claude + Codex 都枚举。
     nonisolated static func listHistory(workdir: String, limit: Int = 30) -> [HistoryEntry] {
+        let fm = FileManager.default
+        var entries: [HistoryEntry] = []
+        // Claude:~/.claude/projects/<编码目录>/<session_id>.jsonl
         let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
         let dir = NSString(string: "~/.claude/projects/\(enc)").expandingTildeInPath
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
-        // 先按 mtime 排序、截断,再只对前 limit 个解析首句(避免解析全部转录)。
-        var metas: [(id: String, full: String, mtime: Date)] = []
-        for f in files where f.hasSuffix(".jsonl") {
-            let full = "\(dir)/\(f)"
-            let mtime = (try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date ?? .distantPast
-            metas.append((String(f.dropLast(6)), full, mtime))
+        if let files = try? fm.contentsOfDirectory(atPath: dir) {
+            for f in files where f.hasSuffix(".jsonl") {
+                let full = "\(dir)/\(f)", id = String(f.dropLast(6))
+                let mtime = (try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date ?? .distantPast
+                entries.append(HistoryEntry(id: id, label: firstUserPrompt(path: full).map { String($0.prefix(48)) } ?? id, mtime: mtime, agent: .claude))
+            }
         }
-        return metas.sorted { $0.mtime > $1.mtime }.prefix(limit).map {
-            HistoryEntry(id: $0.id,
-                         label: firstUserPrompt(path: $0.full).map { String($0.prefix(48)) } ?? $0.id,
-                         mtime: $0.mtime)
+        // Codex:~/.codex/sessions/年/月/日/rollout-时间-<uuid>.jsonl(按日期存,cwd 在首行 payload.cwd)。
+        entries.append(contentsOf: codexHistory(workdir: workdir, fm: fm))
+        // 解析首句较重 → 只对最终要展示的前 limit 个(已按 mtime 排序)解析,避免读全部转录。
+        return Array(entries.sorted { $0.mtime > $1.mtime }.prefix(limit))
+    }
+
+    /// Codex 历史:扫 ~/.codex/sessions 下的 rollout 文件,读首行 cwd 过滤出本工作目录的。
+    nonisolated private static func codexHistory(workdir: String, fm: FileManager) -> [HistoryEntry] {
+        let root = NSString(string: "~/.codex/sessions").expandingTildeInPath
+        guard let en = fm.enumerator(atPath: root) else { return [] }
+        var files: [(path: String, mtime: Date)] = []
+        for case let rel as String in en where rel.hasSuffix(".jsonl") && rel.contains("rollout-") {
+            let full = "\(root)/\(rel)"
+            let mt = (try? fm.attributesOfItem(atPath: full)[.modificationDate]) as? Date ?? .distantPast
+            files.append((full, mt))
         }
+        var out: [HistoryEntry] = []
+        for f in files.sorted(by: { $0.mtime > $1.mtime }).prefix(80) where codexCwd(path: f.path) == workdir {
+            let id = codexThreadId(path: f.path)
+            out.append(HistoryEntry(id: id, label: CodexTranscriptReader.firstUserPrompt(path: f.path).map { String($0.prefix(48)) } ?? id, mtime: f.mtime, agent: .codex))
+        }
+        return out
+    }
+    /// rollout 文件名末尾 36 字符 = 会话 uuid(= thread/resume 的 threadId)。
+    nonisolated private static func codexThreadId(path: String) -> String {
+        let stem = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        return stem.count >= 36 ? String(stem.suffix(36)) : stem
+    }
+    /// 读 rollout 首行的 cwd(在顶层或 payload 里)。session_meta 首行可能 20KB+,必须读到首个换行为止
+    /// ——之前只读 16KB 会把首行截断、解析失败 → Codex 会话匹配不上 → 点叉后消失。
+    nonisolated private static func codexCwd(path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        var line = Data()
+        while line.count < 4 * 1024 * 1024 {
+            guard let part = try? fh.read(upToCount: 32768), !part.isEmpty else { break }
+            if let nl = part.firstIndex(of: 0x0A) { line.append(part[..<nl]); break }
+            line.append(part)
+        }
+        guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        if let c = o["cwd"] as? String { return c }
+        if let p = o["payload"] as? [String: Any], let c = p["cwd"] as? String { return c }
+        return nil
     }
 
     /// 读转录里第一条用户文本(历史列表的标签 / 会话标题)。只读文件头部 —— 首句几乎都在最前,避免读取大转录全文。

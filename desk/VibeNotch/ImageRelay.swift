@@ -17,6 +17,7 @@ enum ImageRelay {
     @discardableResult
     static func saveById(id: String, ext: String, data: Data) -> String? {
         let path = cachePath(id: id, ext: ext)
+        if FileManager.default.fileExists(atPath: path) { return path }   // 命中即跳过,不重写
         return FileManager.default.createFile(atPath: path, contents: data) ? path : nil
     }
     /// 确保本地有这张图:命中缓存直接返回路径;否则按 id 回源下载再缓存。
@@ -70,13 +71,56 @@ enum ImageRelay {
     /// 历史 transcript 里的图是内联 base64、没有服务器 id:落到本地缓存、用内容 hash 当本地 id,
     /// 返回 id,桌面 web 按 `app://__img/<id>` 取(通道里只走这个 id,不放 base64)。
     static func cacheBase64(_ b64: String, ext: String) -> String? {
+        let id = cheapId(b64)
+        if FileManager.default.fileExists(atPath: cachePath(id: id, ext: ext)) { return id }  // 已缓存:不解码不写
         guard let data = Data(base64Encoded: b64) else { return nil }
-        let id = stableId(b64)
         return saveById(id: id, ext: ext, data: data) != nil ? id : nil
     }
-    private static func stableId(_ s: String) -> String {
-        var h: UInt64 = 1469598103934665603   // FNV-1a 64
-        for b in s.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+
+    /// 廉价 id:只取首尾若干字符 + 长度做 FNV,不哈希整段(单张图 base64 几百 KB,逐字节哈希太慢)。
+    /// 够稳定、碰撞概率极低,足够做缓存键 + 去重。
+    static func cheapId(_ b64: String) -> String {
+        let u = Array(b64.utf8); let n = u.count
+        var h: UInt64 = 1469598103934665603
+        for b in u.prefix(96) { h = (h ^ UInt64(b)) &* 1099511628211 }
+        for b in u.suffix(48) { h = (h ^ UInt64(b)) &* 1099511628211 }
+        h = (h ^ UInt64(truncatingIfNeeded: n)) &* 1099511628211
         return "h" + String(h, radix: 16)
+    }
+
+    // 懒索引:历史图 base64 太大,解析时**不解码**,只记 id→(转录文件, 行起始字节, 该行第几张图, ext)。
+    // 真要显示时(scheme handler 取图)才按位置切出那一行、解出那一张、缓存。文字消息因此不被图片拖慢。
+    private static var b64Loc: [String: (path: String, lineStart: UInt64, imgIdx: Int, ext: String)] = [:]
+    private static let b64Lock = NSLock()
+
+    /// 解析转录窗口时调用:登记一张图的位置(不解码、不写盘),返回廉价 id。
+    static func indexB64(_ b64: String, path: String, lineStart: UInt64, imgIdx: Int, ext: String) -> String {
+        let id = cheapId(b64)
+        b64Lock.lock(); b64Loc[id] = (path, lineStart, imgIdx, ext); b64Lock.unlock()
+        return id
+    }
+
+    /// scheme handler 取图:命中缓存直接返回;否则按索引切出转录那一行、解出第 imgIdx 张图、缓存、返回。
+    static func ensureFromIndex(id: String, ext: String) -> String? {
+        let p = cachePath(id: id, ext: ext)
+        if FileManager.default.fileExists(atPath: p) { return p }            // 命中即跳过(不解码)
+        b64Lock.lock(); let loc = b64Loc[id]; b64Lock.unlock()
+        guard let loc, let fh = FileHandle(forReadingAtPath: loc.path) else { return nil }
+        defer { try? fh.close() }
+        try? fh.seek(toOffset: loc.lineStart)
+        var line = Data(); let chunk = 256 * 1024
+        while line.count < 64 * 1024 * 1024 {                                // 读到行尾(图片行可能很大)
+            guard let part = try? fh.read(upToCount: chunk), !part.isEmpty else { break }
+            if let nl = part.firstIndex(of: 0x0A) { line.append(part[..<nl]); break }
+            line.append(part)
+        }
+        guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let msg = o["message"] as? [String: Any],
+              let blocks = msg["content"] as? [[String: Any]] else { return nil }
+        let images = blocks.filter { ($0["type"] as? String) == "image" }
+        guard loc.imgIdx < images.count,
+              let src = images[loc.imgIdx]["source"] as? [String: Any],
+              let b64 = src["data"] as? String, let data = Data(base64Encoded: b64) else { return nil }
+        return saveById(id: id, ext: ext, data: data)
     }
 }

@@ -6,7 +6,7 @@ import {
   Folder, ChevronRight, ChevronDown, ChevronsUpDown, ArrowUp,
   RotateCcw, AppWindow, Plus, X, Paperclip, Sun, Moon, SlidersHorizontal,
   BarChart3, PanelsTopLeft, Copy, FileText, Check, Server, MoreHorizontal, Pencil, EyeOff, Trash2,
-  Activity, DollarSign, Boxes, Database, GitBranch, MessageSquare, Clipboard, Code2,
+  Activity, DollarSign, Boxes, Database, GitBranch, MessageSquare, Clipboard, Code2, User,
 } from 'lucide-react'
 import { subscribe, getState, getTranscripts, getTranscriptMeta, getDirs, getFiles, getUsage, getConn, getPrefs, getImgUpload } from './store'
 import { cmd, auth, type AgentId } from './bridge'
@@ -412,15 +412,21 @@ const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, wo
     prevH.current = el.scrollHeight
   }, [ordered, working, pending?.length])
   useEffect(() => { setLoading(false) }, [ordered.length, hasEarlier])
+  // 微信式:上滑到接近顶部(滚动范围前 25%)就静默预载更早消息,不用点按钮。
+  const onScroll = () => {
+    const el = ref.current; if (!el || !hasEarlier || loading) return
+    const range = el.scrollHeight - el.clientHeight
+    if (range > 0 && el.scrollTop < range * 0.25) { setLoading(true); onLoadEarlier?.() }
+  }
   return (
-    <div ref={ref} className="flex-1 overflow-y-auto overflow-x-hidden">
+    <div ref={ref} onScroll={onScroll} className="flex-1 overflow-y-auto overflow-x-hidden">
       <div className="max-w-[780px] mx-auto px-7 py-5 space-y-4">
-        {hasEarlier && (
+        {/* 预载静默进行;只有还没载完你就滑到顶,才看到这个「加载中」。 */}
+        {hasEarlier && loading && (
           <div className="flex justify-center pb-1">
-            <button onClick={() => { if (onLoadEarlier && !loading) { setLoading(true); onLoadEarlier() } }} disabled={loading}
-              className="px-3.5 py-1.5 rounded-lg text-[12px] text-dim border border-line hover:bg-sunken disabled:opacity-60 transition-colors">
-              {loading ? '加载中…' : '加载更早'}
-            </button>
+            <span className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] text-faint">
+              <span className="w-1.5 h-1.5 rounded-full bg-faint typing-dot" />加载更早消息…
+            </span>
           </div>
         )}
         {blocks.map((b) => b.type === 'user' ? (
@@ -456,7 +462,7 @@ const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, wo
 }, (a, b) =>
   // 只比数据,忽略每次渲染都新建的回调:数据没变就不重渲染(背景会话在跑时不拖累当前列表)。
   a.msgs === b.msgs && a.pending === b.pending && a.working === b.working &&
-  a.model === b.model && a.root === b.root && a.animate === b.animate && a.hasEarlier === b.hasEarlier)
+  a.model === b.model && a.root === b.root && a.animate === b.animate && a.hasEarlier === b.hasEarlier )
 
 function IconBtn({ title, onClick, children }: { title: string; onClick?: () => void; children: React.ReactNode }) {
   return (
@@ -1117,7 +1123,7 @@ type Group = { p: Project; rows: RowItem[]; running: number; gitDirty: number }
 const selEq = (a: Sel, b: Sel) => !!a && !!b && a.kind === b.kind && a.id === b.id
 
 // 单条会话行(默认目录平铺 + 项目文件夹内 复用)。showPath:散会话标完整路径(左侧省略、末级目录必显)区分。
-const SessionRow = memo(function SessionRow({ r, on, showPath, onClick }: { r: RowItem; on: boolean; showPath?: boolean; onClick: () => void }) {
+const SessionRow = memo(function SessionRow({ r, on, showPath, flipping, onClick }: { r: RowItem; on: boolean; showPath?: boolean; flipping?: boolean; onClick: () => void }) {
   const [editing, setEditing] = useState(false)
   const [val, setVal] = useState(r.title)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
@@ -1133,7 +1139,7 @@ const SessionRow = memo(function SessionRow({ r, on, showPath, onClick }: { r: R
   return (
     <div onClick={editing ? undefined : onClick} onDoubleClick={() => { setVal(r.title); setEditing(true) }}
       onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY }) }}
-      className="group relative w-full text-left flex gap-2.5 rounded-[9px] px-2.5 py-2 transition-colors hover:bg-sunken cursor-pointer"
+      className={`group relative w-full text-left flex gap-2.5 rounded-[9px] px-2.5 py-2 transition-colors hover:bg-sunken cursor-pointer ${flipping ? 'flip-sweep' : ''}`}
       style={on ? { background: 'var(--accent-soft)' } : undefined}>
       <span className="mt-[5px]"><Dot meta={r.meta} /></span>
       <div className="min-w-0 flex-1">
@@ -1149,7 +1155,7 @@ const SessionRow = memo(function SessionRow({ r, on, showPath, onClick }: { r: R
         <div className="mt-1 flex items-center gap-[7px]">
           <span className="text-[10.5px] font-medium shrink-0" style={{ color: r.meta.color }}>{r.meta.text}</span>
           <span className="text-[10.5px] text-faint shrink-0">·</span>
-          <span className="font-mono text-[10.5px] text-faint truncate flex-1 min-w-0">{r.model}</span>
+          <span className={`font-mono text-[10.5px] text-faint truncate flex-1 min-w-0 ${flipping ? 'badge-flip' : ''}`}>{r.model}</span>
           <span className="text-[10.5px] text-faint shrink-0">{r.time}</span>
         </div>
       </div>
@@ -1172,15 +1178,15 @@ const SessionRow = memo(function SessionRow({ r, on, showPath, onClick }: { r: R
 }, (a, b) =>
   // 只比展示字段;onClick 每次渲染新建但行为相同 → 忽略。运行中会话每 token 更新 state.sessions
   // 时,标题/状态/时间没变的行直接跳过,会话列表不再整列重渲染。
-  a.on === b.on && a.showPath === b.showPath &&
+  a.on === b.on && a.showPath === b.showPath && a.flipping === b.flipping &&
   a.r.key === b.r.key && a.r.title === b.r.title && a.r.time === b.r.time && a.r.model === b.r.model &&
   a.r.meta.text === b.r.meta.text && a.r.meta.color === b.r.meta.color && a.r.renameKey === b.r.renameKey)
 
 // ===== 左列:默认目录(workplace)文件夹置顶+默认展开,散会话归入并标路径;其它项目文件夹可移除 =====
-function SessionsNav({ groups, sel, activeWd, defaultWd, expanded, toggle, pick, onReorder, onRemove }: {
+function SessionsNav({ groups, sel, activeWd, defaultWd, expanded, toggle, pick, onReorder, onRemove, flipping }: {
   groups: Group[]; sel: Sel; activeWd: string | null; defaultWd?: string
   expanded: Set<string>; toggle: (wd: string) => void; pick: (s: Sel, wd: string) => void
-  onReorder: (fromWd: string, toWd: string) => void; onRemove: (wd: string) => void
+  onReorder: (fromWd: string, toWd: string) => void; onRemove: (wd: string) => void; flipping: Set<string>
 }) {
   const [dragWd, setDragWd] = useState<string | null>(null)
   const [overWd, setOverWd] = useState<string | null>(null)
@@ -1223,7 +1229,7 @@ function SessionsNav({ groups, sel, activeWd, defaultWd, expanded, toggle, pick,
               </div>
               {open && (
                 <div className="pb-1.5" style={{ marginLeft: 19, marginBottom: 8, paddingLeft: 13, borderLeft: `2px solid ${active ? 'var(--accent-soft)' : 'var(--border-strong)'}` }}>
-                  {visibleRows.map((r) => <SessionRow key={r.key} r={r} on={selEq(r.sel, sel)} showPath={isDefault} onClick={() => pick(r.sel, g.p.workdir)} />)}
+                  {visibleRows.map((r) => <SessionRow key={r.key} r={r} on={selEq(r.sel, sel)} showPath={isDefault} flipping={!!r.sel && flipping.has(r.sel.id)} onClick={() => pick(r.sel, g.p.workdir)} />)}
                   {moreCount > 0 && (
                     <button onClick={() => setLimits((m) => ({ ...m, [g.p.workdir]: shown + 30 }))}
                       className="w-full text-left text-[11.5px] text-dim hover:text-accent px-2.5 py-1.5 rounded-[9px] hover:bg-sunken transition-colors">显示更多 · 还有 {moreCount} 条</button>
@@ -1325,6 +1331,10 @@ function ConsolePage() {
   const [openTabs, setOpenTabs] = useState<NonNullable<Sel>[]>([])   // 已打开会话(右侧多标签)
   // 控制台会话内部 id → claude session_id 映射;会话被终端抢占消失后,用它把选中/标签翻牌到同 id 的终端会话。
   const sidToAid = useRef<Map<string, string>>(new Map())
+  // 真实翻牌动效(效果1):被终端抢占、控制台会话翻成终端会话的瞬间,给那张卡播一次过渡。
+  const [flippedIds, setFlippedIds] = useState<Set<string>>(new Set())
+  const prevConsoleAids = useRef<Set<string>>(new Set())
+  const flipTimers = useRef<Record<string, number>>({})
   // 文件视图按会话记忆:每个会话各自的「打开的文件标签 / 当前文件 / chat-files 视图」——切走再切回不丢
   const [filesBySession, setFilesBySession] = useState<Record<string, string[]>>({})
   const [activeFileBySession, setActiveFileBySession] = useState<Record<string, string | null>>({})
@@ -1352,7 +1362,7 @@ function ConsolePage() {
   const [branchSel, setBranchSel] = useState<{ wd: string; branch: string } | null>(null)
   const [pendingResume, setPendingResume] = useState<string | null>(null)
 
-  const doResume = (workdir: string, id: string) => { if (pendingResume) return; setPendingResume(id); cmd.resume(workdir, id) }
+  const doResume = (workdir: string, id: string, agent?: string) => { if (pendingResume) return; setPendingResume(id); cmd.resume(workdir, id, agent === 'codex' ? 'codex' : 'claude') }
   useEffect(() => {
     if (!pendingResume) return
     const s = state.sessions.find((x) => x.agentSessionId === pendingResume)
@@ -1386,11 +1396,26 @@ function ConsolePage() {
   useEffect(() => { localStorage.setItem('console.order', JSON.stringify(projectOrder)) }, [projectOrder])
 
   useEffect(() => {
+    // 只给当前打开的终端会话推实时正文;控制台会话走进程流、历史是静态,都不需要 → null。
+    cmd.focusSession(sel?.kind === 'manual' ? sel.id : null)
     if (sel?.kind === 'history' && !transcripts[sel.id]) cmd.loadTranscript('history', sel.id, sel.workdir)
     if (sel?.kind === 'manual' && !transcripts[sel.id]) cmd.loadTranscript('manual', sel.id)
   }, [sel, transcripts])
   // 持续记录 控制台会话 id → claude session_id(供翻牌时把选中/标签改指到同 id 的终端会话)
   useEffect(() => { state.sessions.forEach((s) => { if (s.agentSessionId) sidToAid.current.set(s.id, s.agentSessionId) }) }, [state.sessions])
+  // 翻牌检测:上一帧还是控制台会话、这一帧控制台没了、但同 session_id 的终端会话在 → 刚被抢占翻牌,标记播动效。
+  useEffect(() => {
+    const nowConsole = new Set(state.sessions.map((s) => s.agentSessionId).filter(Boolean) as string[])
+    const manualIds = new Set(state.manual.map((m) => m.id))
+    for (const aid of prevConsoleAids.current) {
+      if (!nowConsole.has(aid) && manualIds.has(aid)) {
+        setFlippedIds((prev) => (prev.has(aid) ? prev : new Set(prev).add(aid)))
+        clearTimeout(flipTimers.current[aid])
+        flipTimers.current[aid] = window.setTimeout(() => setFlippedIds((prev) => { const n = new Set(prev); n.delete(aid); return n }), 1400)
+      }
+    }
+    prevConsoleAids.current = nowConsole
+  }, [state.sessions, state.manual])
   useEffect(() => {
     if (sel?.kind === 'session' && !state.sessions.some((s) => s.id === sel.id)) {
       // 控制台会话消失:被终端抢占(同 session_id 的终端会话已接管)→ 选中平滑翻牌过去,否则清空
@@ -1442,11 +1467,11 @@ function ConsolePage() {
     const liveIds = new Set<string>([...consoleSids, ...ms.map((m) => m.id)])
     // 历史:默认组并入所有归属目录的历史(各按来源 workdir 取转录);普通组用自己的
     const histSources = isDefault ? rootProjects : [p]
-    const hsRows = histSources.flatMap((src) => src.history.filter((h) => !liveIds.has(h.id)).map((h) => ({ h, wd: src.workdir })))
+    const hsRows = histSources.flatMap((src) => src.history.filter((h) => !liveIds.has(h.id)).map((h) => ({ h, wd: src.workdir })))   // h.agent 决定 Codex/Claude 标
     const rows: RowItem[] = [
       ...cs.map((s): RowItem => ({ key: 's' + s.id, sel: { kind: 'session', id: s.id }, title: s.title, meta: sessionMeta(s.status), model: s.agent === 'codex' ? 'Codex' : 'Claude', time: relTime(s.startedAt), running: !['done', 'error'].includes(s.status), path: s.workdir, ts: s.startedAt ?? 0, renameKey: s.key || s.agentSessionId || s.id })),
       ...ms.map((m): RowItem => ({ key: 'm' + m.id, sel: { kind: 'manual', id: m.id }, title: m.title, meta: manualMeta(m.state), model: `${m.agent === 'codex' ? 'Codex' : 'Claude'} · ${m.terminal}`, time: relTime(m.lastActivityAt), running: m.state === 'working' || m.state === 'waiting', path: m.cwd, ts: m.lastActivityAt, renameKey: m.key || m.id })),
-      ...hsRows.map(({ h, wd }): RowItem => ({ key: 'h' + h.id, sel: { kind: 'history', id: h.id, workdir: wd }, title: h.label, meta: { text: '已结束', color: 'var(--text-faint)', hollow: true }, model: 'Claude', time: relTime(h.mtime), running: false, path: wd, ts: h.mtime, renameKey: h.key || h.id })),
+      ...hsRows.map(({ h, wd }): RowItem => ({ key: 'h' + h.id, sel: { kind: 'history', id: h.id, workdir: wd }, title: h.label, meta: { text: '已结束', color: 'var(--text-faint)', hollow: true }, model: h.agent === 'codex' ? 'Codex' : 'Claude', time: relTime(h.mtime), running: false, path: wd, ts: h.mtime, renameKey: h.key || h.id })),
     ]
     // 运行中优先,其余按时间倒序(最近的在前)——配合分页,先看到的是最相关的
     rows.sort((a, b) => (b.running ? 1 : 0) - (a.running ? 1 : 0) || b.ts - a.ts)
@@ -1533,27 +1558,27 @@ function ConsolePage() {
     barRight = (manualSel.terminal && manualSel.terminal !== '?')
       ? <button onClick={() => cmd.raiseWindow(manualSel.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {manualSel.terminal}</button>
       : null
-    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
+    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} working={manualSel.state === 'working'} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
     footer = viewMode === 'chat' ? <div className="flex-none px-7 py-2.5 border-t border-line text-[11px] text-faint">手动会话:在 {manualSel.terminal} 里输入,这里只读。</div> : null
-    // 排队消息:抖音直播间评论流。绝对定位的浮层(不占容器空间),悬在 chat 底部、背景透明、
-    // 新的在底、旧的往上滑出渐隐、pointer-events-none 不挡操作。
+    // 排队消息:独立浮层(不占对话空间、不打乱消息高度),浮在对话底部、输入区之上;干净样式:图标+透明文字、无背景。
     if (viewMode === 'chat' && (mm?.queued?.length ?? 0) > 0) {
       queueOverlay = (
-        <div className="absolute left-0 right-0 bottom-1 z-20 pointer-events-none flex flex-col justify-end gap-1.5 px-7 overflow-hidden"
-          style={{ height: '130px', WebkitMaskImage: 'linear-gradient(to bottom, transparent, #000 45%)', maskImage: 'linear-gradient(to bottom, transparent, #000 45%)' }}>
-          {mm!.queued!.map((q, i) => (
-            <div key={i} className="flex items-center gap-2 animate-msg text-[13px]" style={{ textShadow: '0 1px 4px var(--bg-elev), 0 1px 4px var(--bg-elev)' }}>
-              <span className="shrink-0 text-[10px] font-semibold px-1.5 py-[1px] rounded-full" style={{ color: 'var(--amber)', border: '1px solid var(--amber)' }}>排队</span>
-              <span className="truncate" style={{ color: 'var(--text)' }} title={q}>{q}</span>
-            </div>
-          ))}
+        <div className="absolute left-0 right-0 bottom-3 z-20 pointer-events-none px-7 flex flex-col justify-end overflow-hidden" style={{ maxHeight: '45%' }}>
+          <div className="max-w-[780px] w-full mx-auto flex flex-col gap-1">
+            {mm!.queued!.slice(-6).map((q, i) => (
+              <div key={i} className="flex items-start gap-2 text-[13px] leading-[1.5] animate-msg" style={{ opacity: 0.5 }}>
+                <User size={13} className="mt-[3px] shrink-0" style={{ color: 'var(--text-faint)' }} />
+                <span className="truncate" style={{ color: 'var(--text-dim)', textShadow: '0 1px 4px var(--bg), 0 0 4px var(--bg)' }} title={q}>{q}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )
     }
   } else if (historySel) {
     const hm = tmeta[historySel.id]
     barSession = { title: historySel.label, meta: { text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }, renameKey: historySel.key || historySel.id }
-    barRight = <button onClick={() => doResume(histWd, historySel.id)} disabled={pendingResume === historySel.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={pendingResume === historySel.id ? 'animate-spin' : ''} />{pendingResume === historySel.id ? '恢复中…' : 'Resume'}</button>
+    barRight = <button onClick={() => doResume(histWd, historySel.id, historySel.agent)} disabled={pendingResume === historySel.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={pendingResume === historySel.id ? 'animate-spin' : ''} />{pendingResume === historySel.id ? '恢复中…' : 'Resume'}</button>
     chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={histWd} hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
   }
   // 仅「无选中会话」(项目空视图)时给项目新建/继续菜单;选了 console 会话不冒它出来。
@@ -1576,7 +1601,7 @@ function ConsolePage() {
       {/* 左列:会话分组 / Git Tree */}
       <div className="w-[312px] shrink-0 bg-elev border-r border-line flex flex-col min-h-0">
         {navMode === 'sessions'
-          ? <SessionsNav groups={orderedGroups} sel={sel} activeWd={activeWd} defaultWd={state.defaultWorkdir} expanded={expanded} toggle={toggleGroup} pick={pick} onReorder={reorder} onRemove={(wd) => cmd.removeProject(wd)} />
+          ? <SessionsNav groups={orderedGroups} sel={sel} activeWd={activeWd} defaultWd={state.defaultWorkdir} expanded={expanded} toggle={toggleGroup} pick={pick} onReorder={reorder} onRemove={(wd) => cmd.removeProject(wd)} flipping={flippedIds} />
           : <GitTreeNav projects={state.projects} activeWd={activeWd} branchSel={branchSel} collapsed={gitCollapsed} toggle={toggleGit} inited={inited} onInit={(wd) => setInited((p) => new Set(p).add(wd))} onBranch={onBranch} />}
       </div>
 
@@ -1604,9 +1629,11 @@ function ConsolePage() {
           <WorkBar session={barSession}
             tri={<TriToggle navMode={navMode} viewMode={viewMode} onConv={onConv} onGit={onGit} onFiles={onFiles} />} right={barRight} />
         )}
-        <div key={sel ? sel.kind + sel.id : 'empty'} className="flex-1 flex flex-col min-h-0 animate-conv relative">
-          <WorkBody viewMode={viewMode} project={activeProject} openFile={openFile} fileTabs={fileTabs} onPickFile={openFileInConsole} onCloseFile={closeFileTab} onAddSel={bodyAddSel} onAddFile={bodyAddFile} chat={chat ?? emptyChat} />
-          {queueOverlay}
+        <div key={sel ? sel.kind + sel.id : 'empty'} className="flex-1 flex flex-col min-h-0 animate-conv">
+          <div className="relative flex-1 min-h-0 flex flex-col">
+            <WorkBody viewMode={viewMode} project={activeProject} openFile={openFile} fileTabs={fileTabs} onPickFile={openFileInConsole} onCloseFile={closeFileTab} onAddSel={bodyAddSel} onAddFile={bodyAddFile} chat={chat ?? emptyChat} />
+            {queueOverlay}
+          </div>
           {footer}
         </div>
       </div>

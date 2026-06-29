@@ -51,7 +51,7 @@ export interface Session {
 export interface Entry { name: string; path: string; isDir: boolean }
 export interface FileBody { text: string; truncated: boolean }
 
-export interface History { id: string; key?: string; label: string; mtime: number }
+export interface History { id: string; key?: string; label: string; mtime: number; agent?: string }
 export interface Project { workdir: string; name: string; history: History[] }
 
 export interface Manual {

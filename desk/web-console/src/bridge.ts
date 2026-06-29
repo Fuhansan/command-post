@@ -115,6 +115,8 @@ export const cmd = {
   // beforeByte 省略=取末尾一窗;传值=加载该字节偏移之前的一窗(更早消息)。
   loadTranscript: (kind: 'manual' | 'history', id: string, workdir?: string, beforeByte?: number) =>
     send({ action: 'loadTranscript', kind, id, workdir, beforeByte }),
+  // 告诉桥当前打开的是哪个(终端)会话:只给它读转录推实时正文,其余不加载。null = 没开/控制台会话。
+  focusSession: (id: string | null) => send({ action: 'focusSession', id }),
   listDir: (path: string) => send({ action: 'listDir', path }),
   loadFile: (path: string) => send({ action: 'loadFile', path }),
   loadUsage: (days: number) => send({ action: 'loadUsage', days }),

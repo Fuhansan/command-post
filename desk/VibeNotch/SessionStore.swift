@@ -152,6 +152,14 @@ final class SessionStore: ObservableObject {
             }
 
         case "SessionEnd":
+            // 只接受「当前 owner 进程」发来的 SessionEnd。被终端「翻牌」让位的旧控制台进程(进程 A)
+            // 临死也会对同一个 session_id 发 SessionEnd,但此刻 owner 已是接管的终端进程 B(SessionStart
+            // 时已把 ownerPID 记成 B 的 ppid)。A 那条 SessionEnd 的 ppid ≠ 当前 ownerPID → 忽略,
+            // 否则会把刚翻牌过来的终端会话误删成「已结束」。
+            if let p = event.ppid, let owner = sessions.first(where: { $0.id == sid })?.ownerPID,
+               pid_t(p) != owner {
+                break
+            }
             sessions.removeAll { $0.id == sid }
 
         default:
