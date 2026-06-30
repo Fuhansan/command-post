@@ -28,8 +28,9 @@ final class PendingDecisionStore: ObservableObject {
     /// session's `.waiting` state so the notch can collapse normally.
     var onTimeout: ((String) -> Void)?
 
-    /// How long to wait for a user decision before giving up.
-    static let decisionTimeout: TimeInterval = 45
+    /// How long to wait for a user decision before giving up. Keep this aligned with
+    /// the hook script/settings timeout so desktop approval does not expire first.
+    static let decisionTimeout: TimeInterval = 86_400
 
     func add(sid: String, conn: HookConnection) {
         // Replace any prior pending for the same session — claude can only have
@@ -48,13 +49,28 @@ final class PendingDecisionStore: ObservableObject {
         }
     }
 
-    func resolve(sid: String, decision: PermissionDecision) {
+    func detail(sid: String) -> String? {
+        guard let event = connections[sid]?.event else { return nil }
+        return event.toolInput?.command
+            ?? event.toolInput?.filePath
+            ?? event.toolInput?.path
+            ?? event.toolInput?.url
+            ?? event.toolName
+    }
+
+    @discardableResult
+    func resolve(sid: String, decision: PermissionDecision) -> Bool {
         watchdogs[sid]?.cancel()
         watchdogs[sid] = nil
-        guard let conn = connections.removeValue(forKey: sid) else { return }
-        conn.respond(json: decision.hookOutput)
-        if case .allow = decision { emitDecision(sid, "allow") } else { emitDecision(sid, "deny") }
+        guard let conn = connections.removeValue(forKey: sid) else { return false }
+        let ok = conn.respond(json: decision.hookOutput)
+        if ok {
+            if case .allow = decision { emitDecision(sid, "allow") } else { emitDecision(sid, "deny") }
+        } else {
+            emitDecision(sid, "timeout")
+        }
         pendingIDs.remove(sid)
+        return ok
     }
 
     func cancel(sid: String) {

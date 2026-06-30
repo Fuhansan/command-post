@@ -24,32 +24,51 @@ enum CodexTranscriptReader {
         guard let fh = FileHandle(forReadingAtPath: path) else { return ([], 0, false) }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
-        let end = min(endByte ?? fileSize, fileSize)
-        let start = end > UInt64(windowBytes) ? end - UInt64(windowBytes) : 0
-        try? fh.seek(toOffset: start)
-        let bytes = [UInt8]((try? fh.read(upToCount: Int(end - start))) ?? Data())
+        let win = UInt64(max(windowBytes, 64 * 1024))
+        var cursor = min(endByte ?? fileSize, fileSize)
+        var fallbackEarliest = Int(cursor)
+        var skipped = 0
 
-        var i = 0
-        if start > 0 { i = (bytes.firstIndex(of: 0x0A)).map { $0 + 1 } ?? bytes.count }
-        var out: [(String, AgentMessage.Kind, String, Int)] = []
-        var firstKept: Int? = nil
-        while i < bytes.count {
-            var j = i
-            while j < bytes.count && bytes[j] != 0x0A { j += 1 }
-            if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8) {
-                let lineByteStart = Int(start) + i
-                let msgs = parseTranscriptLine(lineStr)
-                if !msgs.isEmpty {
-                    if firstKept == nil { firstKept = lineByteStart }
-                    for (k, m) in msgs.enumerated() {
-                        out.append((m.role, m.kind, m.text, lineByteStart * 16 + min(k, 15)))
+        func parseSlice(start: UInt64, end: UInt64) -> ([(String, AgentMessage.Kind, String, Int)], Int?) {
+            try? fh.seek(toOffset: start)
+            let bytes = [UInt8]((try? fh.read(upToCount: Int(end - start))) ?? Data())
+            var i = 0
+            if start > 0 { i = (bytes.firstIndex(of: 0x0A)).map { $0 + 1 } ?? bytes.count }
+            var out: [(String, AgentMessage.Kind, String, Int)] = []
+            var firstKept: Int? = nil
+            while i < bytes.count {
+                var j = i
+                while j < bytes.count && bytes[j] != 0x0A { j += 1 }
+                if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8) {
+                    let lineByteStart = Int(start) + i
+                    let msgs = parseTranscriptLine(lineStr)
+                    if !msgs.isEmpty {
+                        if firstKept == nil { firstKept = lineByteStart }
+                        for (k, m) in msgs.enumerated() {
+                            out.append((m.role, m.kind, m.text, lineByteStart * 16 + min(k, 15)))
+                        }
                     }
                 }
+                i = j + 1
             }
-            i = j + 1
+            return (out, firstKept)
         }
-        let earliest = firstKept ?? Int(start)
-        return (out, earliest, earliest > 0)
+
+        while cursor > 0 {
+            let end = cursor
+            let start = end > win ? end - win : 0
+            let (out, firstKept) = parseSlice(start: start, end: end)
+            if !out.isEmpty || start == 0 {
+                let earliest = firstKept ?? Int(start)
+                return (out, earliest, earliest > 0)
+            }
+            fallbackEarliest = Int(start)
+            cursor = start
+            skipped += 1
+            // Codex app-server 的工具输出可能形成几 MB 单行;跨过这些空窗,但别一次扫完整个超大文件。
+            if skipped >= 12 { break }
+        }
+        return ([], fallbackEarliest, fallbackEarliest > 0)
     }
 
     /// 解析 Codex JSONL 单行,抽出 WebConsole 可展示的文本/工具消息。
@@ -68,6 +87,10 @@ enum CodexTranscriptReader {
             case "agent_message":
                 let text = (payload["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 return text.isEmpty ? [] : [("assistant", .text, text)]
+            case "image_generation_end":
+                let path = (payload["saved_path"] as? String ?? payload["savedPath"] as? String ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return path.isEmpty ? [] : [("assistant", .text, "图片已生成:\n\(path)")]
             default:
                 return []
             }

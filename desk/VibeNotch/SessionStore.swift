@@ -32,13 +32,30 @@ final class SessionStore: ObservableObject {
         sessions.removeAll { $0.id == sessionId }
     }
 
-    func apply(_ event: HookEvent) {
-        guard let sid = event.sessionId else { return }
+    @discardableResult
+    func apply(_ event: HookEvent) -> [String] {
+        guard let sid = event.sessionId else { return [] }
+        var removedSessionIds: [String] = []
         let cwd = event.cwd ?? "?"
         let resolved = resolveTerminalFull(event: event)
         let terminal = resolved.kind
         let terminalPID = resolved.pid
         let prevState = sessions.first(where: { $0.id == sid })?.state
+
+        // Codex `/clear` starts a fresh thread inside the same CLI process and
+        // may not emit Stop/SessionEnd for the old thread. Since one CLI owner
+        // process can only drive one active TUI session, remove the stale row
+        // before materializing the new session.
+        if event.hookEventName == "SessionStart" || event.hookEventName == "UserPromptSubmit" {
+            removedSessionIds.append(
+                contentsOf: removeSupersededSessions(
+                    newSessionId: sid,
+                    ownerPID: event.ppid,
+                    transcriptPath: event.transcriptPath,
+                    terminal: terminal
+                )
+            )
+        }
 
         // App restart safety: if no entry exists yet, try to backfill the
         // latest prompt from the transcript so the row doesn't show "Done"
@@ -160,6 +177,9 @@ final class SessionStore: ObservableObject {
                pid_t(p) != owner {
                 break
             }
+            if sessions.contains(where: { $0.id == sid }) {
+                removedSessionIds.append(sid)
+            }
             sessions.removeAll { $0.id == sid }
 
         default:
@@ -188,6 +208,8 @@ final class SessionStore: ObservableObject {
                 SessionTransition(sessionId: sid, from: prevState, to: updated.state)
             )
         }
+
+        return removedSessionIds
     }
 
     /// Replace the running ordered list of turn steps (text + tool use).
@@ -230,6 +252,25 @@ final class SessionStore: ObservableObject {
     private func touchActivity(sid: String) {
         guard let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
         sessions[idx].lastActivityAt = Date()
+    }
+
+    private func removeSupersededSessions(newSessionId sid: String, ownerPID: Int?, transcriptPath: String?, terminal: TerminalKind) -> [String] {
+        guard let ownerPID, ownerPID > 1 else { return [] }
+        let owner = pid_t(ownerPID)
+        let ownerSessions = sessions.filter { $0.id != sid && $0.ownerPID == owner }
+        guard !ownerSessions.isEmpty else { return [] }
+        let eventIsCodex = transcriptPath?.contains("/.codex/") == true || terminal == .codex
+        let ownerAlreadyHasCodex = ownerSessions.contains {
+            $0.transcriptPath?.contains("/.codex/") == true || $0.terminal == .codex
+        }
+        guard eventIsCodex || ownerAlreadyHasCodex else { return [] }
+        let removed = sessions
+            .filter { $0.id != sid && $0.ownerPID == owner }
+            .map(\.id)
+        guard !removed.isEmpty else { return [] }
+        sessions.removeAll { removed.contains($0.id) }
+        vlog("session superseded by new owner session: new=\(sid.prefix(8)) removed=\(removed.map { $0.prefix(8) }.joined(separator: ",")) ownerPID=\(ownerPID)")
+        return removed
     }
 
     /// Force a session to .working — used by AppDelegate after the user

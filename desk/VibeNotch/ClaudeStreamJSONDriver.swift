@@ -172,20 +172,25 @@ final class ClaudeStreamJSONDriver: AgentDriver {
             multiSelect: false)))
     }
 
-    func respond(to requestId: String, choose optionIds: [String]) {
+    @discardableResult
+    func respond(to requestId: String, choose optionIds: [String]) -> Bool {
         // ① 权限审批:写回 hook 解除阻塞,不走 stdin。
         if let decide = permDeciders.removeValue(forKey: requestId) {
             vlog("[respond] permission id=\(requestId) choose=\(optionIds) → \(optionIds.contains("allow") ? "allow" : "deny")")
             decide(optionIds.contains("allow") ? .allow : .deny)
             emit.yield(.pendingResolved(id: requestId))
-            return
+            return true
         }
         // ②③ AskUserQuestion / ExitPlanMode:headless 的 stream-json 下,claude 一调用这类交互工具
         //    就「立刻自动错误结束」(transcript 实测:tool_result="Answer questions?" toolUseResult=Error),
         //    根本不等我们的 tool_result——我们再写 tool_result 就成了重复/迟到的孤儿,模型当成空选择并重新提问。
         //    所以改为发一条**普通 user 文本消息**把答案给模型,它把这当用户回答继续(实测可行)。
         let isPlan = pendingPlans.remove(requestId) != nil
-        pendingQuestions.removeValue(forKey: requestId)
+        let hadQuestion = pendingQuestions.removeValue(forKey: requestId) != nil
+        guard isPlan || hadQuestion else {
+            vlog("[respond] missing claude request id=\(requestId) choose=\(optionIds)")
+            return false
+        }
         let text: String
         if isPlan {
             text = optionIds.contains("approve") ? "同意这个计划,按它开始执行吧。" : "先别按这个计划做,我们再讨论一下。"
@@ -195,6 +200,7 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         vlog("[respond] choice/plan → user message: \(text) (reqId=\(requestId))")
         writeJSON(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
         emit.yield(.pendingResolved(id: requestId))
+        return true
     }
 
     // MARK: - 下行:stream-json 解析 → 统一事件
@@ -281,6 +287,15 @@ final class ClaudeStreamJSONDriver: AgentDriver {
         guard let msg = o["message"] as? [String: Any] else { return }
         if let m = msg["model"] as? String, m != lastModel, m != "<synthetic>" {
             lastModel = m; emit.yield(.model(m))
+        }
+        // 上下文占用 = 本回合喂给模型的 prompt 大小 = input + cache_read + cache_creation。
+        // 取最新回合的值(下游覆盖刷新,不累加);一个回合可能多条 assistant 消息,后到的更大、自然取胜。
+        if let u = msg["usage"] as? [String: Any] {
+            let inp = (u["input_tokens"] as? Int) ?? 0
+            let cc = (u["cache_creation_input_tokens"] as? Int) ?? 0
+            let cr = (u["cache_read_input_tokens"] as? Int) ?? 0
+            let ctx = inp + cc + cr
+            if ctx > 0 { emit.yield(.usage(contextTokens: ctx, contextWindow: nil)) }
         }
         let msgId = (msg["id"] as? String) ?? UUID().uuidString
         guard let blocks = msg["content"] as? [[String: Any]] else { return }

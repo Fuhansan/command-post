@@ -48,7 +48,8 @@ function installReceiver() {
           break
         case 'transcript':
           setTranscript(msg.payload.id, msg.payload.messages,
-            { earliest: msg.payload.earliest ?? 0, hasEarlier: !!msg.payload.hasEarlier, queued: msg.payload.queued ?? [] })
+            { earliest: msg.payload.earliest ?? 0, hasEarlier: !!msg.payload.hasEarlier, queued: msg.payload.queued ?? [],
+              contextTokens: msg.payload.contextTokens, contextWindow: msg.payload.contextWindow })
           break
         case 'dirList':
           setDir(msg.payload.path, msg.payload.entries)
@@ -98,6 +99,8 @@ export const cmd = {
   continueLast: (workdir: string, agent: AgentId) => send({ action: 'newSession', workdir, agent, continueLast: true }),
   resume: (workdir: string, id: string, agent: AgentId = 'claude') => send({ action: 'newSession', workdir, agent, resume: id }),
   closeSession: (sid: string) => send({ action: 'closeSession', sid }),
+  loadSessionHistory: (sid: string, beforeByte?: number) =>
+    send({ action: 'loadSessionHistory', sid, beforeByte }),
   switchModel: (sid: string, model: string) => send({ action: 'switchModel', sid, model }),
   renameSession: (key: string, title: string) => send({ action: 'renameSession', key, title }),
   hideSession: (key: string) => send({ action: 'hideSession', key }),

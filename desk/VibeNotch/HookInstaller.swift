@@ -6,6 +6,7 @@ import Foundation
 enum HookInstaller {
     static let baseDir = NSString(string: "~/.vibenotch/hooks").expandingTildeInPath
     static let settingsPath = NSString(string: "~/.claude/settings.json").expandingTildeInPath
+    static let codexHooksPath = NSString(string: "~/.codex/hooks.json").expandingTildeInPath
 
     /// Events VibeNotch listens to. Order is the install order — also matches spec B-§2.
     static let events: [(name: String, file: String)] = [
@@ -154,6 +155,11 @@ enum HookInstaller {
     }
 
     static func mergeSettings() throws {
+        try mergeClaudeSettings()
+        try mergeCodexHooks()
+    }
+
+    private static func mergeClaudeSettings() throws {
         let fm = FileManager.default
         let url = URL(fileURLWithPath: settingsPath)
         try fm.createDirectory(
@@ -211,6 +217,57 @@ enum HookInstaller {
             vlog("hooks installed/updated in \(settingsPath)")
         } else {
             vlog("hooks already installed; no settings.json change")
+        }
+    }
+
+    private static func mergeCodexHooks() throws {
+        let fm = FileManager.default
+        let url = URL(fileURLWithPath: codexHooksPath)
+        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        var json: [String: Any] = [:]
+        if fm.fileExists(atPath: codexHooksPath),
+           let data = try? Data(contentsOf: url),
+           let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            json = obj
+        }
+
+        var hooks = (json["hooks"] as? [String: Any]) ?? [:]
+        var changed = false
+        let codexEvents = events.filter { ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"].contains($0.name) }
+        for ev in codexEvents {
+            let scriptPath = "\(baseDir)/\(ev.file)"
+            var groups = (hooks[ev.name] as? [[String: Any]]) ?? []
+            var alreadyInstalled = false
+            for gi in groups.indices {
+                guard var hookList = groups[gi]["hooks"] as? [[String: Any]] else { continue }
+                for hi in hookList.indices where (hookList[hi]["command"] as? String) == scriptPath {
+                    alreadyInstalled = true
+                    if (hookList[hi]["timeout"] as? Int) != 86400 {
+                        hookList[hi]["timeout"] = 86400
+                        groups[gi]["hooks"] = hookList
+                        hooks[ev.name] = groups
+                        changed = true
+                    }
+                }
+            }
+            guard !alreadyInstalled else { continue }
+            groups.append([
+                "hooks": [
+                    ["type": "command", "command": scriptPath, "timeout": 86400],
+                ],
+            ])
+            hooks[ev.name] = groups
+            changed = true
+        }
+
+        json["hooks"] = hooks
+        if changed {
+            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: url, options: .atomic)
+            vlog("codex hooks installed/updated in \(codexHooksPath)")
+        } else {
+            vlog("codex hooks already installed; no hooks.json change")
         }
     }
 }

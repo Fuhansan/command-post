@@ -42,6 +42,10 @@ export interface Session {
   status: string         // starting|idle|working|waitingInput|needsResponse|done|error
   model?: string         // 当前模型(完整 id,如 claude-opus-4-8)
   models?: { id: string; label: string }[]   // 可切换模型(driver 动态获取,不写死)
+  contextTokens?: number // 当前上下文占用 token(最新回合,覆盖刷新)
+  contextWindow?: number // 当前模型上下文窗口(默认 200000)
+  historyEarliest?: number
+  historyHasEarlier?: boolean
   agentSessionId?: string
   startedAt?: number
   messages: Msg[]

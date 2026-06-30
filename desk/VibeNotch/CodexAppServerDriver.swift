@@ -38,6 +38,7 @@ final class CodexAppServerDriver: AgentDriver {
     private struct ServerRequest {
         let method: String
         let params: [String: Any]
+        let responseId: Any
     }
 
     init() {
@@ -178,16 +179,20 @@ final class CodexAppServerDriver: AgentDriver {
         }
     }
 
-    func respond(to requestId: String, choose optionIds: [String]) {
+    @discardableResult
+    func respond(to requestId: String, choose optionIds: [String]) -> Bool {
         let req = stateQueue.sync { serverRequests.removeValue(forKey: requestId) }
-        guard let req else { return }
+        guard let req else {
+            vlog("codex app-server respond failed: missing request id=\(requestId) choose=\(optionIds)")
+            return false
+        }
         let allow = optionIds.contains("allow") || optionIds.contains("accept")
         let result: [String: Any]
         switch req.method {
         case "item/commandExecution/requestApproval":
-            result = ["decision": allow ? "accept" : "decline"]
+            result = commandApprovalResult(params: req.params, allow: allow)
         case "item/fileChange/requestApproval":
-            result = ["decision": allow ? "accept" : "decline"]
+            result = simpleApprovalResult(params: req.params, allow: allow)
         case "item/tool/requestUserInput":
             let answers = toolAnswers(params: req.params, chosen: optionIds)
             result = ["answers": answers]
@@ -197,8 +202,10 @@ final class CodexAppServerDriver: AgentDriver {
         default:
             result = [:]
         }
-        sendResponse(id: requestId, result: result)
+        vlog("codex app-server respond method=\(req.method) id=\(requestId) result=\(compactJSON(result) ?? "{}")")
+        sendResponse(id: req.responseId, result: result)
         emit.yield(.pendingResolved(id: requestId))
+        return true
     }
 
     // MARK: - JSON-RPC
@@ -213,7 +220,7 @@ final class CodexAppServerDriver: AgentDriver {
         }
     }
 
-    private func sendResponse(id: String, result: [String: Any]) {
+    private func sendResponse(id: Any, result: [String: Any]) {
         writeJSON(["id": id, "result": result])
     }
 
@@ -245,7 +252,7 @@ final class CodexAppServerDriver: AgentDriver {
         guard let id = obj["id"] else { return }
         let key = String(describing: id)
         if let err = obj["error"] as? [String: Any] {
-            let msg = err["message"] as? String ?? "Codex app-server request failed"
+            let msg = errorMessage(err, fallback: "Codex app-server request failed")
             resolveResponse(id: key, result: .failure(DriverError.server(msg)))
             return
         }
@@ -258,6 +265,8 @@ final class CodexAppServerDriver: AgentDriver {
             if let t = params["thread"] as? [String: Any] { applyThread(t) }
         case "thread/status/changed":
             handleThreadStatus(params)
+        case "thread/tokenUsage/updated":
+            handleTokenUsage(params["tokenUsage"] as? [String: Any])
         case "turn/started":
             if let turn = params["turn"] as? [String: Any], let id = turn["id"] as? String {
                 stateQueue.async { self.activeTurnId = id }
@@ -284,10 +293,12 @@ final class CodexAppServerDriver: AgentDriver {
              "item/permissions/requestApproval",
              "item/tool/requestUserInput":
             if let id = requestId {
-                handleServerRequest(id: String(describing: id), method: method, params: params)
+                handleServerRequest(rawId: id, method: method, params: params)
             }
         case "error":
-            emit.yield(.error(params["message"] as? String ?? "Codex app-server error"))
+            let msg = errorMessage(params, fallback: "Codex app-server error")
+            vlog("codex app-server error event: \(compactJSON(params) ?? msg)")
+            if hasErrorDetails(params) { emit.yield(.error(msg)) }
         default:
             break
         }
@@ -356,6 +367,16 @@ final class CodexAppServerDriver: AgentDriver {
         stateQueue.async { self.activeTurnId = nil }
     }
 
+    private func handleTokenUsage(_ usage: [String: Any]?) {
+        guard let usage,
+              let last = usage["last"] as? [String: Any],
+              let input = Self.intValue(last["inputTokens"]) else { return }
+        emit.yield(.usage(
+            contextTokens: input,
+            contextWindow: Self.intValue(usage["modelContextWindow"])
+        ))
+    }
+
     private func handleItem(_ item: [String: Any], completed: Bool) {
         guard let type = item["type"] as? String else { return }
         let id = item["id"] as? String ?? UUID().uuidString
@@ -397,6 +418,10 @@ final class CodexAppServerDriver: AgentDriver {
             let q = item["query"] as? String ?? ""
             var op = ToolOp(kind: .other); op.label = "联网"; op.file = q
             emit.yield(.toolCall(ToolCallInfo(id: id, name: "WebSearch", summary: q, op: op)))
+        case "imageGeneration", "image_generation", "image_generation_end", "imageGenerationResult":
+            guard completed, let path = imagePath(from: item), !path.isEmpty else { return }
+            emit.yield(.messageDelta(msgId: id, role: "assistant", text: "图片已生成:\n\(path)"))
+            emit.yield(.messageComplete(msgId: id))
         default:
             break
         }
@@ -408,8 +433,11 @@ final class CodexAppServerDriver: AgentDriver {
         }
     }
 
-    private func handleServerRequest(id: String, method: String, params: [String: Any]) {
-        stateQueue.async { self.serverRequests[id] = ServerRequest(method: method, params: params) }
+    private func handleServerRequest(rawId: Any, method: String, params: [String: Any]) {
+        let id = String(describing: rawId)
+        stateQueue.sync { self.serverRequests[id] = ServerRequest(method: method, params: params, responseId: rawId) }
+        let decisions = (params["availableDecisions"] as? [String])?.joined(separator: ",") ?? "-"
+        vlog("codex app-server pending method=\(method) id=\(id) rawIdType=\(type(of: rawId)) decisions=\(decisions)")
         let detail: String
         let title: String
         var options = [
@@ -449,6 +477,59 @@ final class CodexAppServerDriver: AgentDriver {
         )))
     }
 
+    private func commandApprovalResult(params: [String: Any], allow: Bool) -> [String: Any] {
+        let decisions = availableDecisions(params)
+        guard allow else {
+            return ["decision": firstDecision(in: decisions, from: ["decline", "cancel"]) ?? "decline"]
+        }
+        let decision = firstDecision(in: decisions, from: [
+            "accept",
+            "acceptForSession",
+            "acceptWithExecpolicyAmendment",
+            "applyNetworkPolicyAmendment",
+        ]) ?? "accept"
+        var result: [String: Any] = ["decision": decision]
+        if decision == "acceptWithExecpolicyAmendment",
+           let amendment = params["proposedExecpolicyAmendment"] {
+            result["execpolicy_amendment"] = amendment
+        }
+        if decision == "applyNetworkPolicyAmendment",
+           let amendment = networkPolicyAmendment(params) {
+            result["network_policy_amendment"] = amendment
+        }
+        return result
+    }
+
+    private func simpleApprovalResult(params: [String: Any], allow: Bool) -> [String: Any] {
+        let decisions = availableDecisions(params)
+        let decision = allow
+            ? (firstDecision(in: decisions, from: ["accept", "acceptForSession"]) ?? "accept")
+            : (firstDecision(in: decisions, from: ["decline", "cancel"]) ?? "decline")
+        return ["decision": decision]
+    }
+
+    private func availableDecisions(_ params: [String: Any]) -> [String] {
+        params["availableDecisions"] as? [String] ?? []
+    }
+
+    private func firstDecision(in available: [String], from candidates: [String]) -> String? {
+        guard !available.isEmpty else { return candidates.first }
+        return candidates.first { available.contains($0) }
+    }
+
+    private func networkPolicyAmendment(_ params: [String: Any]) -> Any? {
+        if let one = params["proposedNetworkPolicyAmendment"] { return one }
+        guard let many = params["proposedNetworkPolicyAmendments"] as? [[String: Any]] else { return nil }
+        return many.first(where: { amendmentLooksAllow($0) }) ?? many.first
+    }
+
+    private func amendmentLooksAllow(_ amendment: [String: Any]) -> Bool {
+        for key in ["effect", "access", "decision", "action", "policy"] {
+            if let value = amendment[key] as? String, value.lowercased().contains("allow") { return true }
+        }
+        return compactJSON(amendment)?.lowercased().contains("allow") ?? false
+    }
+
     private func codexInput(_ input: UserInput) -> [[String: Any]] {
         var out: [[String: Any]] = []
         if !input.text.isEmpty { out.append(["type": "text", "text": input.text]) }
@@ -473,6 +554,15 @@ final class CodexAppServerDriver: AgentDriver {
         return changes.compactMap { $0["path"] as? String }
     }
 
+    private func imagePath(from obj: [String: Any]) -> String? {
+        for key in ["saved_path", "savedPath", "path", "file_path", "filePath"] {
+            if let s = obj[key] as? String, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
     private func toolAnswers(params: [String: Any], chosen: [String]) -> [String: Any] {
         var out: [String: Any] = [:]
         for q in params["questions"] as? [[String: Any]] ?? [] {
@@ -487,6 +577,45 @@ final class CodexAppServerDriver: AgentDriver {
               let d = try? JSONSerialization.data(withJSONObject: v),
               let s = String(data: d, encoding: .utf8) else { return nil }
         return s
+    }
+
+    private func errorMessage(_ obj: [String: Any], fallback: String) -> String {
+        if let msg = obj["message"] as? String, !msg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return msg
+        }
+        var parts: [String] = []
+        for key in ["code", "type", "reason", "detail"] {
+            if let v = obj[key] {
+                parts.append("\(key)=\(shortValue(v))")
+            }
+        }
+        if let err = obj["error"] {
+            parts.append("error=\(shortValue(err))")
+        }
+        if let data = obj["data"] {
+            parts.append("data=\(shortValue(data))")
+        }
+        return parts.isEmpty ? fallback : "\(fallback): \(parts.joined(separator: " · "))"
+    }
+
+    private func hasErrorDetails(_ obj: [String: Any]) -> Bool {
+        ["message", "code", "type", "reason", "detail", "error", "data"].contains { key in
+            guard let value = obj[key] else { return false }
+            if let s = value as? String { return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            return true
+        }
+    }
+
+    private func shortValue(_ v: Any, maxLen: Int = 300) -> String {
+        let s = (compactJSON(v) ?? String(describing: v)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.count > maxLen ? String(s.prefix(maxLen)) + "..." : s
+    }
+
+    private static func intValue(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let n = v as? NSNumber { return n.intValue }
+        if let s = v as? String { return Int(s) }
+        return nil
     }
 
     // MARK: - Binary / environment

@@ -18,7 +18,7 @@ struct AgentMessage: Identifiable, Equatable {
     var kind: Kind
     var text: String          // permission 时 = 命令/操作详情
     var ord: Int              // 逻辑顺序号(到达递增)
-    var images: [ImageRef] = []   // 用户消息附带的图片
+    var images: [ImageRef] = []   // 消息附带的图片(用户上传 / agent 生成)
     /// permission 卡的处理结果:nil=待处理(显示允许/拒绝按钮);"allow"/"deny"=已处理(显示徽标)。
     var permState: String? = nil
     var permReqId: String? = nil   // 关联 driver 的权限请求 id,回写时用
@@ -40,11 +40,17 @@ struct AgentSession: Identifiable, Equatable {
     var startedAt: Date = Date()      // 会话开始时间(列表展示相对时间)
     var model: String? = nil          // 当前模型(从流里读到 / 用户切换)
     var availableModels: [AgentModel] = []   // 可切换模型列表(driver 动态获取)
+    var contextTokens: Int = 0        // 当前上下文占用 token(最新回合,覆盖刷新,不累加)
+    var contextWindow: Int = 200_000  // 当前模型的上下文窗口(按 model 从 availableModels 推出,默认 200K)
+    var historyEarliest: Int = 0      // 已回填历史里的最早字节偏移,供控制台 resume 会话继续懒加载
+    var historyHasEarlier: Bool = false
 
     static func == (l: AgentSession, r: AgentSession) -> Bool {
         l.id == r.id && l.status == r.status && l.messages == r.messages &&
         l.pending == r.pending && l.title == r.title && l.agentSessionId == r.agentSessionId &&
-        l.model == r.model && l.availableModels == r.availableModels
+        l.model == r.model && l.availableModels == r.availableModels &&
+        l.contextTokens == r.contextTokens && l.contextWindow == r.contextWindow &&
+        l.historyEarliest == r.historyEarliest && l.historyHasEarlier == r.historyHasEarlier
     }
 }
 
@@ -172,7 +178,7 @@ final class AgentSessionManager: ObservableObject {
         // 历史回填:不依赖 init —— claude 在 stream-json 下要等首条输入才吐 init,
         // 但恢复/继续时我们已知 id(resume),或可取本目录最近转录(continue),直接读历史显示。
         let historyId = resume ?? (continueLast ? Self.listHistory(workdir: workdir, limit: 1).first?.id : nil)
-        if let historyId { loadHistory(sessionId: historyId, into: sid) }
+        if let historyId { loadHistory(sessionId: historyId, workdir: workdir, into: sid) }
         return sid
     }
 
@@ -182,40 +188,71 @@ final class AgentSessionManager: ObservableObject {
         loadProjects()
     }
 
-    /// 后台读 claude 转录(~/.claude/projects/<目录>/<id>.jsonl)重建历史消息,回主线程填入。
+    /// 后台读 agent 转录(Claude:~/.claude/projects; Codex:~/.codex/sessions)重建历史消息,回主线程填入。
     /// resume/continue 不重放历史,所以靠这个把之前的对话显示回来。
-    private func loadHistory(sessionId: String, into sid: String, attempt: Int = 0) {
+    private func loadHistory(sessionId: String, workdir: String, into sid: String,
+                             beforeByte: UInt64? = nil, onlyIfEmpty: Bool = true, attempt: Int = 0) {
         Task.detached(priority: .utility) { [weak self] in
-            let found = Self.findTranscript(sessionId: sessionId)
-            // 只回填最近 ~15 条(只读文件尾),避免解析整份大转录卡顿。要更早的等懒加载分页。
-            let items = found.map { Self.parseTranscriptTail(path: $0, limit: 15) } ?? []
+            let found = Self.findTranscript(sessionId: sessionId, workdir: workdir)
+            // 只回填最近一页(读窗口,不整份解析)。要更早的由同一窗口接口按 earliest 继续分页。
+            let page = found.map { Self.parseHistoryWindow(path: $0, beforeByte: beforeByte, limit: beforeByte == nil ? 15 : 25) }
+            let items = page?.messages ?? []
+            let usage = found.map { Self.lastContextUsage(path: $0) } ?? (tokens: 0, window: nil)
             let shouldRetry: Bool = await MainActor.run {
                 guard let self else { return false }
                 // 会话已被关 / 已注入过历史 → 停。
-                guard let s = self.sessions.first(where: { $0.id == sid }), s.messages.isEmpty else { return false }
+                guard self.sessions.contains(where: { $0.id == sid }) else { return false }
+                if usage.tokens > 0 {
+                    self.mutate(sid) { s in
+                        if s.contextTokens == 0 { s.contextTokens = usage.tokens }
+                        if let w = usage.window, w > 0 { s.contextWindow = w }
+                    }
+                }
+                guard let s = self.sessions.first(where: { $0.id == sid }) else { return false }
+                if onlyIfEmpty && !s.messages.isEmpty { return false }
                 if !items.isEmpty {
                     vlog("console history: sid=\(sid) id=\(sessionId.prefix(8)) 注入 \(items.count) 条")
-                    self.injectHistory(items, into: sid)
+                    self.injectHistory(items, earliest: page?.earliest ?? 0, hasEarlier: page?.hasEarlier ?? false, into: sid)
                     return false
+                }
+                if let page {
+                    self.mutate(sid) {
+                        $0.historyEarliest = page.earliest
+                        $0.historyHasEarlier = page.hasEarlier
+                    }
                 }
                 // 读到 0 条:转录可能还没写完/还没出现(claude 边聊边写)→ 重试几次。
                 vlog("console history: sid=\(sid) id=\(sessionId.prefix(8)) 转录=\(found ?? "无") 条数=0 attempt=\(attempt)")
-                return attempt < 6
+                return onlyIfEmpty && attempt < 6
             }
             guard shouldRetry else { return }
             try? await Task.sleep(nanoseconds: 800_000_000)
-            await self?.loadHistory(sessionId: sessionId, into: sid, attempt: attempt + 1)
+            await self?.loadHistory(sessionId: sessionId, workdir: workdir, into: sid,
+                                    beforeByte: beforeByte, onlyIfEmpty: onlyIfEmpty, attempt: attempt + 1)
         }
     }
 
-    private func injectHistory(_ items: [(role: String, kind: AgentMessage.Kind, text: String)], into sid: String) {
+    func loadEarlierHistory(for sid: String, beforeByte: UInt64?) {
+        guard let s = sessions.first(where: { $0.id == sid }),
+              let aid = s.agentSessionId, !aid.isEmpty else { return }
+        loadHistory(sessionId: aid, workdir: s.workdir, into: sid,
+                    beforeByte: beforeByte, onlyIfEmpty: false)
+    }
+
+    private func injectHistory(_ items: [AgentMessage], earliest: Int, hasEarlier: Bool, into sid: String) {
         mutate(sid) { s in
-            guard s.messages.isEmpty else { vlog("console history: sid=\(sid) 已有消息,跳过注入"); return }
-            s.messages = items.enumerated().map { i, it in
-                AgentMessage(id: "h\(i)", role: it.role, kind: it.kind, text: it.text, ord: i)
+            let existing = Set(s.messages.map(\.id))
+            let fresh = items.filter { !existing.contains($0.id) }
+            if fresh.isEmpty {
+                s.historyEarliest = earliest
+                s.historyHasEarlier = hasEarlier
+                return
             }
+            s.messages.append(contentsOf: fresh)
+            s.historyEarliest = earliest
+            s.historyHasEarlier = hasEarlier
         }
-        ordCounter = max(ordCounter, items.count + 1)   // 后续新消息排在历史之后
+        if let maxOrd = items.map(\.ord).max() { ordCounter = max(ordCounter, maxOrd + 1) }   // 后续新消息排在历史之后
     }
 
     /// 解析转录 JSONL → (role, kind, 文本)。user 文本 / assistant 文本 / assistant 工具调用。
@@ -230,16 +267,23 @@ final class AgentSessionManager: ObservableObject {
         let enc = String(workdir.map { $0.isLetter || $0.isNumber ? $0 : "-" })
         let claude = NSString(string: "~/.claude/projects/\(enc)/\(id).jsonl").expandingTildeInPath
         if FileManager.default.fileExists(atPath: claude) { return claude }
-        return codexPath(forId: id) ?? claude   // Claude 没有 → 按 uuid 在 ~/.codex/sessions 下找 rollout
+        return codexPath(forId: id, workdir: workdir) ?? claude   // Claude 没有 → 按 uuid 在 ~/.codex/sessions 下找 rollout
     }
     /// 按会话 uuid 在 ~/.codex/sessions 下定位 rollout 文件(供查看/解析 Codex 历史)。
-    nonisolated private static func codexPath(forId id: String) -> String? {
+    nonisolated private static func codexPath(forId id: String, workdir: String? = nil) -> String? {
         let root = NSString(string: "~/.codex/sessions").expandingTildeInPath
         guard let en = FileManager.default.enumerator(atPath: root) else { return nil }
+        var hits: [(path: String, mtime: Date, cwdMatch: Bool)] = []
         for case let rel as String in en where rel.contains("rollout-") && rel.hasSuffix("\(id).jsonl") {
-            return "\(root)/\(rel)"
+            let path = "\(root)/\(rel)"
+            let mtime = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date ?? .distantPast
+            let cwdMatch = workdir.map { codexCwd(path: path) == $0 } ?? false
+            hits.append((path, mtime, cwdMatch))
         }
-        return nil
+        return hits.sorted { l, r in
+            if l.cwdMatch != r.cwdMatch { return l.cwdMatch && !r.cwdMatch }
+            return l.mtime > r.mtime
+        }.first?.path
     }
 
     /// 按文件路径解析转录(供 RelayAgent 给 hook 会话做历史回填复用)。
@@ -275,6 +319,130 @@ final class AgentSessionManager: ObservableObject {
             out.append(contentsOf: parseTranscriptLine(String(line)).map { (role: $0.role, kind: $0.kind, text: $0.text) })
         }
         return Array(out.suffix(limit))
+    }
+
+    nonisolated private static func parseHistoryWindow(path: String, beforeByte: UInt64?, limit: Int)
+        -> (messages: [AgentMessage], earliest: Int, hasEarlier: Bool) {
+        let win = parseTranscriptWindow(path: path, endByte: beforeByte, windowBytes: 1024 * 1024)
+        var rows = win.messages
+        if rows.count > limit { rows = Array(rows.suffix(limit)) }
+        let earliest = rows.first.map { $0.ord / 16 } ?? win.earliest
+        let msgs = rows.map { m in
+            AgentMessage(id: "h\(m.ord)", role: m.role, kind: m.kind, text: m.text, ord: m.ord,
+                         op: m.op, model: m.model, ts: m.ts)
+        }
+        return (msgs, earliest, earliest > 0 && (win.hasEarlier || win.messages.count > rows.count))
+    }
+
+    /// 从转录尾部找最近一条 usage/token_count,算当前上下文占用 token。
+    /// Claude = input + cache_read + cache_creation;Codex = last_token_usage.input_tokens。
+    /// Codex 的 cached_input_tokens 只是缓存/计费口径,仍然占模型上下文窗口,不能从容量里扣掉。
+    /// 给手动/历史会话用(它们走转录解析,不走实时 .usage 事件)。
+    /// Codex 若最新 token_count 为 0,也按 0 处理,避免 /compact 或 /clear 后显示旧高水位。
+    nonisolated static func lastContextUsage(path: String) -> (tokens: Int, window: Int?) {
+        if path.contains("/.codex/") { return lastCodexContextUsage(path: path) }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return (0, nil) }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let tailBytes: UInt64 = 256 * 1024
+        let start = size > tailBytes ? size - tailBytes : 0
+        try? fh.seek(toOffset: start)
+        let data = (try? fh.readToEnd()) ?? Data()
+        var text = String(decoding: data, as: UTF8.self)
+        if start > 0, let nl = text.firstIndex(of: "\n") { text = String(text[text.index(after: nl)...]) }
+        for line in text.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (o["type"] as? String) == "assistant",
+                  let msg = o["message"] as? [String: Any],
+                  let u = msg["usage"] as? [String: Any] else { continue }
+            let ctx = ((u["input_tokens"] as? Int) ?? 0)
+                + ((u["cache_creation_input_tokens"] as? Int) ?? 0)
+                + ((u["cache_read_input_tokens"] as? Int) ?? 0)
+            if ctx > 0 { return (ctx, nil) }
+        }
+        return (0, nil)
+    }
+
+    nonisolated static func lastContextTokens(path: String) -> Int {
+        lastContextUsage(path: path).tokens
+    }
+
+    nonisolated private static func lastCodexContextUsage(path: String) -> (tokens: Int, window: Int?) {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return (0, nil) }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let tailBytes: UInt64 = 512 * 1024
+        let start = size > tailBytes ? size - tailBytes : 0
+        try? fh.seek(toOffset: start)
+        let data = (try? fh.readToEnd()) ?? Data()
+        var text = String(decoding: data, as: UTF8.self)
+        if start > 0, let nl = text.firstIndex(of: "\n") { text = String(text[text.index(after: nl)...]) }
+        for line in text.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  (o["type"] as? String) == "event_msg",
+                  let payload = o["payload"] as? [String: Any],
+                  (payload["type"] as? String) == "token_count",
+                  let info = payload["info"] as? [String: Any] else { continue }
+            let last = (info["last_token_usage"] as? [String: Any]) ?? (info["last"] as? [String: Any]) ?? [:]
+            if let input = intValue(last["input_tokens"]) ?? intValue(last["inputTokens"]) {
+                let win = intValue(info["model_context_window"]) ?? intValue(info["modelContextWindow"])
+                return (input, win)
+            }
+        }
+        return (0, nil)
+    }
+
+    nonisolated private static func intValue(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let n = v as? NSNumber { return n.intValue }
+        if let s = v as? String { return Int(s) }
+        return nil
+    }
+
+    /// 从文本里找本机图片路径,登记成 app://__img 可读取的引用。
+    /// Codex 生成图常以 markdown 链接/裸路径出现,例如 ~/.codex/generated_images/.../*.png。
+    nonisolated static func localImageRefs(in text: String) -> [ImageRef] {
+        localImagePaths(in: text).map { path in
+            let ext = normalizedImageExt(path)
+            return ImageRef(id: ImageRelay.registerLocalFile(path), ext: ext, localPath: path)
+        }
+    }
+
+    nonisolated static func localImageDTOs(in text: String) -> [[String: String]] {
+        localImageRefs(in: text).map { ["id": $0.id, "ext": $0.ext] }
+    }
+
+    nonisolated static func localImagePaths(in text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+        let pattern = #"(?i)(?:file://)?(?:~|/)[^\s\)\]\}"'<>]+\.(?:png|jpg|jpeg|webp|gif|heic|heif|bmp|tif|tiff)"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = text as NSString
+        var paths: [String] = []
+        let fm = FileManager.default
+        for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            var p = ns.substring(with: m.range)
+            if p.hasPrefix("file://") { p = String(p.dropFirst("file://".count)) }
+            p = (p as NSString).expandingTildeInPath
+            guard fm.fileExists(atPath: p), isImagePath(p), !paths.contains(p) else { continue }
+            paths.append(p)
+        }
+        return paths
+    }
+
+    nonisolated private static func isImagePath(_ path: String) -> Bool {
+        ["png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "bmp", "tif", "tiff"].contains((path as NSString).pathExtension.lowercased())
+    }
+
+    nonisolated private static func normalizedImageExt(_ path: String) -> String {
+        let ext = (path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "jpeg": return "jpg"
+        case "tif", "tiff": return "tiff"
+        case "heif": return "heic"
+        default: return ext.isEmpty ? "png" : ext
+        }
     }
 
     /// 解析转录中的一行(jsonl),抽出可显示的消息;一行的多个 block 可产生多条。
@@ -337,6 +505,13 @@ final class AgentSessionManager: ObservableObject {
         }
     }
 
+    /// 由当前模型(完整 id,如 claude-opus-4-8)匹配 availableModels 拿上下文窗口。
+    /// claude 的 model 是完整版本号、availableModels 用别名(opus/sonnet/haiku),故用子串匹配;codex 为精确同名。匹配不到回退 200K。
+    nonisolated static func windowFor(model: String?, models: [AgentModel]) -> Int {
+        guard let m = model?.lowercased(), !m.isEmpty else { return 200_000 }
+        return models.first { !$0.id.isEmpty && m.contains($0.id.lowercased()) }?.contextWindow ?? 200_000
+    }
+
     nonisolated static func isSystemInjected(_ text: String) -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let tags = ["<task-notification", "<system-reminder", "<local-command-stdout", "<local-command-caveat",
@@ -361,7 +536,7 @@ final class AgentSessionManager: ObservableObject {
     nonisolated static func parseTranscriptWindow(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024)
         -> (messages: [(role: String, kind: AgentMessage.Kind, text: String, ord: Int, op: ToolOp?, model: String?, ts: Double?)], queued: [[String: Any]], earliest: Int, hasEarlier: Bool) {
         if path.contains("/.codex/") {
-            let r = CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte)
+            let r = CodexTranscriptReader.parseTranscriptWindow(path: path, endByte: endByte, windowBytes: windowBytes)
             return (r.messages.map { ($0.role, $0.kind, $0.text, $0.ord, nil as ToolOp?, nil as String?, nil as Double?) }, [], r.earliest, r.hasEarlier)
         }
         guard let fh = FileHandle(forReadingAtPath: path) else { return ([], [], 0, false) }
@@ -448,10 +623,9 @@ final class AgentSessionManager: ObservableObject {
         return nil
     }
 
-    /// 历史图片:扫与 parseTranscriptWindow 同一窗,返回 ord → 图片([{thumb,url}],都是 data URL)。
-    /// 不动主解析链(Codex/手机端不受影响),桥按 ord 合并进历史消息 DTO。Codex 图片是 localImage 路径,暂不处理。
+    /// 历史图片:扫与 parseTranscriptWindow 同一窗,返回 ord → 图片 id/ext;桥按 ord 合并进历史消息 DTO。
     nonisolated static func transcriptImages(path: String, endByte: UInt64?, windowBytes: Int = 1024 * 1024) -> [Int: [[String: String]]] {
-        guard !path.contains("/.codex/"), let fh = FileHandle(forReadingAtPath: path) else { return [:] }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return [:] }
         defer { try? fh.close() }
         let fileSize = (try? fh.seekToEnd()) ?? 0
         let end = min(endByte ?? fileSize, fileSize)
@@ -464,14 +638,41 @@ final class AgentSessionManager: ObservableObject {
         while i < bytes.count {
             var j = i
             while j < bytes.count && bytes[j] != 0x0A { j += 1 }
-            if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8),
-               let imgs = userImagesInLine(lineStr, path: path, lineStart: UInt64(Int(start) + i)) {
-                // 与 parseTranscriptWindow 的 ord 对齐:用户图文消息是该行第 0 条
-                result[(Int(start) + i) * 16 + 0] = imgs
+            if j > i, let lineStr = String(bytes: bytes[i..<j], encoding: .utf8) {
+                let lineStart = UInt64(Int(start) + i)
+                let imgs = path.contains("/.codex/")
+                    ? codexLocalImagesInLine(lineStr)
+                    : userImagesInLine(lineStr, path: path, lineStart: lineStart)
+                if let imgs {
+                    // 与 parseTranscriptWindow 的 ord 对齐:用户图文消息是该行第 0 条
+                    result[Int(lineStart) * 16 + 0] = imgs
+                }
             }
             i = j + 1
         }
         return result
+    }
+
+    private nonisolated static func codexLocalImagesInLine(_ line: String) -> [[String: String]]? {
+        guard let d = line.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              (o["type"] as? String) == "event_msg",
+              let payload = o["payload"] as? [String: Any],
+              (payload["type"] as? String) == "user_message" else { return nil }
+        let paths = ((payload["local_images"] as? [String])
+                     ?? (payload["localImages"] as? [String]) ?? [])
+            .map { ($0 as NSString).expandingTildeInPath }
+        let fm = FileManager.default
+        var imgs: [[String: String]] = []
+        for p in paths where fm.fileExists(atPath: p) && isImagePath(p) {
+            let ext = normalizedImageExt(p)
+            let id = ImageRelay.registerLocalFile(p)
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: p)) {
+                _ = ImageRelay.saveById(id: id, ext: ext, data: data)
+            }
+            imgs.append(["id": id, "ext": ext])
+        }
+        return imgs.isEmpty ? nil : imgs
     }
 
     private nonisolated static func userImagesInLine(_ line: String, path: String, lineStart: UInt64) -> [[String: String]]? {
@@ -578,14 +779,15 @@ final class AgentSessionManager: ObservableObject {
         return nil
     }
 
-    /// 按 sessionId 在 ~/.claude/projects 下递归找转录文件(不必算目录编码)。
-    nonisolated private static func findTranscript(sessionId: String) -> String? {
+    /// 按 sessionId/threadId 递归找转录文件(不必算目录编码)。Claude 与 Codex 共用 resume 历史回填。
+    nonisolated private static func findTranscript(sessionId: String, workdir: String? = nil) -> String? {
         let base = NSString(string: "~/.claude/projects").expandingTildeInPath
-        guard let en = FileManager.default.enumerator(atPath: base) else { return nil }
-        for case let f as String in en where f.hasSuffix("\(sessionId).jsonl") {
-            return "\(base)/\(f)"
+        if let en = FileManager.default.enumerator(atPath: base) {
+            for case let f as String in en where f.hasSuffix("\(sessionId).jsonl") {
+                return "\(base)/\(f)"
+            }
         }
-        return nil
+        return codexPath(forId: sessionId, workdir: workdir)
     }
 
     func send(_ sid: String, text: String, imagePaths: [String] = []) {
@@ -605,6 +807,17 @@ final class AgentSessionManager: ObservableObject {
     func respond(_ sid: String, requestId: String, choose: [String]) {
         guard let d = managed[sid]?.driver else { return }
         let allow = choose.contains("allow")
+        let pickedLabel: String? = {
+            guard let s = sessions.first(where: { $0.id == sid }),
+                  let req = s.pending.first(where: { $0.id == requestId }),
+                  req.kind == .choice || req.kind == .planConfirm else { return nil }
+            let picked = req.options.filter { choose.contains($0.id) }.map(\.label).joined(separator: "、")
+            return picked.isEmpty ? choose.joined(separator: ",") : picked
+        }()
+        guard d.respond(to: requestId, choose: choose) else {
+            vlog("console respond failed: sid=\(sid) req=\(requestId) choose=\(choose)")
+            return
+        }
         mutate(sid) { s in
             // 权限审批卡(消息):就地标记结果(命令+✓已允许/✕已拒绝),不删,留在对话里。
             if let i = s.messages.firstIndex(where: { $0.kind == .permission && $0.permReqId == requestId }) {
@@ -613,13 +826,12 @@ final class AgentSessionManager: ObservableObject {
             // 选择题(pending):留一条「已选择」记录,再移除待决卡。
             if let req = s.pending.first(where: { $0.id == requestId }),
                req.kind == .choice || req.kind == .planConfirm {
-                let picked = req.options.filter { choose.contains($0.id) }.map(\.label).joined(separator: "、")
                 s.messages.append(AgentMessage(id: "resolved_\(requestId)", role: "assistant", kind: .text,
-                    text: "✓ 已选择:" + (picked.isEmpty ? choose.joined(separator: ",") : picked), ord: self.nextOrd()))
+                    text: "✓ 已选择:" + (pickedLabel ?? choose.joined(separator: ",")), ord: self.nextOrd()))
             }
             s.pending.removeAll { $0.id == requestId }
+            if s.status == .needsResponse { s.status = .working }
         }
-        d.respond(to: requestId, choose: choose)
     }
 
     func interrupt(_ sid: String) { managed[sid]?.driver.interrupt() }
@@ -736,11 +948,26 @@ final class AgentSessionManager: ObservableObject {
             mutate(sid) { $0.status = st }
         case .sessionId(let aid):
             mutate(sid) { $0.agentSessionId = aid }
-            loadHistory(sessionId: aid, into: sid)   // resume/continue 时把历史读回来(空会话无害)
+            if let workdir = sessions.first(where: { $0.id == sid })?.workdir {
+                loadHistory(sessionId: aid, workdir: workdir, into: sid)   // resume/continue 时把历史读回来(空会话无害)
+            }
         case .model(let m):
-            mutate(sid) { $0.model = m }
+            mutate(sid) { s in
+                s.model = m
+                let win = Self.windowFor(model: m, models: s.availableModels)
+                if !(s.agent == .codex && s.contextWindow != 200_000 && win == 200_000) { s.contextWindow = win }
+            }
         case .availableModels(let ms):
-            mutate(sid) { $0.availableModels = ms }
+            mutate(sid) { s in
+                s.availableModels = ms
+                let win = Self.windowFor(model: s.model, models: ms)
+                if !(s.agent == .codex && s.contextWindow != 200_000 && win == 200_000) { s.contextWindow = win }
+            }
+        case .usage(contextTokens: let ctx, contextWindow: let win):
+            mutate(sid) {
+                $0.contextTokens = ctx   // 覆盖刷新:当前模型输入上下文占用
+                if let win, win > 0 { $0.contextWindow = win }
+            }
         case .messageDelta(let msgId, let role, let text):
             mutate(sid) { s in
                 if let i = s.messages.firstIndex(where: { $0.id == msgId }) {
@@ -799,6 +1026,7 @@ final class AgentSessionManager: ObservableObject {
         case .error(let msg):
             mutate(sid) { s in
                 s.status = .error
+                if s.messages.last?.text == "⚠️ \(msg)" { return }
                 s.messages.append(AgentMessage(id: "err_\(self.nextOrd())", role: "system",
                                                kind: .text, text: "⚠️ \(msg)", ord: self.ordCounter))
             }

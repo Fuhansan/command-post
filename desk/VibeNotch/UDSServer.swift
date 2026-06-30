@@ -7,7 +7,7 @@ import Foundation
 ///   2. Hand the open fd to the App via a `HookConnection`.
 ///   3. The App eventually calls `respond(json:)` or `dismiss()` on it.
 ///
-/// A 50-second watchdog dismisses any connection the App forgot.
+/// A long watchdog dismisses any connection the App forgot.
 final class UDSServer {
     let path: String
     private var listenFd: Int32 = -1
@@ -18,7 +18,7 @@ final class UDSServer {
 
     var onEvent: ((HookConnection) -> Void)?
 
-    static let perConnectionTimeout: TimeInterval = 50
+    static let perConnectionTimeout: TimeInterval = 86_400
 
     init(path: String) {
         self.path = path

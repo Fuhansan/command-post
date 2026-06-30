@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private static let doneAutoExpandSeconds: TimeInterval = 5
     private static let waitingAutoExpandSeconds: TimeInterval = 8
-    private static let pendingDecisionTimeoutSeconds: TimeInterval = 45
+    private static let pendingDecisionTimeoutSeconds: TimeInterval = 86_400
     private static let idleSweepIntervalSeconds: TimeInterval = 5 * 60
     private static let livenessSweepIntervalSeconds: TimeInterval = 5
 
@@ -103,10 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let dead = self.store.removeDeadSessions()
                 guard !dead.isEmpty else { return }
                 vlog("liveness-sweep removed \(dead.count): \(dead.map { $0.prefix(8) }.joined(separator: ","))")
-                for sid in dead {
-                    self.cancelReplyRefresh(sessionId: sid)
-                    self.pendingStore.cancel(sid: sid)
-                }
+                self.cleanupRemovedSessions(dead)
             }
         }
     }
@@ -301,11 +298,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 )
                 guard !dropped.isEmpty else { return }
                 vlog("idle-sweep removed \(dropped.count) session(s): \(dropped.map { $0.prefix(8) }.joined(separator: ","))")
-                for sid in dropped {
-                    self.cancelReplyRefresh(sessionId: sid)
-                    self.pendingStore.cancel(sid: sid)
-                }
+                self.cleanupRemovedSessions(dropped)
             }
+        }
+    }
+
+    private func cleanupRemovedSessions(_ sessionIds: [String]) {
+        for sid in Set(sessionIds) {
+            cancelReplyRefresh(sessionId: sid)
+            pendingStore.cancel(sid: sid)
+            questionGates.removeValue(forKey: sid)?.dismiss()
         }
     }
 
@@ -373,7 +375,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        store.apply(event)
+        let removedByApply = store.apply(event)
+        if !removedByApply.isEmpty {
+            cleanupRemovedSessions(removedByApply)
+            vlog("hook removed stale session(s): \(removedByApply.map { $0.prefix(8) }.joined(separator: ","))")
+        }
 
         // 终端用 `--continue`/`--resume` 抢占了控制台会话(同 session_id,但 ppid 不是本管理器进程
         // —— 上面的 isConsoleSession 早退已排除自家进程,到这里必是 foreign)。先 store.apply 让终端
@@ -574,7 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ok
     }
 
-    /// 45-second watchdog tripped without an Allow/Deny click. Connection is
+    /// Pending watchdog tripped without an Allow/Deny click. Connection is
     /// already dismissed by `PendingDecisionStore`; here we flip the row out
     /// of `.waiting` so the notch can collapse on hover-out.
     func handlePendingTimeout(sessionId: String) {
@@ -587,7 +593,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// row transition from orange → blue before we collapse.
     func decide(sessionId: String, decision: PermissionDecision) {
         vlog("user decided \(decision == .allow ? "allow" : "deny") for sid=\(sessionId.prefix(8))")
-        pendingStore.resolve(sid: sessionId, decision: decision)
+        let ok = pendingStore.resolve(sid: sessionId, decision: decision)
+        if !ok { vlog("user decision failed: no live hook sid=\(sessionId.prefix(8))") }
         store.markRunning(sessionId: sessionId)
         autoExpandUntil = Date().addingTimeInterval(2)
         rescheduleExpiryTimer()

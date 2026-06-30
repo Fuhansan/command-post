@@ -537,7 +537,19 @@ final class RelayAgent: NSObject, ObservableObject {
                 out.append(("msg:\(m.id)", "user", bubble(role: "user", m.text), m.text, m.ord))
             case .text:
                 // agent 文本走 markdown 渲染(MarkdownText),否则手机端会显示裸 ## / ** / -
-                out.append(("msg:\(m.id)", "agent", text(m.text, markdown: true), m.text, m.ord))
+                let imgPaths = AgentSessionManager.localImagePaths(in: m.text)
+                if imgPaths.isEmpty {
+                    out.append(("msg:\(m.id)", "agent", text(m.text, markdown: true), m.text, m.ord))
+                } else {
+                    let shown = stripLocalImageMarkdown(m.text)
+                    var kids: [[String: Any]] = []
+                    if !shown.isEmpty { kids.append(text(shown, markdown: true)) }
+                    for path in imgPaths {
+                        if let data = thumbnailBase64(path: path) { kids.append(imageComp(data: data, source: path)) }
+                    }
+                    let root: [String: Any] = kids.count == 1 ? kids[0] : ["type": "stack", "props": ["spacing": 10], "children": kids]
+                    out.append(("msg:\(m.id)", "agent", root, shown.isEmpty ? "图片" : shown, m.ord))
+                }
             case .tool:
                 let root = m.op.map { toolOpComp($0) } ?? commandComp(m.text)
                 out.append(("msg:\(m.id)", "agent", root, m.text, m.ord))
@@ -746,7 +758,15 @@ final class RelayAgent: NSObject, ObservableObject {
                 let t = cap(m.text, 1500)
                 guard !t.isEmpty else { break }
                 flush()   // 新的分析段 → 开新组
-                current = (cap(t, 120), [text(t, markdown: true, style: "body")])   // markdown 文本(无气泡框)
+                let imgPaths = AgentSessionManager.localImagePaths(in: t)
+                let shown = imgPaths.isEmpty ? t : stripLocalImageMarkdown(t)
+                var blocks: [[String: Any]] = []
+                if !shown.isEmpty { blocks.append(text(shown, markdown: true, style: "body")) }   // markdown 文本(无气泡框)
+                for path in imgPaths {
+                    if let data = thumbnailBase64(path: path) { blocks.append(imageComp(data: data, source: path)) }
+                }
+                if blocks.isEmpty { break }
+                current = (cap(shown.isEmpty ? "图片" : shown, 120), blocks)
             case .tool:
                 guard let op = m.op else { break }
                 if current == nil { current = ("AI 操作", []) }
@@ -917,6 +937,14 @@ final class RelayAgent: NSObject, ObservableObject {
     /// 把 [Image …] 整段去掉(已用缩略图展示时)。
     private func stripImages(_ p: String) -> String {
         p.replacingOccurrences(of: #"\[Image[^\]]*\]"#, with: "", options: .regularExpression)
+    }
+
+    private func stripLocalImageMarkdown(_ p: String) -> String {
+        p.replacingOccurrences(
+            of: #"!\[[^\]]*\]\((?:file://)?(?:~|/)[^)]+\.(?:png|jpe?g|webp|gif|heic|heif|bmp|tiff?)\)"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func imageComp(data: String, source: String) -> [String: Any] {

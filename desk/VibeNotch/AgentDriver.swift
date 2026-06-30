@@ -194,6 +194,7 @@ struct FileEditInfo: Equatable {
 struct AgentModel: Equatable {
     let id: String
     let label: String
+    var contextWindow: Int = 200_000   // 上下文窗口 token(标称;claude 4.x 均 200K)。挂在模型上,换模型自动跟着变。
 }
 
 /// driver 把原生协议翻译成的统一事件。上层据此增量更新会话模型。
@@ -202,6 +203,7 @@ enum SessionEvent {
     case sessionId(String)                                  // 供 --resume
     case model(String)                                      // 当前模型(从流里读到)
     case availableModels([AgentModel])                      // 可切换模型列表(动态获取)
+    case usage(contextTokens: Int, contextWindow: Int?)      // 当前上下文占用(最新回合 prompt 侧),覆盖不累加;Codex 可同时回窗口
     case messageDelta(msgId: String, role: String, text: String)  // AI 文本(可流式拼接)
     case messageComplete(msgId: String)
     case toolCall(ToolCallInfo)                             // 工具调用展示
@@ -250,7 +252,9 @@ protocol AgentDriver: AnyObject {
     /// 发用户输入(文本 + 图片)。
     func send(_ input: UserInput)
     /// 回答一个待决项(权限放行/拒绝、或选择题选项)。optionIds 取自 PendingRequest.options。
-    func respond(to requestId: String, choose optionIds: [String])
+    /// 返回 false 表示 driver 已经没有这个待决项,上层不能把 UI 乐观标记为已处理。
+    @discardableResult
+    func respond(to requestId: String, choose optionIds: [String]) -> Bool
     /// 中断当前轮(Ctrl+C)。
     func interrupt()
     /// 结束会话(杀子进程)。

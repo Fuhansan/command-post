@@ -1,7 +1,7 @@
 import type { AppState, Msg, Entry, FileBody, UsageData, Conn, Prefs, Session, Manual, Project, HiddenEntry } from './types'
 
 export interface QueuedItem { text: string; images?: { id: string; ext: string }[] }
-export interface TranscriptMeta { earliest: number; hasEarlier: boolean; queued?: QueuedItem[] }
+export interface TranscriptMeta { earliest: number; hasEarlier: boolean; queued?: QueuedItem[]; contextTokens?: number; contextWindow?: number }
 
 let state: AppState = { projects: [], sessions: [], manual: [], hidden: [], defaultWorkdir: '', defaultRoots: [], defaultSessionDirs: [] }
 let usage: UsageData | null = null

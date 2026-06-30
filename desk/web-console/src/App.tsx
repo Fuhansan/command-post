@@ -109,22 +109,50 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
   return <div className="md flex-1 text-[13.5px] leading-[1.72] text-ink select-text min-w-0" dangerouslySetInnerHTML={{ __html: html }} />
 })
 
-// 用户消息里的图片:缩略图栅格 + 点击看全图(lightbox)
-function UserImages({ images }: { images: MsgImage[] }) {
-  const [zoom, setZoom] = useState<string | null>(null)
-  // 通道只给 id,字节由 VibeNotch 经 app:// 按 id 代取(本地缓存命中或回源)
-  const srcOf = (im: MsgImage) => `app://local/__img/${im.id}.${im.ext || 'png'}`
-  return (
-    <>
-      <div className="flex flex-wrap gap-1.5 justify-end max-w-[78%]">
+const LOCAL_IMAGE_MD_RE = /!\[[^\]]*\]\((?:file:\/\/)?(?:~|\/)[^)]+\.(?:png|jpe?g|webp|gif|heic|heif|bmp|tiff?)\)/gi
+const stripLocalImageMarkdown = (text: string) => text.replace(LOCAL_IMAGE_MD_RE, '').trim()
+const IMAGE_PLACEHOLDER_RE = /\[Image #\d+\]/g
+const UNSUPPORTED_IMAGE_RE = /\[external unsupported block: image\]/gi
+const stripInlineImageRefs = (text: string) =>
+  stripLocalImageMarkdown(text)
+    .replace(IMAGE_PLACEHOLDER_RE, '')
+    .replace(UNSUPPORTED_IMAGE_RE, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+function useEscapeToClose(active: boolean, onClose: () => void) {
+  useEffect(() => {
+    if (!active) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      onClose()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [active, onClose])
+}
+
+// 消息里的图片:缩略图栅格 + 点击看全图(lightbox)
+function MessageImages({ images, align = 'right' }: { images: MsgImage[]; align?: 'left' | 'right' }) {
+    const [zoom, setZoom] = useState<string | null>(null)
+    const closeZoom = useCallback(() => setZoom(null), [])
+    useEscapeToClose(!!zoom, closeZoom)
+    // 通道只给 id,字节由 VibeNotch 经 app:// 按 id 代取(本地缓存命中或回源)
+    const srcOf = (im: MsgImage) => `app://local/__img/${im.id}.${im.ext || 'png'}`
+    const right = align === 'right'
+    return (
+      <>
+      <div className={`flex flex-wrap gap-1.5 ${right ? 'justify-end max-w-[78%]' : 'justify-start max-w-full'}`}>
         {images.map((im, i) => (
           <img key={i} src={srcOf(im)} alt="" onClick={() => setZoom(srcOf(im))}
-            className="max-w-[180px] max-h-[220px] rounded-[12px] object-cover border border-line cursor-zoom-in transition hover:brightness-90" />
+            className={`${right ? 'max-w-[180px] max-h-[220px]' : 'max-w-[360px] max-h-[420px]'} rounded-[12px] object-cover border border-line cursor-zoom-in transition hover:brightness-90`} />
         ))}
       </div>
       {zoom && createPortal(
-        <div onClick={() => setZoom(null)} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
-          <img src={zoom} alt="" className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
+        <div role="dialog" aria-modal="true" onClick={closeZoom} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
+          <img src={zoom} alt="" onClick={(e) => e.stopPropagation()} className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
         </div>,
         document.body,
       )}
@@ -135,6 +163,8 @@ function UserImages({ images }: { images: MsgImage[] }) {
 // 排队消息弹幕:一条条暗色行(图标+透明文字、无背景),图片显示小缩略图、可点预览。
 function QueueDanmaku({ items }: { items: { text: string; images?: { id: string; ext: string }[] }[] }) {
   const [zoom, setZoom] = useState<string | null>(null)
+  const closeZoom = useCallback(() => setZoom(null), [])
+  useEscapeToClose(!!zoom, closeZoom)
   const srcOf = (im: { id: string; ext: string }) => `app://local/__img/${im.id}.${im.ext || 'png'}`
   return (
     <>
@@ -155,8 +185,8 @@ function QueueDanmaku({ items }: { items: { text: string; images?: { id: string;
         </div>
       ))}
       {zoom && createPortal(
-        <div onClick={() => setZoom(null)} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
-          <img src={zoom} alt="" className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
+        <div role="dialog" aria-modal="true" onClick={closeZoom} className="fixed inset-0 z-[1000] flex items-center justify-center p-6 cursor-zoom-out animate-fade" style={{ background: 'rgba(0,0,0,.85)' }}>
+          <img src={zoom} alt="" onClick={(e) => e.stopPropagation()} className="max-w-full max-h-full rounded-lg object-contain shadow-pop" />
         </div>, document.body)}
     </>
   )
@@ -361,7 +391,12 @@ function AssistantTurn({ items, model, root, onRespond, onOpenFile }: { items: M
   let seg: { id: string; op: NormOp }[] = []
   const flush = (key: string) => { if (seg.length) { const s = seg; blocks.push(<OpsTimeline key={'ops' + key} ops={s} root={root} onOpenFile={onOpenFile} />); seg = [] } }
   for (const m of items) {
-    if (m.kind === 'text') { flush(m.id); if (m.text) blocks.push(<Markdown key={m.id} text={m.text} />) }
+    if (m.kind === 'text') {
+      flush(m.id)
+      const text = m.images && m.images.length > 0 ? stripInlineImageRefs(m.text) : m.text
+      if (text) blocks.push(<Markdown key={m.id} text={text} />)
+      if (m.images && m.images.length > 0) blocks.push(<MessageImages key={`${m.id}:images`} images={m.images} align="left" />)
+    }
     else if (m.kind === 'permission') { flush(m.id); blocks.push(<PermissionCard key={m.id} m={m} onRespond={onRespond} />) }
     else if (!isHiddenTool(m)) seg.push({ id: m.id, op: opOf(m) })   // tool / file(隐藏待办/任务编排)
   }
@@ -409,9 +444,9 @@ function PendingCard({ p, onRespond }: { p: Pending; onRespond?: (reqId: string,
 }
 
 type Block = { type: 'user'; m: Msg } | { type: 'system'; m: Msg } | { type: 'assistant'; items: Msg[]; key: string }
-const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, working, model, root, animate = true, hasEarlier, onLoadEarlier }: {
+const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, working, model, root, animate = true, hasEarlier, loadCursor, onLoadEarlier }: {
   msgs: Msg[]; pending?: Pending[]; onRespond?: (r: string, c: string[]) => void; onOpenFile?: (path: string) => void; working?: boolean
-  model?: string; root?: string; animate?: boolean; hasEarlier?: boolean; onLoadEarlier?: () => void
+  model?: string; root?: string; animate?: boolean; hasEarlier?: boolean; loadCursor?: number; onLoadEarlier?: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const ordered = useMemo(() => [...msgs].sort((a, b) => a.ord - b.ord), [msgs])
@@ -441,7 +476,7 @@ const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, wo
     prevFirst.current = firstOrd
     prevH.current = el.scrollHeight
   }, [ordered, working, pending?.length])
-  useEffect(() => { setLoading(false) }, [ordered.length, hasEarlier])
+  useEffect(() => { setLoading(false) }, [ordered.length, hasEarlier, loadCursor])
   // 微信式:上滑到接近顶部(滚动范围前 25%)就静默预载更早消息,不用点按钮。
   const onScroll = () => {
     const el = ref.current; if (!el || !hasEarlier || loading) return
@@ -462,8 +497,11 @@ const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, wo
         {blocks.map((b) => b.type === 'user' ? (
           <div key={b.m.id} className={animate ? 'animate-msg' : undefined}>
             <div className="flex flex-col items-end gap-1.5">
-              {b.m.images && b.m.images.length > 0 && <UserImages images={b.m.images} />}
-              {b.m.text && <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg" style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{b.m.text}</div>}
+              {b.m.images && b.m.images.length > 0 && <MessageImages images={b.m.images} align="right" />}
+              {(() => {
+                const text = b.m.images && b.m.images.length > 0 ? stripInlineImageRefs(b.m.text) : b.m.text
+                return text && <div className="max-w-[78%] px-3.5 py-2.5 text-[13px] leading-[1.6] whitespace-pre-wrap break-words select-text text-accentfg" style={{ background: 'var(--accent)', borderRadius: '14px 14px 4px 14px' }}>{text}</div>
+              })()}
             </div>
           </div>
         ) : b.type === 'system' ? (
@@ -492,7 +530,8 @@ const MsgList = memo(function MsgList({ msgs, pending, onRespond, onOpenFile, wo
 }, (a, b) =>
   // 只比数据,忽略每次渲染都新建的回调:数据没变就不重渲染(背景会话在跑时不拖累当前列表)。
   a.msgs === b.msgs && a.pending === b.pending && a.working === b.working &&
-  a.model === b.model && a.root === b.root && a.animate === b.animate && a.hasEarlier === b.hasEarlier )
+  a.model === b.model && a.root === b.root && a.animate === b.animate &&
+  a.hasEarlier === b.hasEarlier && a.loadCursor === b.loadCursor )
 
 function IconBtn({ title, onClick, children }: { title: string; onClick?: () => void; children: React.ReactNode }) {
   return (
@@ -778,8 +817,32 @@ function TriToggle({ navMode, viewMode, onConv, onGit, onFiles }: {
   )
 }
 
+// 上下文容量指示器:当前模型输入上下文 / 模型窗口。
+// cached token 仍然占模型上下文窗口,不能从容量里扣掉。40% 作为质量提醒线。
+function ContextGauge({ tokens, window }: { tokens?: number; window?: number }) {
+  const win = window || 200_000
+  if (!tokens || tokens <= 0) return null
+  const pct = Math.min(100, (tokens / win) * 100)
+  const color = pct >= 60 ? 'var(--red)' : pct >= 40 ? 'var(--amber)' : 'var(--text-dim)'
+  const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}K` : `${n}`)
+  return (
+    <div className="flex items-center gap-1.5 shrink-0"
+      title={`模型输入上下文 ${pct.toFixed(0)}% · ${tokens.toLocaleString()}/${win.toLocaleString()} tokens(40% 后建议关注,可 /compact 或 /clear)`}>
+      <span className="text-[11.5px] text-faint">·</span>
+      <div className="relative h-[3px] w-14 rounded-full overflow-hidden bg-sunken">
+        <div className="absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-out"
+          style={{ width: `${pct}%`, background: color }} />
+        {/* 40% 提醒线:用页面底色描一道细缝,fill 漫过来也看得见 */}
+        <div className="absolute inset-y-0 w-px" style={{ left: '40%', background: 'var(--bg)' }} />
+      </div>
+      <span className="font-mono text-[11px] tabular-nums" style={{ color }}>{pct.toFixed(0)}%</span>
+      <span className="font-mono text-[11px] text-faint tabular-nums">{k(tokens)}/{k(win)}</span>
+    </div>
+  )
+}
+
 // ===== 会话工作区头(标题 + 状态 + 三段切换 + 重命名/隐藏/结束)=====
-type BarSession = { title: string; meta: DotMeta; model?: string; sub?: string; renameKey?: string; manualId?: string }
+type BarSession = { title: string; meta: DotMeta; model?: string; sub?: string; renameKey?: string; manualId?: string; ctxTokens?: number; ctxWindow?: number }
 // 常驻工作区顶栏(像任务栏一直存在):左=会话信息(无会话时留空,可拖动窗口),中=三段切换,右=操作
 function WorkBar({ session, tri, right }: {
   session?: BarSession | null; tri: React.ReactNode; right?: React.ReactNode
@@ -796,6 +859,7 @@ function WorkBar({ session, tri, right }: {
             <Dot meta={session.meta} size={7} />
             <span className="text-[11.5px] text-dim whitespace-nowrap">{session.meta.text}</span>
             {session.model && <><span className="text-[11.5px] text-faint">·</span><span className="font-mono text-[11px] text-faint truncate">{session.model}</span></>}
+            <ContextGauge tokens={session.ctxTokens} window={session.ctxWindow} />
             {session.sub && <><span className="text-[11.5px] text-faint">·</span><span className="text-[11.5px] text-faint truncate min-w-0">{session.sub}</span></>}
           </div>
         </>)}
@@ -1576,19 +1640,19 @@ function ConsolePage() {
   let barSession: BarSession | null = null, barRight: React.ReactNode = null, footer: React.ReactNode = null, chat: React.ReactNode = null, queueOverlay: React.ReactNode = null
   let bodyAddSel: typeof addCode | undefined, bodyAddFile: typeof addFile | undefined
   if (liveSession) {
-    barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id }
+    barSession = { title: liveSession.title, meta: sessionMeta(liveSession.status), model: modelLabel(liveSession.model), renameKey: liveSession.key || liveSession.agentSessionId || liveSession.id, ctxTokens: liveSession.contextTokens, ctxWindow: liveSession.contextWindow }
     // 结束会话改由「标签 ×」/「会话行右键菜单」接管,WorkBar 不再放 X
-    chat = <MsgList msgs={liveSession.messages} pending={liveSession.pending} onRespond={onLiveRespond} onOpenFile={openFileInConsole} working={liveSession.status === 'working'} model={liveSession.model} root={liveSession.workdir} />
+    chat = <MsgList msgs={liveSession.messages} pending={liveSession.pending} onRespond={onLiveRespond} onOpenFile={openFileInConsole} working={liveSession.status === 'working'} model={liveSession.model} root={liveSession.workdir} hasEarlier={liveSession.historyHasEarlier} loadCursor={liveSession.historyEarliest} onLoadEarlier={() => liveSession.historyHasEarlier && cmd.loadSessionHistory(liveSession.id, liveSession.historyEarliest)} />
     footer = <Composer sid={liveSession.id} agent={liveSession.agent} model={liveSession.model} models={liveSession.models} working={liveSession.status === 'working'} attachments={attachments} setAttachments={setAttachments} onSend={(t, imgs) => cmd.sendInput(liveSession.id, t, imgs)} />
     bodyAddSel = addCode; bodyAddFile = addFile
   } else if (manualSel) {
     const mm = tmeta[manualSel.id]
-    barSession = { title: manualSel.title, meta: manualMeta(manualSel.state), sub: manualSel.cwd, renameKey: manualSel.key || manualSel.id, manualId: manualSel.id }
+    barSession = { title: manualSel.title, meta: manualMeta(manualSel.state), sub: manualSel.agent === 'codex' ? undefined : manualSel.cwd, renameKey: manualSel.key || manualSel.id, manualId: manualSel.id, ctxTokens: mm?.contextTokens, ctxWindow: mm?.contextWindow }
     // 终端未知(? = 无法识别的进程,如重启后存活的孤儿 console 进程)→ 没有窗口可顶,不显示唤起。
     barRight = (manualSel.terminal && manualSel.terminal !== '?')
       ? <button onClick={() => cmd.raiseWindow(manualSel.id)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110" style={{ background: 'var(--accent)' }}><AppWindow size={13} /> 唤起 {manualSel.terminal}</button>
       : null
-    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} working={manualSel.state === 'working'} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
+    chat = <MsgList msgs={transcripts[manualSel.id] ?? []} animate={false} working={manualSel.state === 'working'} onOpenFile={openFileInConsole} root={manualSel.cwd} hasEarlier={mm?.hasEarlier} loadCursor={mm?.earliest} onLoadEarlier={() => mm && cmd.loadTranscript('manual', manualSel.id, undefined, mm.earliest)} />
     footer = manualSel.pendingPerm
       ? <div className="flex-none px-7 py-3 border-t border-line flex items-center gap-2.5" style={{ background: 'var(--bg-elev)' }}>
           <span className="text-[10px] font-semibold px-1.5 py-px rounded shrink-0" style={{ color: 'var(--amber)', border: '1px solid var(--amber)' }}>审批</span>
@@ -1609,7 +1673,7 @@ function ConsolePage() {
     const hm = tmeta[historySel.id]
     barSession = { title: historySel.label, meta: { text: '历史 · 只读', color: 'var(--text-faint)', hollow: true }, renameKey: historySel.key || historySel.id }
     barRight = <button onClick={() => doResume(histWd, historySel.id, historySel.agent)} disabled={pendingResume === historySel.id} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium text-accentfg hover:brightness-110 disabled:opacity-60" style={{ background: 'var(--accent)' }}><RotateCcw size={13} className={pendingResume === historySel.id ? 'animate-spin' : ''} />{pendingResume === historySel.id ? '恢复中…' : 'Resume'}</button>
-    chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={histWd} hasEarlier={hm?.hasEarlier} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
+    chat = <MsgList msgs={transcripts[historySel.id] ?? []} animate={false} onOpenFile={openFileInConsole} root={histWd} hasEarlier={hm?.hasEarlier} loadCursor={hm?.earliest} onLoadEarlier={() => hm && cmd.loadTranscript('history', historySel.id, histWd, hm.earliest)} />
   }
   // 仅「无选中会话」(项目空视图)时给项目新建/继续菜单;选了 console 会话不冒它出来。
   if (!barRight && activeProject && !sel) {

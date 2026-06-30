@@ -154,6 +154,10 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                                     continueLast: obj["continueLast"] as? Bool ?? false)
         case "closeSession":
             if let sid = obj["sid"] as? String { manager?.closeSession(sid) }
+        case "loadSessionHistory":
+            if let sid = obj["sid"] as? String {
+                manager?.loadEarlierHistory(for: sid, beforeByte: (obj["beforeByte"] as? NSNumber)?.uint64Value)
+            }
         case "switchModel":
             if let sid = obj["sid"] as? String, let model = obj["model"] as? String {
                 manager?.switchModel(sid, to: model)
@@ -183,7 +187,17 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
                let choose = obj["choose"] as? [String] { manager?.respond(sid, requestId: req, choose: choose) }
         case "termPermission":
             // 控制台对终端会话审批的应答 → 回写被 hook 扣住的连接(allow/deny),和手机同一套。
-            if let sid = obj["sid"] as? String { pending?.resolve(sid: sid, decision: (obj["allow"] as? Bool ?? false) ? .allow : .deny) }
+            if let sid = obj["sid"] as? String {
+                let allow = obj["allow"] as? Bool ?? false
+                let ok = pending?.resolve(sid: sid, decision: allow ? .allow : .deny) ?? false
+                if ok {
+                    store?.markRunning(sessionId: sid)
+                    vlog("web console permission \(allow ? "allow" : "deny") sid=\(sid.prefix(8))")
+                } else {
+                    vlog("web console permission failed: no live hook sid=\(sid.prefix(8))")
+                }
+                scheduleManual()
+            }
         case "theme":
             // 跟随网页主题给原生标题栏条着色,避免深色模式露出白边。
             let dark = obj["dark"] as? Bool ?? false
@@ -313,7 +327,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         let imgMap = AgentSessionManager.transcriptImages(path: path, endByte: endByte, windowBytes: windowBytes)
         let msgs = win.messages.map { m -> [String: Any] in
             var d: [String: Any] = ["id": "h\(m.ord)", "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
-            if let imgs = imgMap[m.ord] { d["images"] = imgs }   // 历史图片(thumb/url 都是 data URL)
+            var imgs = imgMap[m.ord] ?? []                        // Claude 历史内联图片索引
+            for im in AgentSessionManager.localImageDTOs(in: m.text) where !imgs.contains(where: { $0["id"] == im["id"] }) {
+                imgs.append(im)
+            }
+            if !imgs.isEmpty { d["images"] = imgs }
             if let op = m.op { d["op"] = toolOpJSON(op) }         // 结构化动作(diff/目录)
             if let mo = m.model, !mo.isEmpty { d["model"] = mo }
             if let ts = m.ts { d["ts"] = ts }
@@ -326,9 +344,11 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         guard let path else { return }
         Task.detached(priority: .userInitiated) { [weak self] in
             let r = Self.buildTranscriptMsgs(path: path, endByte: beforeByte)
+            let usage = AgentSessionManager.lastContextUsage(path: path)
             await MainActor.run {
                 self?.pushJSON(type: "transcript", payload: [
                     "id": id, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
+                    "contextTokens": usage.tokens, "contextWindow": usage.window ?? 200_000,
                 ])
             }
         }
@@ -351,13 +371,16 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         let sid = e.id
         Task.detached(priority: .userInitiated) { [weak self] in
             let r = Self.buildTranscriptMsgs(path: tp, endByte: nil)
+            // 手动会话走转录解析,没有实时 .usage 事件 → 从转录尾部最近一条 assistant 的 usage 算上下文占用。
+            let usage = AgentSessionManager.lastContextUsage(path: tp)
             await MainActor.run {
                 guard let self, self.ready else { return }
-                guard let sig = self.jsonSig(["m": r.msgs, "q": r.queued]) else { return }   // 排队变化也要推
+                guard let sig = self.jsonSig(["m": r.msgs, "q": r.queued, "c": usage.tokens, "w": usage.window ?? 200_000]) else { return }   // 排队/容量变化也要推
                 guard self.lastManualContentSig[sid] != sig else { return }
                 self.lastManualContentSig[sid] = sig
                 self.pushJSON(type: "transcript", payload: [
                     "id": sid, "messages": r.msgs, "queued": r.queued, "earliest": r.earliest, "hasEarlier": r.hasEarlier,
+                    "contextTokens": usage.tokens, "contextWindow": usage.window ?? 200_000,
                 ])
             }
         }
@@ -562,15 +585,16 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
         let base = e.promptSummary.map { String($0.prefix(40)) }
             ?? e.transcriptPath.flatMap { AgentSessionManager.firstUserPrompt(path: $0) }.map { String($0.prefix(40)) }
             ?? "手动会话"
+        let isPendingPerm = pending?.pendingIDs.contains(e.id) ?? false
         return [
             "id": e.id, "key": e.id, "title": meta.title(for: e.id) ?? base, "cwd": e.cwd,
             "terminal": e.terminal.displayName,
             "agent": agent,
-            "state": manualState(e.state),
+            "state": isPendingPerm ? "waiting" : manualState(e.state),
             "lastActivityAt": e.lastActivityAt.timeIntervalSince1970 * 1000,
             // 终端会话被 hook 扣住的权限审批(如 git push):控制台据此渲染允许/拒绝卡,点击经 termPermission 回写。
-            "pendingPerm": pending?.pendingIDs.contains(e.id) ?? false,
-            "pendingDetail": e.toolDetail ?? "",
+            "pendingPerm": isPendingPerm,
+            "pendingDetail": (isPendingPerm ? pending?.detail(sid: e.id) : nil) ?? e.toolDetail ?? "",
         ]
     }
     private func manualState(_ s: SessionState) -> String {
@@ -592,6 +616,10 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
             "agent": s.agent.rawValue, "status": statusKey(s.status),
             "model": s.model ?? "",
             "models": s.availableModels.map { ["id": $0.id, "label": $0.label] },
+            "contextTokens": s.contextTokens,
+            "contextWindow": s.contextWindow,
+            "historyEarliest": s.historyEarliest,
+            "historyHasEarlier": s.historyHasEarlier,
             "agentSessionId": s.agentSessionId ?? "",
             "startedAt": s.startedAt.timeIntervalSince1970 * 1000,
             "messages": s.messages.map { msgDTO($0) },
@@ -600,9 +628,13 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
     private func msgDTO(_ m: AgentMessage) -> [String: Any] {
         var d: [String: Any] = ["id": m.id, "role": m.role, "kind": m.kind.rawValue, "text": m.text, "ord": m.ord]
-        if !m.images.isEmpty {
-            // 通道只带 id;web 用 app://__img/<id>.<ext> 按 id 取字节(scheme handler 本地缓存命中或回源)
-            d["images"] = m.images.map { ["id": $0.id, "ext": $0.ext] }
+        var imgs = m.images.map { ["id": $0.id, "ext": $0.ext] }
+        for im in AgentSessionManager.localImageDTOs(in: m.text) where !imgs.contains(where: { $0["id"] == im["id"] }) {
+            imgs.append(im)
+        }
+        if !imgs.isEmpty {
+            // 通道只带 id;web 用 app://__img/<id>.<ext> 按 id 取字节(scheme handler 本地缓存命中/本地文件命中或回源)
+            d["images"] = imgs
         }
         if let ps = m.permState { d["permState"] = ps }
         if let pr = m.permReqId { d["permReqId"] = pr }
