@@ -422,6 +422,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if event.hookEventName == "PreToolUse",
+           let ppid = event.ppid,
+           ProcessUtils.hasCodexAppServerAncestor(startPid: pid_t(ppid)) {
+            vlog("codex app-server hook bypass: sid=\(event.sessionId?.prefix(8) ?? "?") tool=\(event.toolName ?? "-")")
+            _ = conn.respond(json: PermissionDecision.allow.hookOutput)
+            return
+        }
+
+        if event.hookEventName == "PreToolUse",
            let tool = event.toolName,
            PolicyConstants.dangerousTools.contains(tool),
            let sid = event.sessionId {

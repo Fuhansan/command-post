@@ -53,4 +53,57 @@ enum ProcessUtils {
         guard len > 0 else { return nil }
         return String(cString: buffer)
     }
+
+    /// Full argv for a process. `proc_pidpath` only returns the executable, but
+    /// distinguishing `codex app-server` from terminal `codex resume` needs args.
+    static func commandLine(pid: pid_t) -> [String]? {
+        let maxArgs = max(Int(sysconf(_SC_ARG_MAX)), 4096)
+        var buffer = [CChar](repeating: 0, count: maxArgs)
+        var size = buffer.count
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        let result = mib.withUnsafeMutableBufferPointer { mibPtr in
+            sysctl(mibPtr.baseAddress, UInt32(mibPtr.count), &buffer, &size, nil, 0)
+        }
+        guard result == 0, size > MemoryLayout<Int32>.size else { return nil }
+
+        var argc: Int32 = 0
+        memcpy(&argc, buffer, MemoryLayout<Int32>.size)
+        guard argc > 0 else { return [] }
+
+        var index = MemoryLayout<Int32>.size
+        // Skip executable path.
+        while index < size && buffer[index] != 0 { index += 1 }
+        // Skip NUL padding before argv[0].
+        while index < size && buffer[index] == 0 { index += 1 }
+
+        var args: [String] = []
+        while index < size && args.count < Int(argc) {
+            let start = index
+            while index < size && buffer[index] != 0 { index += 1 }
+            if index > start {
+                let bytes = buffer[start..<index].map { UInt8(bitPattern: $0) }
+                if let s = String(bytes: bytes, encoding: .utf8), !s.isEmpty {
+                    args.append(s)
+                }
+            }
+            while index < size && buffer[index] == 0 { index += 1 }
+        }
+        return args
+    }
+
+    static func hasCodexAppServerAncestor(startPid: pid_t, maxDepth: Int = 32) -> Bool {
+        var current = startPid
+        var depth = 0
+        while current > 1 && depth < maxDepth {
+            if let args = commandLine(pid: current),
+               args.contains(where: { ($0 as NSString).lastPathComponent == "codex" }),
+               args.dropFirst().contains("app-server") {
+                return true
+            }
+            guard let info = procInfo(pid: current) else { return false }
+            current = info.ppid
+            depth += 1
+        }
+        return false
+    }
 }

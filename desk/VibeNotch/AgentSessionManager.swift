@@ -862,6 +862,11 @@ final class AgentSessionManager: ObservableObject {
     func handleConsolePreToolUse(ownerPID: pid_t, toolName: String, detail: String,
                                  decide: @escaping (PermissionDecision) -> Void) -> Bool {
         guard let driver = driver(forOwnerPID: ownerPID) else { return false }
+        if driver.capabilities.permission != .hook {
+            vlog("console PreToolUse bypass: agent=\(driver.kind.rawValue) tool=\(toolName)")
+            decide(.allow)
+            return true
+        }
         if toolName == "AskUserQuestion" || toolName == "ExitPlanMode" {
             decide(.allow)   // 放行,让 stream 里的 tool_use→tool_result 处理交互
         } else if PolicyConstants.readOnlyTools.contains(toolName) {

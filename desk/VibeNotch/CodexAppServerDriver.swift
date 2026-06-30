@@ -298,6 +298,10 @@ final class CodexAppServerDriver: AgentDriver {
         case "error":
             let msg = errorMessage(params, fallback: "Codex app-server error")
             vlog("codex app-server error event: \(compactJSON(params) ?? msg)")
+            if isRetryingStreamError(params) {
+                emit.yield(.status(.working))
+                return
+            }
             if hasErrorDetails(params) { emit.yield(.error(msg)) }
         default:
             break
@@ -604,6 +608,18 @@ final class CodexAppServerDriver: AgentDriver {
             if let s = value as? String { return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return true
         }
+    }
+
+    private func isRetryingStreamError(_ obj: [String: Any]) -> Bool {
+        guard (obj["willRetry"] as? Bool) == true else { return false }
+        let err = obj["error"] as? [String: Any]
+        let message = (err?["message"] as? String ?? obj["message"] as? String ?? "").lowercased()
+        let details = (err?["additionalDetails"] as? String ?? obj["additionalDetails"] as? String ?? "").lowercased()
+        let info = err?["codexErrorInfo"] as? [String: Any]
+            ?? obj["codexErrorInfo"] as? [String: Any]
+        return info?["responseStreamDisconnected"] != nil
+            || message.contains("reconnecting")
+            || details.contains("request timed out")
     }
 
     private func shortValue(_ v: Any, maxLen: Int = 300) -> String {
