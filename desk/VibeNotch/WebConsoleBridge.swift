@@ -294,7 +294,7 @@ final class WebConsoleBridge: NSObject, WKScriptMessageHandler, WKNavigationDele
 
     private func raiseWindow(manualId: String) {
         guard let e = store?.sessions.first(where: { $0.id == manualId }),
-              let start = e.ownerPID ?? e.terminalPID, start > 1,
+              let start = e.terminalPID ?? e.ownerPID, start > 1,
               let appPid = ProcessUtils.findTerminal(startPid: start).pid else { return }
         // 控制台跑在后台:.activateIgnoringOtherApps 在 macOS 14+ 已失效(no-op)。
         // 用 AX kAXFrontmost(jumpToTerminal 同款,已验证可从后台把 JetBrains/终端带到前台)。

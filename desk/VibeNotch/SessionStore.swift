@@ -94,9 +94,6 @@ final class SessionStore: ObservableObject {
                         terminalPID: terminalPID,
                         startedAt: Date()
                     )
-                } else {
-                    entry?.terminal = terminal
-                    if let p = terminalPID { entry?.terminalPID = p }
                 }
             }
 
@@ -186,15 +183,17 @@ final class SessionStore: ObservableObject {
             break
         }
 
-        // 记录 owner 进程(claude/shell 的 ppid),供异常退出检测用
-        if let p = event.ppid, p > 1, let idx = sessions.firstIndex(where: { $0.id == sid }) {
-            sessions[idx].ownerPID = pid_t(p)
-        }
-        // 每个 hook 事件都刷新宿主应用/终端。Codex.app 的 app-server 子进程
-        // 常在 SessionStart 之后才被正确识别,不能只在创建条目时写一次。
+        // 每个 hook 事件都刷新宿主应用/终端,但不能让 Codex.app 的 app-server
+        // 事件覆盖一个已经识别为真实终端/IDE 的 Codex TUI 会话。否则控制台
+        // 「唤起」会打开 Codex.app,而不是用户实际启动 codex 的终端窗口。
         if let idx = sessions.firstIndex(where: { $0.id == sid }) {
-            if terminal != .unknown { sessions[idx].terminal = terminal }
-            if let terminalPID { sessions[idx].terminalPID = terminalPID }
+            if shouldRefreshHost(existing: sessions[idx], newTerminal: terminal, newPID: terminalPID) {
+                if let p = event.ppid, p > 1 { sessions[idx].ownerPID = pid_t(p) }
+                if terminal != .unknown { sessions[idx].terminal = terminal }
+                if let terminalPID { sessions[idx].terminalPID = terminalPID }
+            } else {
+                vlog("host refresh skipped: sid=\(sid.prefix(8)) keep=\(sessions[idx].terminal.displayName) new=\(terminal.displayName)")
+            }
         }
         // 记录转录路径,供 RelayAgent 计算文件改动行数
         if let tp = event.transcriptPath, let idx = sessions.firstIndex(where: { $0.id == sid }) {
@@ -303,6 +302,16 @@ final class SessionStore: ObservableObject {
             return ProcessUtils.findTerminal(startPid: pid_t(p))
         }
         return (.unknown, nil)
+    }
+
+    private func shouldRefreshHost(existing: SessionEntry, newTerminal: TerminalKind, newPID: pid_t?) -> Bool {
+        guard newTerminal != .unknown || newPID != nil else { return false }
+        if newTerminal == .codex,
+           existing.terminal != .codex,
+           existing.terminal != .unknown {
+            return false
+        }
+        return true
     }
 
     private func formatToolDetail(name: String?, input: ToolInputView?) -> String? {
