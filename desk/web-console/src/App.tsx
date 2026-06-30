@@ -40,7 +40,7 @@ function sessionMeta(status: string): DotMeta {
     case 'working': return { text: '运行中', color: 'var(--accent)', pulse: true }
     case 'starting': return { text: '启动中', color: 'var(--amber)', pulse: true }
     case 'needsResponse': return { text: '待响应', color: 'var(--amber)', hollow: true }
-    case 'waitingInput': return { text: '挂起', color: 'var(--text-faint)', hollow: true }
+    case 'waitingInput': return { text: '挂起', color: 'var(--green)', hollow: true }
     case 'idle': return { text: '就绪', color: 'var(--accent)' }
     case 'error': return { text: '错误', color: 'var(--red)' }
     default: return { text: '已完成', color: 'var(--green)' }
